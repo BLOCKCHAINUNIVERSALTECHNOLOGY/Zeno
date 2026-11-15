@@ -30,7 +30,12 @@
 //   Portals bound inside a transaction die when it ends
 //   (COMMIT/ROLLBACK/idle-timeout): a later Execute of one fails
 //   with 26000 instead of serving its cached rows (B2 — the cache
-//   could hold rows that never committed).
+//   could hold rows that never committed). Since V0.8 a ROLLBACK
+//   TO SAVEPOINT also closes every portal AND prepared statement
+//   created AFTER that savepoint (26000 on a later use —
+//   PostgreSQL behaviour); portals / statements from BEFORE the
+//   savepoint survive, and a suspended portal of theirs re-runs
+//   fresh on resume (its cache predates the rollback).
 // - Close 'C' ('S' statement / 'P' portal) -> CloseComplete '3'.
 //   Closing a nonexistent name is NOT an error. Closing a statement
 //   also closes every portal built from it.
@@ -107,6 +112,11 @@ struct PreparedStatement {
     /// One resolved type OID per parameter, in $ order. Length is
     /// the parameter count (the highest `$n` in the SQL).
     param_types: Vec<i32>,
+    /// V0.8: the session savepoint clock at Parse time (see
+    /// `Session::sp_clock` in `pgwire.rs`). A ROLLBACK TO
+    /// SAVEPOINT closes every statement with a clock HIGHER than
+    /// the savepoint's — it was created after the savepoint.
+    sp_clock: u64,
 }
 
 /// Materialized SELECT result, cached in a portal so a
@@ -154,6 +164,14 @@ struct Portal {
     /// its own first Execute, not a transaction's writes).
     txn_at_bind: Option<u64>,
     gen_at_bind: u64,
+    /// V0.8: the session savepoint clock at Bind time (see
+    /// `Session::sp_clock` in `pgwire.rs`). A ROLLBACK TO
+    /// SAVEPOINT closes every portal with a clock HIGHER than
+    /// the savepoint's — it was created after the savepoint, so
+    /// a later Execute fails with 26000. A portal with a LOWER
+    /// clock survives (its stale cache is re-run via the epoch
+    /// in `CachedRows`, like before).
+    sp_clock: u64,
 }
 
 impl Portal {
@@ -203,6 +221,35 @@ impl ExtendedState {
     pub(crate) fn close_all_portals(&mut self) {
         self.portals.clear();
         self.unnamed_portal = None;
+    }
+
+    /// Close every portal AND prepared statement created AFTER a
+    /// savepoint (V0.8, PostgreSQL behaviour): `cutoff` is the
+    /// savepoint's clock, and anything with a HIGHER clock was
+    /// created after it. Portals / statements from BEFORE the
+    /// savepoint (lower or equal clock) survive. Called after a
+    /// successful ROLLBACK TO SAVEPOINT, from `client_loop` (Simple
+    /// Query) or `handle_execute` (extended). A later Execute /
+    /// Describe / Bind of a closed object fails with 26000 ("does
+    /// not exist") — the lookup simply misses, exactly like an
+    /// object that was never created.
+    pub(crate) fn close_after_savepoint(&mut self, cutoff: u64) {
+        self.portals.retain(|_, p| p.sp_clock <= cutoff);
+        if self
+            .unnamed_portal
+            .as_ref()
+            .is_some_and(|p| p.sp_clock > cutoff)
+        {
+            self.unnamed_portal = None;
+        }
+        self.statements.retain(|_, s| s.sp_clock <= cutoff);
+        if self
+            .unnamed_statement
+            .as_ref()
+            .is_some_and(|s| s.sp_clock > cutoff)
+        {
+            self.unnamed_statement = None;
+        }
     }
 
     fn statement(&self, name: &str) -> Option<&PreparedStatement> {
@@ -418,6 +465,7 @@ pub(crate) fn handle_parse(
     writer: &mut impl Write,
     _shared: &Arc<Mutex<Shared>>,
     state: &mut ExtendedState,
+    session: &mut Session,
     body: &[u8],
 ) -> Result<(), SqlError> {
     let mut r = MsgReader::new(body);
@@ -442,7 +490,14 @@ pub(crate) fn handle_parse(
     // stays. Frame-reading errors above return before this point
     // and never touch the stored statement either.
     match parse_statement(state, &name, &sql, &declared) {
-        Ok(stmt) => {
+        Ok(mut stmt) => {
+            // V0.8: stamp the statement with the session clock,
+            // so a later ROLLBACK TO SAVEPOINT can tell it was
+            // created after that savepoint (higher clock) and
+            // close it. The stamp is taken here — after the parse
+            // succeeded, so a failed Parse never advances the
+            // clock and never disturbs the ordering.
+            stmt.sp_clock = session.next_sp_clock();
             if name.is_empty() {
                 state.unnamed_statement = Some(stmt);
             } else {
@@ -529,6 +584,9 @@ fn parse_statement(
         tokens,
         kind,
         param_types,
+        // Stamped by `handle_parse` once the parse succeeded
+        // (V0.8) — a placeholder here, never left in place.
+        sp_clock: 0,
     })
 }
 
@@ -613,7 +671,7 @@ pub(crate) fn handle_bind(
     writer: &mut impl Write,
     shared: &Arc<Mutex<Shared>>,
     state: &mut ExtendedState,
-    session: &Session,
+    session: &mut Session,
     body: &[u8],
 ) -> Result<(), SqlError> {
     let mut r = MsgReader::new(body);
@@ -699,7 +757,7 @@ pub(crate) fn handle_bind(
 fn bind_portal(
     shared: &Arc<Mutex<Shared>>,
     state: &ExtendedState,
-    session: &Session,
+    session: &mut Session,
     portal_name: &str,
     stmt_name: &str,
     fmt_codes: &[i16],
@@ -758,6 +816,10 @@ fn bind_portal(
         // bound in, so a later Execute can tell it is dead.
         txn_at_bind: session.txn,
         gen_at_bind: session.generation,
+        // V0.8: stamp the portal with the session clock, so a
+        // later ROLLBACK TO SAVEPOINT can tell it was created
+        // after that savepoint (higher clock) and close it.
+        sp_clock: session.next_sp_clock(),
     })
 }
 
@@ -941,6 +1003,12 @@ pub(crate) fn handle_execute(
         if session.generation != generation_before {
             state.close_all_portals();
         }
+        // V0.8: a ROLLBACK TO SAVEPOINT executed through this
+        // portal closed the portals / statements created after
+        // that savepoint — apply the cutoff now.
+        if let Some(cutoff) = session.take_savepoint_cutoff() {
+            state.close_after_savepoint(cutoff);
+        }
         match outcome? {
             StmtOutcome::Rows { columns, rows } => {
                 let fresh = CachedRows {
@@ -1041,6 +1109,51 @@ mod tests {
 
     fn toks(sql: &str) -> Vec<Token> {
         tokenize(sql).expect("test SQL must tokenize")
+    }
+
+    #[test]
+    fn close_after_savepoint_keeps_earlier_closes_later() {
+        // V0.8: a ROLLBACK TO SAVEPOINT closes every portal and
+        // prepared statement with a clock HIGHER than the
+        // savepoint's; lower-or-equal clocks survive.
+        let mut state = ExtendedState::new();
+        let stmt = |clock: u64| PreparedStatement {
+            tokens: vec![],
+            kind: StmtKind::Select,
+            param_types: vec![],
+            sp_clock: clock,
+        };
+        state.statements.insert("old".to_string(), stmt(1));
+        state.statements.insert("new".to_string(), stmt(5));
+        state.unnamed_statement = Some(stmt(7));
+        let portal = |name: &str, clock: u64| Portal {
+            statement_name: name.to_string(),
+            statement: stmt(clock),
+            params: vec![],
+            result_formats: vec![],
+            cached: None,
+            rows_sent: 0,
+            txn_at_bind: None,
+            gen_at_bind: 0,
+            sp_clock: clock,
+        };
+        state.portals.insert("p_old".to_string(), portal("old", 2));
+        state.portals.insert("p_new".to_string(), portal("new", 6));
+        state.unnamed_portal = Some(portal("old", 8));
+        // Roll back to the savepoint with clock 3: clocks > 3 go.
+        state.close_after_savepoint(3);
+        assert!(state.statements.contains_key("old"));
+        assert!(!state.statements.contains_key("new"));
+        assert!(
+            state.unnamed_statement.is_none(),
+            "unnamed statement (clock 7) must close"
+        );
+        assert!(state.portals.contains_key("p_old"));
+        assert!(!state.portals.contains_key("p_new"));
+        assert!(
+            state.unnamed_portal.is_none(),
+            "unnamed portal (clock 8) must close"
+        );
     }
 
     #[test]

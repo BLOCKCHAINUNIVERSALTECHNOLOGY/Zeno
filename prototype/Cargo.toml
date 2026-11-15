@@ -1,8 +1,8 @@
 [package]
 name = "zeno"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
-description = "Zeno — One Engine, All Data. Hybrid key-value + table + JSON document database in Rust (V0.7 prototype)."
+description = "Zeno — One Engine, All Data. Hybrid key-value + table + JSON document database in Rust (V0.8 prototype)."
 license = "Apache-2.0"
 
 [[bin]]
@@ -33,6 +33,13 @@ unicode-normalization = "0.1"
 rustls = { version = "0.23", features = ["ring"] }
 rcgen = "0.14"
 time = "0.3"
+# Graceful shutdown (V0.8): `ctrlc` is the small, widely reviewed
+# SIGINT/SIGTERM handler crate — a dedicated thread waits on the
+# signals (no unsafe signal-handler code of our own). The
+# `termination` feature is REQUIRED for SIGTERM (and SIGHUP):
+# without it ctrlc only handles SIGINT. Only this one new
+# dependency in V0.8.
+ctrlc = { version = "3", features = ["termination"] }
 
 [profile.release]
 opt-level = 2

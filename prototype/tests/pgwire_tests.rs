@@ -151,6 +151,44 @@ impl Server {
         std::mem::forget(self);
         dir
     }
+
+    /// Send SIGTERM (not SIGKILL) and wait for a graceful exit:
+    /// the server stops accepting, lets live queries finish,
+    /// flushes and saves meta.json, then exits 0. Returns the
+    /// exit status and the (kept) data directory, like
+    /// `stop_keep_dir`. Uses the `kill` command and the child's
+    /// real PID (`Child::id`) — never a shell `$!`, which in
+    /// this sandbox's exec wrapper is the wrapper shell's PID,
+    /// not the server's. The tests run on Linux.
+    fn shutdown_gracefully(mut self) -> (std::process::ExitStatus, PathBuf) {
+        let pid = self.child.id();
+        let sent = std::process::Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(sent, "kill -TERM {pid} must succeed");
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    let dir = self.dir.clone();
+                    std::mem::forget(self);
+                    return (status, dir);
+                }
+                Ok(None) => {
+                    if std::time::Instant::now() > deadline {
+                        let _ = self.child.kill();
+                        let _ = self.child.wait();
+                        panic!("server did not exit within 15s of SIGTERM");
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => panic!("try_wait failed: {e}"),
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1948,6 +1986,35 @@ fn scram_wrong_password_rejected_and_connection_closed() {
     let msgs = scram_login(&mut client2, "sanjay", "correct horse battery staple");
     assert!(msgs.iter().any(|m| matches!(m, Msg::AuthOk)), "{msgs:?}");
     client2.terminate();
+}
+
+#[test]
+fn failed_login_closes_connection_promptly() {
+    // V0.8 regression test: the graceful-shutdown socket list
+    // first kept a clone of every connection forever, so the peer
+    // never saw EOF after a failed login — the client waited out
+    // its whole 5 s read timeout instead of seeing the close at
+    // once (the pgwire suite went from ~21s to ~57s before the
+    // clone was removed on thread exit). A failed login must
+    // close the connection promptly.
+    let server = Server::start("scram-close-promptly");
+    set_password(&server.dir, "sanjay", "correct horse battery staple");
+    let mut client = Client::connect_socket(server.port);
+    let outcome = scram_login_outcome(&mut client, "sanjay", "wrong password");
+    assert!(
+        matches!(outcome, Msg::ErrorResponse(ref code, _) if code == "28P01"),
+        "wrong password must be 28P01, got: {outcome:?}"
+    );
+    let start = std::time::Instant::now();
+    assert!(
+        client.try_read_one().is_none(),
+        "the server must close the connection after a failed login"
+    );
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "the close must arrive promptly, not after the 5 s client timeout — took {elapsed:?} (a leaked socket clone keeps the connection open)"
+    );
 }
 
 #[test]
@@ -3821,18 +3888,22 @@ fn review_bigint_where_and_order_by_are_exact_above_2_pow_53() {
 
 #[test]
 fn review_portal_cache_invalidated_after_rollback_to_savepoint() {
-    // B2 (V0.7 review): a suspended portal's cached rows
-    // included a row the ROLLBACK TO SAVEPOINT had just undone,
-    // and resuming the portal served it. The cache must be
-    // re-run fresh (resuming from the rows already sent).
+    // B2 (V0.7 review), kept in V0.8 for portals created BEFORE
+    // the savepoint: a suspended portal's cached rows included a
+    // row the ROLLBACK TO SAVEPOINT had just undone, and resuming
+    // the portal served it. The cache must be re-run fresh
+    // (resuming from the rows already sent). (A portal created
+    // AFTER the savepoint is closed outright by the rollback in
+    // V0.8 — see `savepoint_rollback_closes_portals_created_after_it`.)
+    // So the Parse/Bind happen BEFORE the savepoint here: this
+    // portal survives the rollback (PostgreSQL keeps pre-savepoint
+    // portals) and only its stale cache is re-run.
     let server = Server::start("fix-portal-stale");
     let (mut client, _) = Client::connect(server.port);
     client.query("CREATE TABLE t (id, name)");
     client.query("INSERT INTO t VALUES (1, 'n1')");
     client.query("INSERT INTO t VALUES (2, 'n2')");
     client.query("BEGIN");
-    client.query("SAVEPOINT sp");
-    client.query("INSERT INTO t VALUES (3, 'n3')");
     let msgs = client.extended(&[
         parse_frame("s1", "SELECT * FROM t", &[]),
         bind_frame("p1", "s1", &[], &[], &[]),
@@ -3848,6 +3919,8 @@ fn review_portal_cache_invalidated_after_rollback_to_savepoint() {
         msgs.iter().any(|m| matches!(m, Msg::PortalSuspended)),
         "must suspend: {msgs:?}"
     );
+    client.query("SAVEPOINT sp");
+    client.query("INSERT INTO t VALUES (3, 'n3')");
     // Roll back the insert of row 3, via the extended protocol.
     let msgs = client.extended(&[
         parse_frame("", "ROLLBACK TO SAVEPOINT sp", &[]),
@@ -3873,6 +3946,211 @@ fn review_portal_cache_invalidated_after_rollback_to_savepoint() {
     assert_eq!(Client::tag(&msgs).as_deref(), Some("SELECT 2"), "{msgs:?}");
     client.query("COMMIT");
     client.terminate();
+}
+
+#[test]
+fn savepoint_rollback_closes_portals_and_statements_created_after_it() {
+    // V0.8 (PostgreSQL behaviour): ROLLBACK TO SAVEPOINT closes
+    // every portal AND prepared statement created AFTER the
+    // savepoint. Using one afterwards fails with 26000 (invalid
+    // sql statement name) — and the connection stays alive.
+    let server = Server::start("savepoint-close-after");
+    let (mut client, _) = Client::connect(server.port);
+    client.query("CREATE TABLE t (id, name)");
+    client.query("INSERT INTO t VALUES (1, 'n1')");
+    client.query("INSERT INTO t VALUES (2, 'n2')");
+    client.query("BEGIN");
+    client.query("SAVEPOINT sp");
+    client.query("INSERT INTO t VALUES (3, 'n3')");
+    // Prepared statement + portal created AFTER the savepoint.
+    let msgs = client.extended(&[
+        parse_frame("s1", "SELECT * FROM t", &[]),
+        bind_frame("p1", "s1", &[], &[], &[]),
+        execute_frame("p1", 0),
+        sync_frame(),
+    ]);
+    assert_eq!(
+        Client::rows(&msgs).len(),
+        3,
+        "before the rollback all 3 rows show: {msgs:?}"
+    );
+    // Roll back via Simple Query (so the cutoff path through
+    // client_loop is covered too).
+    let msgs = client.query("ROLLBACK TO SAVEPOINT sp");
+    assert!(Client::error(&msgs).is_none(), "{msgs:?}");
+    assert_eq!(Client::rows(&client.query("SELECT * FROM t")).len(), 2);
+    // The portal is closed: Execute fails with 26000.
+    let msgs = client.extended(&[execute_frame("p1", 0), sync_frame()]);
+    let (code, _) = Client::error(&msgs).expect("closed portal must error");
+    assert_eq!(code, "26000", "{msgs:?}");
+    // Describe of the closed portal: 26000 too.
+    let msgs = client.extended(&[describe_frame(b'P', "p1"), sync_frame()]);
+    let (code, _) = Client::error(&msgs).expect("closed portal Describe must error");
+    assert_eq!(code, "26000", "{msgs:?}");
+    // The prepared statement is closed too: Bind from it is 26000...
+    let msgs = client.extended(&[bind_frame("p2", "s1", &[], &[], &[]), sync_frame()]);
+    let (code, _) = Client::error(&msgs).expect("closed statement Bind must error");
+    assert_eq!(code, "26000", "{msgs:?}");
+    // ...and Describe(S) of it is 26000.
+    let msgs = client.extended(&[describe_frame(b'S', "s1"), sync_frame()]);
+    let (code, _) = Client::error(&msgs).expect("closed statement Describe must error");
+    assert_eq!(code, "26000", "{msgs:?}");
+    // The connection is still usable: re-Parse + Bind + Execute work.
+    let msgs = client.extended(&[
+        parse_frame("s1", "SELECT * FROM t", &[]),
+        bind_frame("p1", "s1", &[], &[], &[]),
+        execute_frame("p1", 0),
+        sync_frame(),
+    ]);
+    assert_eq!(
+        Client::rows(&msgs).len(),
+        2,
+        "re-created portal sees 2 rows: {msgs:?}"
+    );
+    client.query("COMMIT");
+    client.terminate();
+}
+
+#[test]
+fn savepoint_rollback_keeps_portals_and_statements_created_before_it() {
+    // V0.8: only objects created AFTER the savepoint are closed.
+    // A portal and a prepared statement from BEFORE the savepoint
+    // survive the rollback and still run — and a statement from
+    // before it can still be bound afterwards.
+    let server = Server::start("savepoint-keep-before");
+    let (mut client, _) = Client::connect(server.port);
+    client.query("CREATE TABLE t (id, name)");
+    client.query("INSERT INTO t VALUES (1, 'n1')");
+    client.query("INSERT INTO t VALUES (2, 'n2')");
+    client.query("BEGIN");
+    // Statement + portal created BEFORE the savepoint.
+    let msgs = client.extended(&[
+        parse_frame("s0", "SELECT * FROM t", &[]),
+        bind_frame("p0", "s0", &[], &[], &[]),
+        sync_frame(),
+    ]);
+    assert!(Client::error(&msgs).is_none(), "{msgs:?}");
+    client.query("SAVEPOINT sp");
+    client.query("INSERT INTO t VALUES (3, 'n3')");
+    let msgs = client.query("ROLLBACK TO SAVEPOINT sp");
+    assert!(Client::error(&msgs).is_none(), "{msgs:?}");
+    // The pre-savepoint portal still executes — 2 rows, no row 3.
+    let msgs = client.extended(&[execute_frame("p0", 0), sync_frame()]);
+    assert!(Client::error(&msgs).is_none(), "{msgs:?}");
+    assert_eq!(
+        Client::rows(&msgs).len(),
+        2,
+        "pre-savepoint portal must still run: {msgs:?}"
+    );
+    // The pre-savepoint statement can still be bound after the rollback.
+    let msgs = client.extended(&[
+        bind_frame("p9", "s0", &[], &[], &[]),
+        execute_frame("p9", 0),
+        sync_frame(),
+    ]);
+    assert!(Client::error(&msgs).is_none(), "{msgs:?}");
+    assert_eq!(Client::rows(&msgs).len(), 2, "{msgs:?}");
+    client.query("COMMIT");
+    client.terminate();
+}
+
+#[test]
+fn graceful_shutdown_sigterm_exits_zero_and_keeps_data() {
+    // V0.8: SIGTERM shuts the server down gracefully — exit 0,
+    // meta.json freshly saved by the shutdown itself, and the
+    // data is all there on restart.
+    let server = Server::start("graceful-shutdown");
+    let (mut client, _) = Client::connect(server.port);
+    client.query("CREATE TABLE t (id, name)");
+    client.query("INSERT INTO t VALUES (1, 'Sanjay')");
+    client.query("INSERT INTO t VALUES (2, 'Asha')");
+    client.terminate();
+    // No meta.json while the server runs: it only saves it on
+    // flush/drop, and two rows do not trigger a flush — so a
+    // meta.json after the shutdown proves the shutdown saved it.
+    assert!(
+        std::fs::metadata(server.dir.join("meta.json")).is_err(),
+        "meta.json must not exist before the shutdown"
+    );
+    let (status, dir) = server.shutdown_gracefully();
+    assert!(
+        status.success(),
+        "SIGTERM shutdown must exit 0, got {status}"
+    );
+    assert_eq!(status.code(), Some(0), "exit code must be 0, got {status}");
+    let meta = std::fs::metadata(dir.join("meta.json")).expect("shutdown must save meta.json");
+    assert!(meta.len() > 0, "meta.json must not be empty");
+    // Restart on the same directory: both rows are back.
+    let server2 = Server::start_with_args_on_dir(dir, &[]);
+    let (mut client, _) = Client::connect(server2.port);
+    let rows = Client::rows(&client.query("SELECT * FROM t"));
+    assert_eq!(
+        rows.len(),
+        2,
+        "both rows must survive the graceful shutdown: {rows:?}"
+    );
+    assert_eq!(rows[0][1], Some("Sanjay".to_string()));
+    assert_eq!(rows[1][1], Some("Asha".to_string()));
+    client.terminate();
+}
+
+#[test]
+fn bench_command_reports_measured_numbers() {
+    // V0.8: `zeno bench` runs and prints real measured numbers
+    // (median/p95/ops/s) for the row counts asked for — and says
+    // plainly that no PostgreSQL/MongoDB comparison ran.
+    let bin = env!("CARGO_BIN_EXE_zeno");
+    let out = std::process::Command::new(bin)
+        .args(["bench", "--rows", "100"])
+        .output()
+        .expect("zeno bench must run");
+    assert!(
+        out.status.success(),
+        "bench must exit 0: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    for needle in [
+        "rows = 100",
+        "median of 3 runs",
+        "KV put",
+        "KV get",
+        "table insert",
+        "table select",
+        "median",
+        "p95",
+        "ops/s",
+        "no PostgreSQL/MongoDB comparison",
+    ] {
+        assert!(
+            text.contains(needle),
+            "bench output must contain '{needle}':\n{text}"
+        );
+    }
+}
+
+#[test]
+fn bench_duplicate_rows_rejected_with_clear_error() {
+    // M2 (V0.8 review): `zeno bench --rows 100,100` used to be
+    // accepted and then failed mid-run with "table 'bench100'
+    // already exists" — after the first iteration had already run
+    // and (before the M3 fix) leaked its temp dir. Duplicates must
+    // be rejected up front, with the duplicate count named.
+    let bin = env!("CARGO_BIN_EXE_zeno");
+    let out = std::process::Command::new(bin)
+        .args(["bench", "--rows", "100,100"])
+        .output()
+        .expect("zeno bench must run");
+    assert!(
+        !out.status.success(),
+        "duplicate --rows must fail, stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("duplicate") && err.contains("100"),
+        "stderr must name the duplicate count: {err}"
+    );
 }
 
 #[test]

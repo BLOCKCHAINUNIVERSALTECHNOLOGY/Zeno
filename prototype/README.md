@@ -1,19 +1,22 @@
-# Zeno — One Engine, All Data (V0.7 prototype)
+# Zeno — One Engine, All Data (V0.8 prototype)
 
 > **Zeno is a hybrid SQL + JSON database in Rust — not ZenoDB (Lantern, Go
 > time-series) and not ZenDB.** The name was chosen knowing those exist.
 
-Zeno V0.7 is a small, working, single-node database prototype. One engine
+Zeno V0.8 is a small, working, single-node database prototype. One engine
 stores three kinds of data: **key-value**, **tables**, and **JSON
 documents**. It is written in Rust using `std` + `serde` +
 `serde_json` + small RustCrypto crates (`sha2`, `hmac`, `pbkdf2`,
 `base64`, `getrandom`, `subtle`) for SCRAM-SHA-256 auth, plus
 `rustls` (TLS 1.2/1.3, `ring` provider) + `rcgen` (self-signed
-certificate generation) for `serve --tls` — no heavy dependencies,
-no external database engine. V0.7 adds **a real SQL parser**
-(lexer + recursive-descent parser), **savepoints**, and a
-**background auto-vacuum** on top of the V0.6 MVCC transactions
-(see "What is new in V0.7").
+certificate generation) for `serve --tls` — and `ctrlc`
+(SIGINT/SIGTERM handling) for the graceful shutdown — no heavy
+dependencies, no external database engine. V0.8 adds
+**PostgreSQL-compatible savepoint portal closing**, a
+**graceful shutdown on SIGINT/SIGTERM**, and a **`zeno bench`
+command with a V1.0 readiness checklist** on top of the V0.7 SQL
+parser, savepoints and background auto-vacuum (see "What is new
+in V0.8").
 
 > **⚠️ LOCAL PROTOTYPE ONLY. With no users configured, `zeno serve`
 > accepts EVERY local client with NO password (trust auth) and
@@ -26,6 +29,79 @@ no external database engine. V0.7 adds **a real SQL parser**
 > shared machine, and never use it in production. Anyone on the
 > same machine can read and change all your data. See "Password
 > auth (SCRAM-SHA-256)" and "TLS" below.**
+
+## What is new in V0.8
+
+- **Savepoint portal closing, PostgreSQL-compatible
+  (`src/pgwire.rs`, `src/extended.rs`, `src/txn.rs`).** V0.7
+  kept every portal alive across a `ROLLBACK TO SAVEPOINT`
+  and re-ran its cached rows fresh — a documented deviation
+  from PostgreSQL, which closes the portals created after the
+  savepoint. V0.8 does what PostgreSQL does: on a successful
+  `ROLLBACK TO SAVEPOINT`, every portal AND prepared statement
+  created AFTER that savepoint is closed, so a later Execute /
+  Describe / Bind of one fails with **26000** (invalid sql
+  statement name) and the connection stays alive. Portals and
+  statements created BEFORE the savepoint survive — and a
+  suspended portal of theirs still re-runs fresh on resume
+  (its cache predates the rollback), exactly like the V0.7
+  review fix (B2). How it works: every SAVEPOINT, Parse and
+  Bind advances a strictly increasing per-connection clock
+  (`Session::sp_clock`); a savepoint records the clock at its
+  creation, a portal / statement records the clock at its
+  Parse/Bind, and the rollback closes everything with a HIGHER
+  clock than the savepoint's. The clock never resets — not even
+  at transaction end — so a statement from before a
+  transaction is never closed by a rollback inside a later one.
+  (Two deliberate deviations remain, unchanged: a failed
+  savepoint-control statement, 3B001, and a VACUUM inside a
+  transaction, 25001, do NOT abort the transaction — see "What
+  is new in V0.7".)
+- **Graceful shutdown on SIGINT/SIGTERM (`src/pgwire.rs`,
+  `serve`).** A signal used to kill the process at once. Now:
+  the first SIGINT/SIGTERM stops the server accepting new
+  connections, stops the auto-vacuum thread, waits up to **5
+  seconds** for live connections to finish their queries and
+  disconnect, then force-closes any sockets still open (a
+  query running longer than the grace period may lose its
+  reply — its committed data is already safe in the WAL),
+  flushes the memtable to an SSTable, saves `meta.json` with
+  fresh counters, and exits **0**. A second signal exits
+  immediately (code 130, force). Signal handling is the
+  `ctrlc` crate (version 3, `termination` feature — without
+  that feature ctrlc only handles SIGINT, not SIGTERM; that
+  cost one debugging round, see `docs/V1-READINESS.md` for the
+  note). The table registry needs no shutdown save — it is
+  written on every mutation already. A failed shutdown flush
+  still exits 0: the data is durable in the WAL and the next
+  open replays it. Known shutdown edges, prototype-only (no
+  fix): the auto-vacuum thread is joined without a timeout; the
+  signal handler is installed only after the engine opens and
+  the socket binds, so a signal in that tiny window still kills
+  at once; `ctrlc` installs once per process; and a portal
+  suspended before a savepoint resumes from its pre-savepoint
+  state on ROLLBACK TO (see V1-READINESS item 14).
+- **Benchmark command + V1.0 checklist (`src/bench.rs`,
+  `docs/V1-READINESS.md`).** `zeno bench [--rows
+  100,1000,10000]` measures Zeno's OWN engine — KV put/get,
+  table insert, full table select — at each row count, with a
+  warmup before each measured run, **3 measured runs per row
+  count, reporting the median of the 3 runs** (a single sample
+  varied 2x run to run in review — KV put 26536 -> 11352 ->
+  14111 ops/s — so one run's numbers are not a measurement),
+  and prints median / p95 / mean latency and ops/s next to the
+  machine (CPU, core count, debug/release). It runs on a fresh
+  temporary data directory that is removed afterwards, so it
+  never touches the user's data. The numbers are this machine's only: there
+  is NO comparison with PostgreSQL or MongoDB, because neither
+  is installed in this sandbox (`which psql mongod postgres`
+  finds nothing) — the checklist says so plainly, and no
+  estimated or guessed comparison number appears anywhere.
+  `docs/V1-READINESS.md` lists everything still missing
+  before V1.0 (psql verification, power-loss test, JOIN,
+  2PC, production hardening, benchmarks vs PostgreSQL/MongoDB)
+  with an honest done / pending status per item.
+- Version is now **0.8.0** (Cargo.toml, CLI, README).
 
 ## What is new in V0.7
 
@@ -87,9 +163,12 @@ no external database engine. V0.7 adds **a real SQL parser**
   Simple Query AND the extended protocol. A suspended portal
   whose cached rows predate a ROLLBACK TO SAVEPOINT is re-run
   fresh on its next Execute (resuming from the rows already
-  sent), so it can never serve a row the rollback undid —
-  PostgreSQL closes portals created after the savepoint instead;
-  Zeno re-runs them. One PostgreSQL behaviour
+  sent), so it can never serve a row the rollback undid — but
+  only when the portal was created BEFORE the savepoint: since
+  V0.8, PostgreSQL's rule applies and portals / prepared
+  statements created AFTER the savepoint are closed instead
+  (26000 on a later use) — see "What is new in V0.8". One
+  PostgreSQL behaviour
   is kept deliberately: `ROLLBACK TO SAVEPOINT` is the way back
   out of an aborted (25P02) transaction — it runs while aborted
   and clears the abort, so the transaction is usable again. A
@@ -119,10 +198,14 @@ no external database engine. V0.7 adds **a real SQL parser**
   thread. A vacuum that prunes nothing does NOT rewrite the
   SSTables: the data is already durable as it is, so a no-op
   vacuum burns no new SSTable id. The stop flag + join run when
-  the server stops serving (the accept loop ending on a listener
-  error) — there is no signal handling, so SIGINT/SIGTERM still
-  end the process at once and the thread dies with it, as with
-  every other server thread. The interval is
+  the server stops serving — since V0.8 that is the graceful
+  shutdown on SIGINT/SIGTERM (see "What is new in V0.8"): the
+  signal stops the accept loop first, then the vacuum thread is
+  stopped and joined, so no vacuum is left running after the
+  server has stopped serving. (Before V0.8 the accept loop only
+  ended on a listener error and there was no signal handling, so
+  SIGINT/SIGTERM ended the process at once and the thread died
+  with it.) The interval is
   also settable small for tests (`--vacuum-interval 1`); the
   manual `VACUUM` statement and the `vacuum` CLI command are
   unchanged and still work. (The library API clamps an interval
@@ -146,9 +229,10 @@ below. Each has a regression test (see "Tests").
   SAVEPOINT undid.** A successful ROLLBACK TO bumps a
   per-connection cache epoch; a portal whose cached rows
   predate it re-runs its statement fresh on the next Execute
-  and resumes from the rows already sent. (PostgreSQL closes
-  portals created after the savepoint; Zeno re-runs them —
-  see "What is new in V0.7".)
+  and resumes from the rows already sent. (V0.8 narrows this
+  to portals created BEFORE the savepoint: portals and
+  prepared statements created AFTER it are now closed
+  outright, PostgreSQL-style — see "What is new in V0.8".)
 - **M1 — duplicate savepoint names stack.** A second
   `SAVEPOINT s` hides the first instead of deleting it;
   `RELEASE s` reveals the first again, so `ROLLBACK TO s`
@@ -179,6 +263,47 @@ below. Each has a regression test (see "Tests").
   busy-spin; m6 a panic inside the auto-vacuum thread is
   caught with `catch_unwind`, logged, and the thread retries
   at the next interval.
+
+## V0.8 review fixes (post-review hardening)
+
+A review of V0.8 found no blockers, 3 must-fix items and 5
+minors; all must-fix items and minors m1–m3 are fixed, m4
+needed no fix, m5 is documented only. Each fix has a
+regression test (see "Tests").
+
+- **M1 — `zeno --version` works and creates nothing.**
+  `--version` / `-V` are handled in `main()` like `--help`,
+  before any engine opens: they print `zeno 0.8.0` and exit 0.
+  Unknown top-level commands are also validated before the
+  engine opens, so a typo no longer creates a `zeno-data/`
+  directory. (Before: `--version` fell through to `run()`,
+  exited 1, and created `zeno-data/` with meta.json + wal.log.)
+- **M2 — duplicate `--rows` rejected up front.** `parse_rows`
+  rejects a repeated count with a clear error (`--rows has
+  duplicate count 100 — each row count may appear only once`).
+  (Before: `--rows 100,100` was accepted and failed mid-run
+  when the second iteration tried to create `bench100` again.)
+- **M3 — bench temp dir removed on every exit path.** The
+  temp dir is owned by a `BenchTempDir` Drop guard, created
+  before the engine opens: success, any error return, or a
+  panic all remove `/tmp/zeno-bench-<pid>-<nanos>/`. (Before:
+  the dir was removed only at the end of `run()`, so every
+  failed bench run leaked it.)
+- **Minors:** m1 `docs/V1-READINESS.md` said 247 tests, the
+  real count is 255; m2 the README "Tests" section still
+  quoted V0.7 counts (119 unit / 79 pgwire / 239 total) —
+  now 127 / 85 / 255; m3 `zeno bench` was single-sample and
+  varied 2x run to run, so each row count is now measured 3
+  times and the median of the 3 runs is reported; m4 the
+  "shutdown 5s grace" observation did not reproduce (0.00s on
+  an already-disconnected client; 5s only with a client still
+  connected idle, which is the documented design) — no fix;
+  m5 small shutdown edges documented, not fixed: the
+  auto-vacuum thread is joined without a timeout, the signal
+  handler is installed after engine-open/bind, `ctrlc`
+  installs once per process, and a portal suspended before a
+  savepoint resumes from its pre-savepoint state on ROLLBACK
+  TO (see "What is new in V0.8").
 
 ## What is new in V0.6
 
@@ -933,8 +1058,13 @@ Each has a regression test (see "Tests").
   SERIALIZABLE, and no multi-node support (see the other
   bullets in this section). The V0.7 parser and savepoints are
   done (see "What is new in V0.7").
-- **Not production-ready.** No independent audit, no benchmark against
-  other databases. No speed claims are made anywhere in this repo.
+- **Not production-ready.** No independent audit. A Zeno-only
+  benchmark exists (`zeno bench`, see "What is new in V0.8")
+  but there is still no benchmark against PostgreSQL or
+  MongoDB — neither is installed in this sandbox, so no
+  comparison number is claimed anywhere in this repo. No speed
+  claims are made beyond the measured numbers `zeno bench`
+  prints on the machine it runs on.
 
 ## How the engine works (short version)
 
@@ -972,7 +1102,10 @@ cargo build --release
 ./target/release/zeno --data ./my-data stats
 ./target/release/zeno --data ./my-data hold 5   # diagnostic: hold the lock 5s
 
-# PostgreSQL wire protocol (V0.7) — server keeps running until killed
+# PostgreSQL wire protocol (V0.8) — server keeps running until it
+# gets SIGINT/SIGTERM, then shuts down gracefully (stops accepting,
+# up to 5s for live queries, flush + meta.json save, exit 0 —
+# a second signal exits at once). See "What is new in V0.8".
 ./target/release/zeno --data ./my-data serve --port 5433
 # With TLS (needs a certificate first — see below) and a smaller
 # connection cap than the default 20:
@@ -980,6 +1113,13 @@ cargo build --release
 # Auto-vacuum runs every 60s by default; change the interval, or off:
 ./target/release/zeno --data ./my-data serve --port 5433 --vacuum-interval 10
 ./target/release/zeno --data ./my-data serve --port 5433 --no-auto-vacuum
+
+# Benchmark (V0.8) — Zeno's own engine only, on a fresh temp dir
+# (removed afterwards; your data is untouched). No PostgreSQL /
+# MongoDB comparison: neither is installed in this sandbox.
+./target/release/zeno bench
+./target/release/zeno bench --rows 100,1000
+# V1.0 readiness checklist: docs/V1-READINESS.md
 
 # TLS (V0.5): generate a SELF-SIGNED certificate (prototype only —
 # production needs a real CA certificate; clients must pin this
@@ -1122,7 +1262,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-- 119 unit tests (the 99 from V0.6, plus 15 V0.7 parser ones —
+- 127 unit tests (the 99 from V0.6, plus 15 V0.7 parser ones —
   lexer line/column tracking, comments, unterminated string
   position, SELECT with multi-condition WHERE + ORDER BY +
   LIMIT + OFFSET, all six comparison operators, INSERT column
@@ -1139,8 +1279,14 @@ cargo test
   cleanly on stop — plus 1 vacuum-interval clamp one (0 clamps
   to 100 ms, never busy-spins) — plus 3 table ones: integer
   comparison exact above 2^53, duplicate CREATE TABLE column
-  rejected, duplicate UPDATE SET column rejected)
-- 41 integration tests in `tests/engine_tests.rs` (the 23 from
+  rejected, duplicate UPDATE SET column rejected — plus 1 V0.8
+  table one: corrupt row values are warned and counted, not
+  silently dropped — plus 7 V0.8 bench ones: latency summary
+  median/p95/mean, empty summary is zero, `--rows` parsing
+  incl. duplicate rejection, median-of-runs takes the middle
+  value, the temp-dir guard removes on drop, and the error path
+  removes the temp dir)
+- 43 integration tests in `tests/engine_tests.rs` (the 23 from
   V0.5, plus 7 V0.6 ones: commit makes writes visible /
   rollback hides them, snapshot isolation hides later commits,
   write-write conflict aborts the second committer, table
@@ -1159,8 +1305,10 @@ cargo test
   `doc:` prefixes are rejected for raw puts). Two V0.5 tests changed line numbers only:
   an autocommit `put` now writes two WAL records (write +
   commit marker), so the corrupt lines the tests append land
-  on lines 3 and 5 instead of 2 and 3.
-- 79 integration tests in `tests/pgwire_tests.rs` (the 62 from
+  on lines 3 and 5 instead of 2 and 3 — plus 2 V0.8 review-fix
+  ones: `zeno --version` exits 0 and creates no data dir, and an
+  unknown command fails without creating a data dir.
+- 85 integration tests in `tests/pgwire_tests.rs` (the 62 from
   V0.6, plus 17 V0.7 ones: savepoint rollback keeps earlier
   writes and drops later ones (and the savepoint survives a
   ROLLBACK TO), savepoint release + unknown-name 3B001 +
@@ -1182,8 +1330,13 @@ cargo test
   V0.5 test changed deliberately: UPDATE is supported now, so
   the "unsupported SQL" test asserts UPDATE succeeds (UPDATE 1)
   and uses DROP TABLE for the 0A000 case instead; one extended
-  Parse test does the same.
-- 239 tests total, all passing.
+  Parse test does the same — plus 6 V0.8 ones, including
+  savepoint rollback closing portals/statements created after
+  it and keeping the ones created before it, graceful shutdown
+  on SIGTERM exiting 0 and keeping data, `zeno bench`
+  reporting measured numbers, and duplicate `--rows` rejected
+  with a clear error.
+- 255 tests total, all passing.
 
 **How the wire protocol is verified without `psql`:** `psql` is not
 installed in this sandbox, so `tests/pgwire_tests.rs` builds the

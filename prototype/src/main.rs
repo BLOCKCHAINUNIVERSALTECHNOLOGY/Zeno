@@ -30,11 +30,11 @@ use zeno::doc;
 use zeno::engine::Engine;
 use zeno::table::TableStore;
 
-const VERSION: &str = "0.7.0";
+const VERSION: &str = "0.8.0";
 
 fn usage() -> String {
     format!(
-        "Zeno {VERSION} — One Engine, All Data (V0.7 prototype)\n\
+        "Zeno {VERSION} — One Engine, All Data (V0.8 prototype)\n\
         \n\
         Usage: zeno [--data <dir>] <command> [args]   (default data dir: ./zeno-data)\n\
         \n\
@@ -43,7 +43,7 @@ fn usage() -> String {
         \x20 get <key>                fetch a value\n\
         \x20 del <key>                delete a key (tombstone)\n\
         \n\
-        Table (SQL over the wire protocol is parsed by the V0.7 parser;\n\
+        Table (SQL over the wire protocol is parsed by the V0.8 parser;\n\
         \x20 the CLI below is still the simple one-command form):\n\
         \x20 table create <name> <col1,col2,...>\n\
         \x20 table insert <name> <val1,val2,...>\n\
@@ -65,7 +65,7 @@ fn usage() -> String {
         \x20 hold <seconds>           open the engine and hold its lock for N seconds\n\
         \x20                          (diagnostic for the lock demo / tests only)\n\
         \n\
-        PostgreSQL wire protocol (V0.7, Simple + extended query, trust or SCRAM auth):\n\
+        PostgreSQL wire protocol (V0.8, Simple + extended query, trust or SCRAM auth):\n\
         \x20 serve [--port <port>] [--tls] [--max-connections <n>]\n\
         \x20       [--vacuum-interval <seconds>] [--no-auto-vacuum]\n\
         \x20                          listen on 127.0.0.1:<port> (default 5432) and\n\
@@ -78,7 +78,24 @@ fn usage() -> String {
         \x20                          auto-vacuum runs every --vacuum-interval\n\
         \x20                          seconds (default 60; --no-auto-vacuum turns\n\
         \x20                          it off) — it prunes only versions no live\n\
-        \x20                          snapshot needs.\n\
+        \x20                          snapshot needs. On SIGINT/SIGTERM the server\n\
+        \x20                          shuts down gracefully: it stops accepting new\n\
+        \x20                          connections, lets live queries finish (up to 5s),\n\
+        \x20                          stops the auto-vacuum, flushes the memtable and\n\
+        \x20                          saves meta.json, then exits 0 (a second signal\n\
+        \x20                          exits immediately).\n\
+        \n\
+        Benchmark (V0.8, Zeno's own engine only — no PostgreSQL/\n\
+        \x20 MongoDB comparison: neither is installed here):\n\
+        \x20 bench [--rows 100,1000,10000]\n\
+        \x20                          measure KV put/get + table insert/select\n\
+        \x20                          throughput and latency (median/p95) at each\n\
+        \x20                          row count: 3 measured runs per row count,\n\
+        \x20                          median of the 3 reported (a single sample\n\
+        \x20                          varies run to run), with warmup, on a fresh\n\
+        \x20                          temp dir (removed afterwards — your data is\n\
+        \x20                          untouched).\n\
+        \x20                          Numbers are for this machine only; see README.\n\
         \x20                          LOCAL PROTOTYPE ONLY: with no users\n\
         \x20                          configured any local client may connect, no\n\
         \x20                          password. Example: zeno --data ./my-data serve\n\
@@ -173,6 +190,16 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // M1 (V0.8 review): `--version` used to fall through to
+    // `run()`, which opened the engine first — so `zeno --version`
+    // in an empty directory exited 1 AND created a `zeno-data/`
+    // directory (meta.json + wal.log). Like `--help`, it is handled
+    // here, before any engine is opened.
+    if args[0] == "--version" || args[0] == "-V" {
+        println!("zeno {VERSION}");
+        return ExitCode::SUCCESS;
+    }
+
     match run(
         &data_dir,
         port,
@@ -232,6 +259,27 @@ fn run(
     // a password set here applies at once, with no restart.
     if cmd == "user" {
         return run_user(data_dir, &args[1..]);
+    }
+
+    // `bench` measures the engine on a fresh TEMPORARY data
+    // directory (deleted afterwards) — it must not open the user's
+    // data dir, so it runs before the one-shot open below, like
+    // `serve` / `cert` / `user`.
+    if cmd == "bench" {
+        return run_bench(&args[1..]);
+    }
+
+    // M1 (V0.8 review): validate the top-level command BEFORE
+    // opening the engine. Any unknown command (a typo, `--version`
+    // if it ever got this far) used to open the engine first and
+    // create the data directory, then fail. The commands above
+    // (`serve` / `cert` / `user` / `bench`) never open the engine;
+    // the ones below all need it — so the check belongs here.
+    const KNOWN_COMMANDS: &[&str] = &[
+        "put", "get", "del", "flush", "compact", "vacuum", "hold", "stats", "table", "doc",
+    ];
+    if !KNOWN_COMMANDS.contains(&cmd) {
+        return Err(format!("unknown command '{cmd}'\n\n{}", usage()));
     }
 
     let mut engine = Engine::open(data_dir).map_err(|e| format!("cannot open data dir: {e}"))?;
@@ -398,6 +446,25 @@ fn run(
         other => return Err(format!("unknown command '{other}'\n\n{}", usage())),
     }
     Ok(())
+}
+
+/// `bench [--rows 100,1000,10000]`: measure Zeno's own engine
+/// (see `bench.rs`). Runs on a fresh temp dir, never on `--data`.
+fn run_bench(args: &[String]) -> Result<(), String> {
+    let mut rows = zeno::bench::DEFAULT_ROWS.to_vec();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--rows" && i + 1 < args.len() {
+            rows = zeno::bench::parse_rows(&args[i + 1])?;
+            i += 2;
+        } else {
+            return Err(format!(
+                "unknown bench argument '{}' — usage: zeno bench [--rows 100,1000,10000]",
+                args[i]
+            ));
+        }
+    }
+    zeno::bench::run(&rows)
 }
 
 fn run_cert(data_dir: &Path, args: &[String]) -> Result<(), String> {

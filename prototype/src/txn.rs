@@ -230,12 +230,18 @@ pub struct Txn {
     pub savepoints: Vec<Savepoint>,
 }
 
-/// One savepoint: its name and the write buffer as it was when the
-/// savepoint was established.
+/// One savepoint: its name, the write buffer as it was when the
+/// savepoint was established, and the session savepoint-clock
+/// value at that moment (V0.8). The clock is a strictly increasing
+/// per-connection event number (see `Session::sp_clock` in
+/// `pgwire.rs`): a portal or prepared statement created AFTER this
+/// savepoint has a HIGHER clock, so `ROLLBACK TO` can close
+/// exactly those (PostgreSQL behaviour) by comparing clocks.
 #[derive(Debug, Clone)]
 pub struct Savepoint {
     pub name: String,
     pub writes: std::collections::BTreeMap<String, Option<String>>,
+    pub clock: u64,
 }
 
 impl Txn {

@@ -773,6 +773,21 @@ impl Engine {
         Ok(())
     }
 
+    /// Graceful shutdown (V0.8): flush the memtable to an SSTable
+    /// (which also clears the WAL — its records are durable in the
+    /// SSTable now) and persist `meta.json` with the fresh counters.
+    /// The flush runs first even if the meta save then fails, and
+    /// vice versa: both are attempted, the first error is reported.
+    /// Committed data is durable in the WAL even without this call
+    /// (every commit fsyncs), so a failure here loses nothing —
+    /// the next open replays the WAL. `Drop` also saves meta, but
+    /// this is the explicit shutdown path, with a real error.
+    pub(crate) fn shutdown_persist(&mut self) -> std::io::Result<()> {
+        let flush_result = self.flush();
+        let meta_result = self.save_meta();
+        flush_result.and(meta_result)
+    }
+
     fn maybe_flush(&mut self) -> std::io::Result<()> {
         if self.memtable.is_full() {
             self.flush()?;
@@ -1387,7 +1402,7 @@ impl Engine {
     /// the first savepoint). `RELEASE` removes only the newest
     /// savepoint of that name and reveals the older one again;
     /// `ROLLBACK TO` addresses the newest one.
-    pub fn txn_savepoint(&mut self, txn: u64, name: &str) -> Result<(), String> {
+    pub fn txn_savepoint(&mut self, txn: u64, name: &str, clock: u64) -> Result<(), String> {
         let t = self
             .active_txns
             .get_mut(&txn)
@@ -1395,6 +1410,7 @@ impl Engine {
         t.savepoints.push(crate::txn::Savepoint {
             name: name.to_string(),
             writes: t.writes.clone(),
+            clock,
         });
         Ok(())
     }
@@ -1405,7 +1421,11 @@ impl Engine {
     /// rolling back to it again still works; savepoints made
     /// after it are gone (they described a buffer state that no
     /// longer exists). Unknown name: 3B001 at the SQL layer.
-    pub fn txn_rollback_to_savepoint(&mut self, txn: u64, name: &str) -> Result<(), String> {
+    /// Returns the named savepoint's clock (V0.8): the caller
+    /// closes every portal / prepared statement whose clock is
+    /// HIGHER than it — those were created after the savepoint
+    /// (PostgreSQL behaviour).
+    pub fn txn_rollback_to_savepoint(&mut self, txn: u64, name: &str) -> Result<u64, String> {
         let t = self
             .active_txns
             .get_mut(&txn)
@@ -1416,9 +1436,10 @@ impl Engine {
             .rposition(|s| s.name == name)
             .ok_or_else(|| format!("no such savepoint '{name}'"))?;
         let saved = t.savepoints[pos].writes.clone();
+        let clock = t.savepoints[pos].clock;
         t.writes = saved;
         t.savepoints.truncate(pos + 1);
-        Ok(())
+        Ok(clock)
     }
 
     /// RELEASE SAVEPOINT (V0.7): forget the NEWEST savepoint of

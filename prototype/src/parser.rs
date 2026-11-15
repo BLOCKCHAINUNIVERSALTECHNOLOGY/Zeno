@@ -611,26 +611,26 @@ impl Parser {
             "JOIN" | "LEFT" | "RIGHT" | "INNER" | "FULL" | "CROSS" => ParseError::unsupported(
                 t.line,
                 t.col,
-                "JOIN is not supported in Zeno 0.7.0 — query one table at a time \
+                "JOIN is not supported in Zeno 0.8.0 — query one table at a time \
                  (see README: what the parser does not support)",
             ),
             "GROUP" | "HAVING" => ParseError::unsupported(
                 t.line,
                 t.col,
-                "GROUP BY / HAVING is not supported in Zeno 0.7.0 — no aggregates yet",
+                "GROUP BY / HAVING is not supported in Zeno 0.8.0 — no aggregates yet",
             ),
             "UNION" | "EXCEPT" | "INTERSECT" => ParseError::unsupported(
                 t.line,
                 t.col,
                 format!(
-                    "{} is not supported in Zeno 0.7.0 — one SELECT per statement",
+                    "{} is not supported in Zeno 0.8.0 — one SELECT per statement",
                     t.word_upper()
                 ),
             ),
             "ON" => ParseError::unsupported(
                 t.line,
                 t.col,
-                "JOIN ... ON is not supported in Zeno 0.7.0 — query one table at a time",
+                "JOIN ... ON is not supported in Zeno 0.8.0 — query one table at a time",
             ),
             _ => ParseError::syntax(
                 t.line,
@@ -708,7 +708,7 @@ impl Parser {
                     t.line,
                     t.col,
                     format!(
-                        "function call {}(...) is not supported in Zeno 0.7.0 — use a literal value",
+                        "function call {}(...) is not supported in Zeno 0.8.0 — use a literal value",
                         t.word_upper()
                     ),
                 ));
@@ -734,7 +734,7 @@ impl Parser {
                 TokKind::Punct(p) if p == "(" => Err(ParseError::unsupported(
                     t.line,
                     t.col,
-                    "subqueries are not supported in Zeno 0.7.0 — use a literal value",
+                    "subqueries are not supported in Zeno 0.8.0 — use a literal value",
                 )),
                 _ => Err(self.err_at(t, "a value")),
             },
@@ -756,7 +756,7 @@ impl Parser {
             "WITH" => Err(ParseError::unsupported(
                 first.line,
                 first.col,
-                "WITH (common table expressions) is not supported in Zeno 0.7.0",
+                "WITH (common table expressions) is not supported in Zeno 0.8.0",
             )),
             other => Err(ParseError::syntax(
                 first.line,
@@ -791,7 +791,7 @@ impl Parser {
                             t.line,
                             t.col,
                             format!(
-                                "aggregate/function {upper}(...) is not supported in Zeno 0.7.0 \
+                                "aggregate/function {upper}(...) is not supported in Zeno 0.8.0 \
                                  — no aggregates yet (see README)"
                             ),
                         ));
@@ -800,7 +800,7 @@ impl Parser {
                         return Err(ParseError::unsupported(
                             t.line,
                             t.col,
-                            format!("function call {upper}(...) is not supported in Zeno 0.7.0"),
+                            format!("function call {upper}(...) is not supported in Zeno 0.8.0"),
                         ));
                     }
                 }
@@ -819,7 +819,7 @@ impl Parser {
             return Err(ParseError::unsupported(
                 t.line,
                 t.col,
-                "subqueries are not supported in Zeno 0.7.0 — query a table directly",
+                "subqueries are not supported in Zeno 0.8.0 — query a table directly",
             ));
         }
         let table = self.expect_name()?;
@@ -901,7 +901,7 @@ impl Parser {
                 return Err(ParseError::unsupported(
                     t.line,
                     t.col,
-                    "OR in WHERE is not supported in Zeno 0.7.0 — use AND, or run two queries",
+                    "OR in WHERE is not supported in Zeno 0.8.0 — use AND, or run two queries",
                 ));
             }
         }
@@ -921,7 +921,7 @@ impl Parser {
                     t.line,
                     t.col,
                     format!(
-                        "subqueries ({} (SELECT ...)) are not supported in Zeno 0.7.0 — \
+                        "subqueries ({} (SELECT ...)) are not supported in Zeno 0.8.0 — \
                          use a literal value, or run the inner query first",
                         t.word_upper()
                     ),
@@ -959,14 +959,14 @@ impl Parser {
                         return Err(ParseError::unsupported(
                             op_tok.line,
                             op_tok.col,
-                            "LIKE is not supported in Zeno 0.7.0 — no pattern matching yet (see README)",
+                            "LIKE is not supported in Zeno 0.8.0 — no pattern matching yet (see README)",
                         ));
                     }
                     "IS" => {
                         return Err(ParseError::unsupported(
                             op_tok.line,
                             op_tok.col,
-                            "IS [NOT] NULL is not supported in Zeno 0.7.0 — Zeno has no NULLs (see README)",
+                            "IS [NOT] NULL is not supported in Zeno 0.8.0 — Zeno has no NULLs (see README)",
                         ));
                     }
                     "NOT" | "BETWEEN" | "IN" => {
@@ -974,7 +974,7 @@ impl Parser {
                             op_tok.line,
                             op_tok.col,
                             format!(
-                                "{} is not supported in Zeno 0.7.0 — use a plain comparison operator (=, !=, <, >, <=, >=)",
+                                "{} is not supported in Zeno 0.8.0 — use a plain comparison operator (=, !=, <, >, <=, >=)",
                                 op_tok.word_upper()
                             ),
                         ));
@@ -1011,7 +1011,7 @@ impl Parser {
                 t.line,
                 t.col,
                 format!(
-                    "{what} with a parameter is not supported in Zeno 0.7.0 — use a literal number"
+                    "{what} with a parameter is not supported in Zeno 0.8.0 — use a literal number"
                 ),
             )),
             _ => Err(ParseError::syntax(
@@ -1047,7 +1047,7 @@ impl Parser {
                 return Err(ParseError::unsupported(
                     t.line,
                     t.col,
-                    "INSERT ... SELECT is not supported in Zeno 0.7.0 — run the SELECT first, then INSERT the values",
+                    "INSERT ... SELECT is not supported in Zeno 0.8.0 — run the SELECT first, then INSERT the values",
                 ));
             }
         }
@@ -1145,7 +1145,7 @@ impl Parser {
                 t.line,
                 t.col,
                 format!(
-                    "only CREATE TABLE is supported in Zeno 0.7.0 (got CREATE '{}')",
+                    "only CREATE TABLE is supported in Zeno 0.8.0 (got CREATE '{}')",
                     t.text()
                 ),
             ));
@@ -1180,7 +1180,7 @@ impl Parser {
                         t.line,
                         t.col,
                         format!(
-                            "table-level constraint {} is not supported in Zeno 0.7.0 — \
+                            "table-level constraint {} is not supported in Zeno 0.8.0 — \
                              put PRIMARY KEY / UNIQUE on a single column instead",
                             t.word_upper()
                         ),

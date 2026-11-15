@@ -346,6 +346,65 @@ fn lock_second_open_fails_while_first_open() {
 }
 
 #[test]
+fn cli_version_exits_zero_and_creates_no_data_dir() {
+    // M1 (V0.8 review): `zeno --version` used to fall through to
+    // run(), open the engine, exit 1, and create a `zeno-data/`
+    // directory in the working directory. It must print the
+    // version, exit 0, and create nothing.
+    let work = tmp_dir("cli-version");
+    for flag in ["--version", "-V"] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_zeno"))
+            .arg(flag)
+            .current_dir(&work)
+            .output()
+            .expect("run zeno --version");
+        assert!(
+            out.status.success(),
+            "{flag} must exit 0, stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "zeno 0.8.0",
+            "{flag} must print exactly the version"
+        );
+    }
+    assert!(
+        !work.join("zeno-data").exists(),
+        "--version must not create a data dir"
+    );
+    cleanup(&work);
+}
+
+#[test]
+fn cli_unknown_command_creates_no_data_dir() {
+    // M1 (V0.8 review): an unknown command (a typo) used to open
+    // the engine before failing, creating `zeno-data/` in the
+    // working directory. It must fail WITHOUT creating anything.
+    let work = tmp_dir("cli-unknown");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_zeno"))
+        .arg("frobnicate")
+        .current_dir(&work)
+        .output()
+        .expect("run zeno frobnicate");
+    assert!(
+        !out.status.success(),
+        "unknown command must fail, stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unknown command 'frobnicate'"),
+        "stderr must name the unknown command: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !work.join("zeno-data").exists(),
+        "unknown command must not create a data dir"
+    );
+    cleanup(&work);
+}
+
+#[test]
 fn lock_stale_after_kill_nine_reopens() {
     let dir = tmp_dir("lock-kill");
     {

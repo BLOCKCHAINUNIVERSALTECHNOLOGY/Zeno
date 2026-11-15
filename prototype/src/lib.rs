@@ -2,6 +2,7 @@
 // these modules; the integration tests use the same public API.
 
 pub mod auth;
+pub mod bench;
 pub mod bloom;
 pub mod doc;
 pub mod engine;

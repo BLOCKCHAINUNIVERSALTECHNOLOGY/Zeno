@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# demo.sh — Zeno V0.7 end-to-end demo.
+# demo.sh — Zeno V0.8 end-to-end demo.
 #
 # Runs a full scenario against one data directory:
 #   1. Key-value put / get / delete
@@ -47,6 +47,11 @@
 #      RELEASE; and the new parser: multi-row INSERT, ORDER BY /
 #      LIMIT, multi-condition WHERE, multi-SET UPDATE, plus a bad
 #      SQL line/column error and a JOIN "not supported" error.
+#  14. GRACEFUL SHUTDOWN + BENCH (V0.8) — a server writes two rows,
+#      gets SIGTERM, and exits 0 after flushing + saving meta.json
+#      (no meta.json exists before the signal); a restart reads the
+#      rows back. Then `zeno bench --rows 100,1000` prints real
+#      measured throughput/latency numbers on this machine.
 #
 # No fake numbers: everything printed below is real output of the binary.
 set -euo pipefail
@@ -976,6 +981,142 @@ PYEOF
 kill $SERVER4 || true
 wait $SERVER4 2>/dev/null || true
 rm -rf ./demo-data-v7
+
+say "14. GRACEFUL SHUTDOWN + BENCH (V0.8)"
+echo "(a server writes two rows, gets SIGTERM, and must exit 0"
+echo " after flushing + saving meta.json — which does not exist"
+echo " before the signal. A restart then reads the rows back."
+echo " Then 'zeno bench' prints real measured numbers.)"
+rm -rf ./demo-data-v8
+$ZENO --data ./demo-data-v8 serve --port 5437 --no-auto-vacuum > ./demo-v8-server.log 2>&1 &
+SERVER5=$!
+sleep 1
+python3 - <<'PYEOF'
+import socket, struct
+
+def recvn(s, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = s.recv(n - len(buf))
+        if not chunk:
+            raise EOFError("connection closed")
+        buf += chunk
+    return buf
+
+def read_msg(s):
+    tag = recvn(s, 1)
+    (ln,) = struct.unpack("!I", recvn(s, 4))
+    return tag, recvn(s, ln - 4)
+
+s = socket.create_connection(("127.0.0.1", 5437))
+params = b"user\0zeno\0database\0zeno\0\0"
+body = struct.pack("!I", 196608) + params
+s.sendall(struct.pack("!I", len(body) + 4) + body)
+while True:
+    tag, _ = read_msg(s)
+    if tag == b'Z':
+        break
+
+def q(sql):
+    body = sql.encode() + b"\0"
+    s.sendall(b"Q" + struct.pack("!I", len(body) + 4) + body)
+    rows = []
+    while True:
+        tag, b = read_msg(s)
+        if tag == b'Z':
+            break
+        if tag == b'D':
+            (ncols,) = struct.unpack("!h", b[:2])
+            pos, vals = 2, []
+            for _ in range(ncols):
+                (ln,) = struct.unpack("!i", b[pos:pos+4])
+                pos += 4
+                vals.append(None if ln < 0 else b[pos:pos+ln].decode())
+                pos += max(ln, 0)
+            rows.append(vals)
+        elif tag == b'C':
+            print(f"   {sql} -> {b[:-1].decode()}")
+    return rows
+
+q("CREATE TABLE v8_t (id, name)")
+q("INSERT INTO v8_t VALUES (1, 'Sanjay')")
+q("INSERT INTO v8_t VALUES (2, 'Asha')")
+print("   SELECT * FROM v8_t ->", q("SELECT * FROM v8_t"))
+s.sendall(b"X" + struct.pack("!I", 4))
+s.close()
+print("   client disconnected")
+PYEOF
+if [ -f ./demo-data-v8/meta.json ]; then
+  echo "ERROR: meta.json already exists before the shutdown (it should not)"
+  exit 1
+fi
+echo "(no meta.json yet — the server only saves it on shutdown)"
+echo "-- SIGTERM to the server (pid $SERVER5):"
+kill -TERM $SERVER5
+wait $SERVER5
+echo "(server exit code: $? — 0 means graceful shutdown)"
+echo "-- server log:"
+cat ./demo-v8-server.log
+echo "-- meta.json now exists (saved by the shutdown):"
+ls -l ./demo-data-v8/meta.json
+echo "-- restart the server and read the rows back:"
+$ZENO --data ./demo-data-v8 serve --port 5437 --no-auto-vacuum > ./demo-v8-server2.log 2>&1 &
+SERVER6=$!
+sleep 1
+python3 - <<'PYEOF'
+import socket, struct
+
+def recvn(s, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = s.recv(n - len(buf))
+        if not chunk:
+            raise EOFError("connection closed")
+        buf += chunk
+    return buf
+
+def read_msg(s):
+    tag = recvn(s, 1)
+    (ln,) = struct.unpack("!I", recvn(s, 4))
+    return tag, recvn(s, ln - 4)
+
+s = socket.create_connection(("127.0.0.1", 5437))
+params = b"user\0zeno\0database\0zeno\0\0"
+body = struct.pack("!I", 196608) + params
+s.sendall(struct.pack("!I", len(body) + 4) + body)
+while True:
+    tag, _ = read_msg(s)
+    if tag == b'Z':
+        break
+body = b"SELECT * FROM v8_t\0"
+s.sendall(b"Q" + struct.pack("!I", len(body) + 4) + body)
+rows = []
+while True:
+    tag, b = read_msg(s)
+    if tag == b'Z':
+        break
+    if tag == b'D':
+        (ncols,) = struct.unpack("!h", b[:2])
+        pos, vals = 2, []
+        for _ in range(ncols):
+            (ln,) = struct.unpack("!i", b[pos:pos+4])
+            pos += 4
+            vals.append(None if ln < 0 else b[pos:pos+ln].decode())
+            pos += max(ln, 0)
+        rows.append(vals)
+print("   rows after restart:", rows)
+s.sendall(b"X" + struct.pack("!I", 4))
+s.close()
+PYEOF
+kill -TERM $SERVER6
+wait $SERVER6
+echo "(second server also exited 0)"
+rm -rf ./demo-data-v8 ./demo-v8-server.log ./demo-v8-server2.log
+
+say "14b. BENCH (V0.8) — Zeno's own engine, this machine only"
+echo "(fresh temp dir, removed afterwards; no PostgreSQL/MongoDB"
+echo " comparison — neither is installed here.)"
+$ZENO bench --rows 100,1000
 
 
 echo

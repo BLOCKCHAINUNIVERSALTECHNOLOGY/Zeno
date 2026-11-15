@@ -153,11 +153,33 @@ pub(crate) struct Session {
     /// suspended portal's cached rows were computed from the
     /// transaction's write buffer BEFORE the rollback, so they
     /// may contain rows the rollback just undid. The portal
-    /// itself survives (unlike at transaction end), but its
-    /// cache is stale: the next Execute re-runs the statement
-    /// fresh and resumes from the rows already sent. See
-    /// `CachedRows.epoch` in `extended.rs`.
+    /// itself survives — but ONLY when it was created BEFORE the
+    /// savepoint (V0.8: portals created after it are closed
+    /// outright, see `savepoint_cutoff`) — so the next Execute
+    /// re-runs the statement fresh instead of serving the stale
+    /// cache. See `CachedRows.epoch` in `extended.rs`.
     pub(crate) cache_epoch: u64,
+    /// V0.8: a strictly increasing per-connection event number,
+    /// bumped on every SAVEPOINT, Parse and Bind. A savepoint
+    /// records the clock at its creation; a portal / prepared
+    /// statement records the clock at its Parse/Bind. On
+    /// ROLLBACK TO SAVEPOINT, every portal / statement with a
+    /// clock HIGHER than the savepoint's was created after the
+    /// savepoint, so PostgreSQL closes it — `savepoint_cutoff`
+    /// carries that cutoff from `exec_rollback_to` to the caller
+    /// (`client_loop` / `handle_execute`), which applies
+    /// `ExtendedState::close_after_savepoint`. Never reset (not
+    /// even at transaction end): a statement created before a
+    /// transaction must keep its LOWER clock across later
+    /// savepoints in later transactions, or it would be closed
+    /// by a rollback it predates.
+    pub(crate) sp_clock: u64,
+    /// V0.8: set by a successful ROLLBACK TO SAVEPOINT to the
+    /// named savepoint's clock (see `sp_clock`); the caller
+    /// consumes it exactly once with `take_savepoint_cutoff`
+    /// and closes the portals / statements created after that
+    /// savepoint. `None` the rest of the time.
+    savepoint_cutoff: Option<u64>,
     /// m1: the tables that existed when this transaction began
     /// (its DDL snapshot). A table created by another connection
     /// AFTER this BEGIN is invisible inside the transaction —
@@ -180,9 +202,27 @@ impl Session {
             aborted: false,
             generation: 0,
             cache_epoch: 0,
+            sp_clock: 0,
+            savepoint_cutoff: None,
             txn_tables: None,
             last_activity: Instant::now(),
         }
+    }
+
+    /// Advance the savepoint clock and return the new value (V0.8).
+    /// Called on every SAVEPOINT, Parse and Bind, so the order in
+    /// which those happened is exactly the order of their clocks.
+    pub(crate) fn next_sp_clock(&mut self) -> u64 {
+        self.sp_clock += 1;
+        self.sp_clock
+    }
+
+    /// Take the pending savepoint-rollback cutoff, if a ROLLBACK
+    /// TO SAVEPOINT set one (V0.8). Consuming it here — exactly
+    /// once, by the message-loop caller — is what applies the
+    /// portal / statement closing for that rollback.
+    pub(crate) fn take_savepoint_cutoff(&mut self) -> Option<u64> {
+        self.savepoint_cutoff.take()
     }
 
     /// ReadyForQuery status byte: 'T' while a transaction is
@@ -298,7 +338,7 @@ pub fn serve(data_dir: &Path, port: u16, opts: &ServeOptions) -> std::io::Result
     }));
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     println!(
-        "zeno 0.7.0 listening on 127.0.0.1:{} (data dir: {})",
+        "zeno 0.8.0 listening on 127.0.0.1:{} (data dir: {})",
         port,
         data_dir.display()
     );
@@ -342,9 +382,59 @@ pub fn serve(data_dir: &Path, port: u16, opts: &ServeOptions) -> std::io::Result
     // connection counts from the moment it is accepted — including
     // while it is still handshaking or sitting idle.
     let active = Arc::new(AtomicUsize::new(0));
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
+    // Graceful shutdown (V0.8): a SIGINT/SIGTERM sets `shutdown`
+    // (the accept loop below stops taking new connections); a
+    // SECOND signal exits immediately (force). `ctrlc` runs the
+    // handler on its own thread, so setting a flag is all it
+    // does — the real shutdown work happens in this thread, in
+    // the open, after the accept loop ends.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_signals = Arc::new(AtomicUsize::new(0));
+    {
+        let shutdown = Arc::clone(&shutdown);
+        let shutdown_signals = Arc::clone(&shutdown_signals);
+        ctrlc::set_handler(move || {
+            let n = shutdown_signals.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == 1 {
+                eprintln!(
+                    "zeno: signal received — shutting down gracefully \
+                     (no new connections; up to {}s for live queries to \
+                     finish; send the signal again to force exit)",
+                    SHUTDOWN_GRACE.as_secs()
+                );
+                shutdown.store(true, Ordering::SeqCst);
+            } else {
+                eprintln!("zeno: second signal received — exiting immediately");
+                std::process::exit(130);
+            }
+        })
+        .map_err(|e| std::io::Error::other(format!("cannot install the signal handler: {e}")))?;
+    }
+    // Sockets of live connections, kept so the shutdown below can
+    // force-close them after the grace period (a thread blocked
+    // in `read` wakes up with an error/EOF and exits). Clones
+    // only — the connection thread owns its own copy, so dropping
+    // this list never closes a socket by itself. Stale entries
+    // (a client that already disconnected) fail their shutdown
+    // harmlessly and are ignored. Each entry is removed by the
+    // connection thread itself when it ends (`LiveSocketGuard`
+    // below): a clone left behind after the thread ended would
+    // keep the socket open forever, so the peer would never see
+    // EOF — a failed login would look like a hang to the client
+    // (its read waits out the whole timeout) instead of a clean
+    // close. Keyed by connection id, so the thread can remove
+    // exactly its own entry.
+    let live_sockets: Arc<Mutex<Vec<(u32, TcpStream)>>> = Arc::new(Mutex::new(Vec::new()));
+    // Non-blocking accept: the loop polls the listener and the
+    // shutdown flag together, so a signal is noticed within
+    // ~5 ms instead of only when the next client connects.
+    listener.set_nonblocking(true)?;
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+        match listener.accept() {
+            Ok((stream, _addr)) => {
                 // F2: bound how long one idle/half-talking client can
                 // hold a thread. Set on the socket (shared with the
                 // BufReader clone) before the thread starts, so the
@@ -373,9 +463,17 @@ pub fn serve(data_dir: &Path, port: u16, opts: &ServeOptions) -> std::io::Result
                     .peer_addr()
                     .map(|a| a.ip().to_string())
                     .unwrap_or_default();
+                let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+                // V0.8: remember a clone for the shutdown
+                // force-close (see `live_sockets` above). The
+                // connection thread removes it when it ends (see
+                // `LiveSocketGuard` in the spawn below).
+                if let Ok(clone) = stream.try_clone() {
+                    recover_lock(&live_sockets).push((conn_id, clone));
+                }
                 let shared = Arc::clone(&shared);
                 let tls_config = tls_config.clone();
-                let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+                let live_sockets = Arc::clone(&live_sockets);
                 // M2: the counted slot is owned by this RAII guard,
                 // which the connection thread takes with it. Its
                 // `Drop` runs when the thread returns AND when the
@@ -386,6 +484,10 @@ pub fn serve(data_dir: &Path, port: u16, opts: &ServeOptions) -> std::io::Result
                 let slot = ConnectionSlot::counted(Arc::clone(&active));
                 match std::thread::Builder::new().spawn(move || {
                     let _slot = slot;
+                    let _live = LiveSocketGuard {
+                        sockets: live_sockets,
+                        conn_id,
+                    };
                     let result = handle_connection(stream, shared, conn_id, tls_config, peer_ip);
                     if let Err(e) = result {
                         eprintln!("pgwire conn {conn_id}: {e}");
@@ -397,20 +499,132 @@ pub fn serve(data_dir: &Path, port: u16, opts: &ServeOptions) -> std::io::Result
                     }
                 }
             }
-            Err(e) => eprintln!("pgwire accept error: {e}"),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // No connection waiting: sleep briefly, then poll
+                // again (this also re-checks the shutdown flag).
+                // 5 ms keeps connection acceptance fast (the old
+                // blocking accept answered at once) while the
+                // loop still notices a signal within milliseconds.
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => {
+                eprintln!("pgwire accept error: {e}");
+                std::thread::sleep(Duration::from_millis(100));
+            }
         }
     }
-    // The accept loop only ends on a listener error (in practice
-    // it runs until the process is killed): stop the auto-vacuum
-    // thread and wait for it, so no vacuum is left running after
-    // the server has stopped serving.
+    // The accept loop ended — a signal asked for a graceful
+    // shutdown, or the listener failed. Either way the server
+    // stops serving now and shuts down in the open, in order:
+    // stop the auto-vacuum, let live connections drain (then
+    // force-close them), flush + save meta, exit 0.
+    if shutdown.load(Ordering::SeqCst) {
+        println!("zeno: shutting down gracefully — no longer accepting connections");
+    }
     if let Some(stop) = vacuum_stop {
         stop.store(true, Ordering::Relaxed);
     }
     if let Some(thread) = vacuum_thread {
         let _ = thread.join();
     }
+    // Live queries get SHUTDOWN_GRACE to finish and their clients
+    // to disconnect. An idle-but-connected client never drains on
+    // its own — that is what the grace period is for.
+    if !wait_for_drain(&active, SHUTDOWN_GRACE) {
+        eprintln!(
+            "zeno: {} connection(s) still live after {}s — force-closing them \
+             (a query running longer than the grace period may lose its reply; \
+             its committed data is already safe in the WAL)",
+            active.load(Ordering::SeqCst),
+            SHUTDOWN_GRACE.as_secs()
+        );
+        {
+            let sockets = recover_lock(&live_sockets);
+            for (_, s) in sockets.iter() {
+                let _ = s.shutdown(std::net::Shutdown::Both);
+            }
+        }
+        let _ = wait_for_drain(&active, SHUTDOWN_FORCE_WAIT);
+        let still = active.load(Ordering::SeqCst);
+        if still > 0 {
+            eprintln!(
+                "zeno: warning: {still} connection thread(s) did not exit — \
+                 shutting down anyway (their data is safe: every commit already \
+                 fsynced its WAL)"
+            );
+        }
+    }
+    // Persist: flush the memtable to an SSTable (which also
+    // clears the WAL — its records are durable in the SSTable
+    // now) and save meta.json with fresh counters. If the shared
+    // lock is still held by a connection thread that would not
+    // die, do not block forever: try for ~2s, then exit anyway
+    // — the data is already durable in the WAL, so the next open
+    // replays it; only the flush and the fresh meta are skipped.
+    match lock_shared_for_shutdown(&shared) {
+        Some(mut guard) => {
+            if let Err(e) = guard.engine.shutdown_persist() {
+                eprintln!(
+                    "zeno: warning: shutdown flush/meta save failed ({e}) — \
+                     data is still safe in the WAL and will be replayed on the next open"
+                );
+            } else {
+                println!("zeno: flushed memtable to SSTable and saved meta.json");
+            }
+        }
+        None => {
+            eprintln!(
+                "zeno: warning: could not lock the engine for the shutdown flush \
+                 (a connection thread is still holding it) — data is still safe in the WAL"
+            );
+        }
+    }
+    println!("zeno: shutdown complete — exit 0");
     Ok(())
+}
+
+/// Graceful shutdown (V0.8): how long `serve` waits after a
+/// SIGINT/SIGTERM for live connections to finish their queries
+/// and disconnect, before force-closing the remaining sockets.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+/// After the force-close, how long to wait for the connection
+/// threads to notice and exit before flushing anyway.
+const SHUTDOWN_FORCE_WAIT: Duration = Duration::from_secs(2);
+
+/// Wait up to `timeout` for the live-connection counter to reach
+/// zero. Returns true when it drained, false on timeout.
+fn wait_for_drain(active: &AtomicUsize, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if active.load(Ordering::SeqCst) == 0 {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    active.load(Ordering::SeqCst) == 0
+}
+
+/// Lock the shared engine for the shutdown flush, but only for
+/// ~2s: a connection thread that will not die must not block the
+/// shutdown forever. `None` means "could not lock in time" — the
+/// caller then exits without the flush (the WAL still has the
+/// data). A poisoned lock is recovered, like `recover_lock`.
+fn lock_shared_for_shutdown(shared: &Mutex<Shared>) -> Option<MutexGuard<'_, Shared>> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match shared.try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                return Some(poisoned.into_inner());
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
 }
 
 /// Background auto-vacuum (V0.7): run `Engine::vacuum` every
@@ -492,6 +706,28 @@ pub(crate) fn start_auto_vacuum(
             }
         })
         .expect("could not spawn the auto-vacuum thread")
+}
+
+/// One live socket clone in the shutdown list (V0.8). The
+/// connection thread takes this guard with it, and its `Drop`
+/// removes the thread's clone from the list when the thread ends
+/// — on a normal return AND on a panic unwind. Without this, the
+/// clone would outlive the connection and the peer would never
+/// see EOF (a socket sends FIN only when its last fd closes):
+/// a failed login would look like a hang to the client instead
+/// of a clean close, and every test that waits for EOF would
+/// wait out its whole read timeout. (That is exactly what the
+/// first V0.8 build did — the pgwire suite went from ~21s to
+/// ~57s before this guard existed.)
+struct LiveSocketGuard {
+    sockets: Arc<Mutex<Vec<(u32, TcpStream)>>>,
+    conn_id: u32,
+}
+
+impl Drop for LiveSocketGuard {
+    fn drop(&mut self) {
+        recover_lock(&self.sockets).retain(|(id, _)| *id != self.conn_id);
+    }
 }
 
 /// One counted connection slot (M2). The accept loop increments
@@ -1014,6 +1250,12 @@ fn client_loop<R: Read, W: Write>(
                 if session.generation != generation_before {
                     ext.close_all_portals();
                 }
+                // V0.8: a ROLLBACK TO SAVEPOINT in this Simple
+                // Query closed the portals / statements created
+                // after that savepoint — apply the cutoff now.
+                if let Some(cutoff) = session.take_savepoint_cutoff() {
+                    ext.close_after_savepoint(cutoff);
+                }
                 ready_for_query(&mut writer, session.status())?;
             }
             b'X' => return Ok(()), // Terminate
@@ -1024,7 +1266,9 @@ fn client_loop<R: Read, W: Write>(
                 // connection enters skip-until-Sync mode (above) —
                 // that is what keeps a pipelined driver in sync.
                 let result = match tag {
-                    b'P' => crate::extended::handle_parse(&mut writer, shared, &mut ext, &body),
+                    b'P' => {
+                        crate::extended::handle_parse(&mut writer, shared, &mut ext, session, &body)
+                    }
                     b'B' => {
                         crate::extended::handle_bind(&mut writer, shared, &mut ext, session, &body)
                     }
@@ -1606,7 +1850,7 @@ pub(crate) fn classify_statement(tokens: &[Token]) -> Result<StmtKind, SqlError>
         "DROP" | "ALTER" | "SET" | "SHOW" | "GRANT" | "REVOKE" | "TRUNCATE" | "COPY"
         | "EXPLAIN" => Err(sql_err(
             "0A000",
-            format!("{first} is not supported in Zeno 0.7.0 (only CREATE TABLE, INSERT, UPDATE, SELECT, DELETE, VACUUM, BEGIN, COMMIT, ROLLBACK, SAVEPOINT, RELEASE SAVEPOINT, ROLLBACK TO SAVEPOINT)"),
+            format!("{first} is not supported in Zeno 0.8.0 (only CREATE TABLE, INSERT, UPDATE, SELECT, DELETE, VACUUM, BEGIN, COMMIT, ROLLBACK, SAVEPOINT, RELEASE SAVEPOINT, ROLLBACK TO SAVEPOINT)"),
         )),
         "" => Ok(StmtKind::Empty),
         other => Err(sql_err(
@@ -1920,7 +2164,7 @@ fn exec_create_ast(
     if session.txn.is_some() {
         return Err(sql_err(
             "0A000",
-            "CREATE TABLE is not supported inside a transaction in Zeno 0.7.0 \
+            "CREATE TABLE is not supported inside a transaction in Zeno 0.8.0 \
              (DDL is not versioned — run it outside a transaction, after COMMIT or ROLLBACK)",
         ));
     }
@@ -2311,7 +2555,7 @@ fn exec_begin(
         return Err(sql_err(
             "25001",
             "already in a transaction — COMMIT or ROLLBACK first \
-             (Zeno 0.7.0 has no nested transactions)",
+             (Zeno 0.8.0 has no nested transactions)",
         ));
     }
     // Poison recovery (V0.5): see `recover_lock`.
@@ -2423,11 +2667,15 @@ fn exec_savepoint(
             "there is no transaction in progress — SAVEPOINT outside a transaction (BEGIN first)",
         )
     })?;
+    // V0.8: stamp the savepoint with the session clock, so a
+    // later ROLLBACK TO can tell which portals / statements were
+    // created after it (higher clock) and close them.
+    let clock = session.next_sp_clock();
     // Poison recovery (V0.5): see `recover_lock`.
     let mut guard = recover_lock(shared);
     guard
         .engine
-        .txn_savepoint(txn, &name)
+        .txn_savepoint(txn, &name, clock)
         .map_err(|e| sql_err("25P01", e))?;
     Ok(StmtOutcome::Command("SAVEPOINT".to_string()))
 }
@@ -2468,7 +2716,7 @@ fn exec_rollback_to(
     })?;
     // Poison recovery (V0.5): see `recover_lock`.
     let mut guard = recover_lock(shared);
-    guard
+    let clock = guard
         .engine
         .txn_rollback_to_savepoint(txn, &name)
         .map_err(|e| {
@@ -2486,6 +2734,14 @@ fn exec_rollback_to(
     // statement fresh instead of serving the stale cache (the
     // portal itself stays alive — see `Session::cache_epoch`).
     session.cache_epoch += 1;
+    // V0.8 (PostgreSQL behaviour): portals and prepared
+    // statements created AFTER this savepoint are closed — the
+    // caller applies this cutoff to the extended-protocol state,
+    // so a later Execute / Describe of one fails with 26000
+    // ("does not exist") instead of running. Portals from
+    // BEFORE the savepoint survive (their stale cache is what
+    // the epoch bump above re-runs).
+    session.savepoint_cutoff = Some(clock);
     Ok(StmtOutcome::Command("ROLLBACK".to_string()))
 }
 
@@ -2545,7 +2801,7 @@ fn exec_vacuum(
     session: &mut Session,
 ) -> Result<StmtOutcome, SqlError> {
     if tokens.len() != 1 {
-        return Err(sql_err("42601", "VACUUM takes no arguments in Zeno 0.7.0"));
+        return Err(sql_err("42601", "VACUUM takes no arguments in Zeno 0.8.0"));
     }
     if session.txn.is_some() {
         return Err(sql_err(

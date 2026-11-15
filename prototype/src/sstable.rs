@@ -11,6 +11,10 @@
 // Honest note: V0.1 loads the whole SSTable into memory on open. That is
 // simple and fine for a prototype, but a production engine would keep an
 // on-disk index and read only the block it needs.
+//
+// V0.2: the Bloom filter on line 2 is now sized to the entry count
+// (16 bits/key, minimum 1 KiB — see bloom.rs). Old V0.1 files with a
+// fixed 1 KiB filter still open: `BloomFilter::from_hex` accepts any size.
 
 use crate::bloom::BloomFilter;
 use serde::{Deserialize, Serialize};

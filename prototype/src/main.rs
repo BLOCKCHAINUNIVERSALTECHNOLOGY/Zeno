@@ -20,6 +20,7 @@
 //   zeno --data ./zeno-data compact
 //   zeno --data ./zeno-data flush
 //   zeno --data ./zeno-data stats
+//   zeno --data ./zeno-data hold 5   (diagnostic: hold the data-dir lock)
 //
 // Default data directory: ./zeno-data
 
@@ -29,11 +30,11 @@ use zeno::doc;
 use zeno::engine::Engine;
 use zeno::table::TableStore;
 
-const VERSION: &str = "0.1.0";
+const VERSION: &str = "0.2.0";
 
 fn usage() -> String {
     format!(
-        "Zeno {VERSION} — One Engine, All Data (V0.1 prototype)\n\
+        "Zeno {VERSION} — One Engine, All Data (V0.2 prototype)\n\
         \n\
         Usage: zeno [--data <dir>] <command> [args]   (default data dir: ./zeno-data)\n\
         \n\
@@ -56,7 +57,9 @@ fn usage() -> String {
         Maintenance:\n\
         \x20 flush                    force memtable flush to an SSTable\n\
         \x20 compact                  merge SSTables, drop old versions + tombstones\n\
-        \x20 stats                    show engine stats"
+        \x20 stats                    show engine stats\n\
+        \x20 hold <seconds>           open the engine and hold its lock for N seconds\n\
+        \x20                          (diagnostic for the lock demo / tests only)"
     )
 }
 
@@ -127,6 +130,29 @@ fn run(data_dir: &Path, args: &[String]) -> Result<(), String> {
             let count = engine.compact().map_err(|e| e.to_string())?;
             println!("OK  compacted — {count} SSTable(s) remain");
         }
+        "hold" => {
+            // Diagnostic only (used by demo.sh and the lock tests):
+            // open the engine — which takes the data-dir lock — and
+            // keep the process alive for N seconds so a second process
+            // can be shown failing to open the same directory. The
+            // lock is released when this process exits (or is killed;
+            // a killed holder leaves a stale lock that the next open
+            // takes over once its PID is dead — see lock.rs).
+            need(args, 2, "seconds to hold the lock")?;
+            let secs: u64 = args[1]
+                .parse()
+                .map_err(|_| "hold needs a number of seconds".to_string())?;
+            println!(
+                "holding lock on {} for {secs}s (pid {}) — try another `zeno` command now",
+                data_dir.display(),
+                std::process::id()
+            );
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            println!("done holding lock");
+            // Keep `engine` alive until here so the lock is held the
+            // whole time.
+            let _ = engine.stats();
+        }
         "stats" => {
             let s = engine.stats();
             println!("Zeno {VERSION} stats");
@@ -140,6 +166,13 @@ fn run(data_dir: &Path, args: &[String]) -> Result<(), String> {
             println!("  deletes          : {}", s.deletes);
             println!("  flushes          : {}", s.flushes);
             println!("  compactions      : {}", s.compactions);
+            println!("  wal corrupt lines: {}", s.wal_corrupt_lines);
+            if !s.wal_corrupt_line_numbers.is_empty() {
+                println!(
+                    "  wal corrupt line nos: {:?} (this open; count above is the lifetime total)",
+                    s.wal_corrupt_line_numbers
+                );
+            }
             println!("  next SSTable id  : {}", s.next_sst_id);
             println!("  tables           : {}", tables.list_tables().join(", "));
         }

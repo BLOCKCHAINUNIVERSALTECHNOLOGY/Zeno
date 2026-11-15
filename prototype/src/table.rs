@@ -41,6 +41,7 @@ fn row_key(table: &str, row_id: u64) -> String {
     format!("table:{table}:{row_id:020}")
 }
 
+#[derive(Debug)]
 pub struct TableStore {
     registry_path: PathBuf,
     registry: TableRegistry,
@@ -49,9 +50,68 @@ pub struct TableStore {
 impl TableStore {
     pub fn open(dir: &Path) -> std::io::Result<Self> {
         let registry_path = dir.join("tables.json");
+        let quarantine_path = dir.join("tables.json.corrupt");
         let registry = match fs::read_to_string(&registry_path) {
-            Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
-            Err(_) => TableRegistry::default(), // first run: no tables yet
+            Ok(text) => match serde_json::from_str(&text) {
+                Ok(registry) => registry,
+                Err(e) => {
+                    // FAIL CLOSED, never fail open: a corrupt registry
+                    // must not silently become "no tables". If we did,
+                    // `create_table` would happily re-register a table
+                    // and `insert` would restart next_row_id at 1 and
+                    // OVERWRITE the old rows still stored in the KV
+                    // engine. Quarantine the corrupt file (kept for
+                    // inspection, never deleted) and refuse to open so
+                    // no create/insert can touch the old rows until an
+                    // operator has looked at the quarantine. (This is
+                    // deliberately stricter than meta.json: corrupt
+                    // meta.json only loses stats counters, which the
+                    // disk scan rebuilds — corrupt tables.json loses
+                    // next_row_id, which nothing can rebuild.)
+                    let _ = fs::remove_file(&quarantine_path);
+                    let quarantined = fs::rename(&registry_path, &quarantine_path).is_ok();
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "corrupt tables.json ({e}); {} — refusing to open so \
+                             existing rows cannot be overwritten; inspect {} and \
+                             restore it as tables.json, or delete it only if you \
+                             accept losing the table registry",
+                            if quarantined {
+                                format!("quarantined to {}", quarantine_path.display())
+                            } else {
+                                "could not quarantine it".to_string()
+                            },
+                            quarantine_path.display()
+                        ),
+                    ));
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // First run — unless a quarantine from an earlier
+                // corruption is still sitting here. If it is, the
+                // registry was already lost once and nobody has dealt
+                // with it: opening as "no tables" now would let the
+                // next create/insert overwrite the old rows, exactly
+                // the failure the quarantine is meant to stop. Refuse
+                // until an operator removes or restores the quarantine.
+                if quarantine_path.exists() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "tables.json is missing but {} exists (an earlier \
+                             corrupt tables.json was quarantined) — refusing to \
+                             open as an empty registry so existing rows cannot \
+                             be overwritten; inspect the quarantine and restore \
+                             it as tables.json, or delete it only if you accept \
+                             losing the table registry",
+                            quarantine_path.display()
+                        ),
+                    ));
+                }
+                TableRegistry::default()
+            }
+            Err(e) => return Err(e),
         };
         Ok(Self {
             registry_path,

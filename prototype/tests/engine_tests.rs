@@ -4,8 +4,10 @@
 // other's data and never touch the user's real data directory.
 
 use std::path::PathBuf;
+use zeno::bloom::BloomFilter;
 use zeno::doc::DocStore;
 use zeno::engine::Engine;
+use zeno::sstable::{sstable_path, SsTable};
 use zeno::table::TableStore;
 
 fn tmp_dir(name: &str) -> PathBuf {
@@ -312,5 +314,380 @@ fn single_sstable_compaction_drops_tombstone() {
     drop(e);
     let mut e2 = Engine::open(&dir).unwrap();
     assert_eq!(e2.get("gone"), None);
+    cleanup(&dir);
+}
+
+// ======================= V0.2 tests =======================
+
+#[test]
+fn lock_second_open_fails_while_first_open() {
+    let dir = tmp_dir("lock-held");
+    let mut e1 = Engine::open(&dir).unwrap();
+    e1.put("k", "v").unwrap();
+    // A second engine on the same directory must fail cleanly while
+    // the first is alive — and must say the directory is in use.
+    let err = match Engine::open(&dir) {
+        Ok(_) => panic!("second open must fail while first is open"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("already in use"),
+        "error must say the directory is in use: {err}"
+    );
+    // The first engine is unaffected and the data is intact.
+    assert_eq!(e1.get("k"), Some("v".to_string()));
+    drop(e1);
+    // After the first closes, the same directory opens again.
+    let mut e2 = Engine::open(&dir).unwrap();
+    assert_eq!(e2.get("k"), Some("v".to_string()));
+    cleanup(&dir);
+}
+
+#[test]
+fn lock_stale_after_kill_nine_reopens() {
+    let dir = tmp_dir("lock-kill");
+    {
+        let mut e = Engine::open(&dir).unwrap();
+        e.put("before-kill", "survives").unwrap();
+    }
+    // A real holder process: `zeno hold 30` opens the engine (taking
+    // the lock) and sleeps. Kill it with SIGKILL, exactly like a crash.
+    let zeno_bin = env!("CARGO_BIN_EXE_zeno");
+    let mut child = std::process::Command::new(zeno_bin)
+        .args(["--data", dir.to_str().unwrap(), "hold", "30"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn zeno hold");
+    // Wait until the holder has actually taken the lock (max 5s).
+    let lock_path = dir.join("LOCK");
+    let mut took = false;
+    for _ in 0..50 {
+        if lock_path.exists() {
+            took = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(took, "holder process never took the lock");
+    // While the holder lives, a second open must fail.
+    assert!(
+        Engine::open(&dir).is_err(),
+        "second open must fail while holder is alive"
+    );
+    child.kill().expect("kill holder (SIGKILL)");
+    let _ = child.wait();
+    // After the kill, the stale lock (dead PID) must not block reopen.
+    let mut e2 = Engine::open(&dir).expect("engine must reopen after kill -9 of holder");
+    assert_eq!(e2.get("before-kill"), Some("survives".to_string()));
+    e2.put("after-kill", "works").unwrap();
+    assert_eq!(e2.get("after-kill"), Some("works".to_string()));
+    cleanup(&dir);
+}
+
+#[test]
+fn lock_concurrent_holders_exactly_one_winner() {
+    // Regression test for the V0.2 LOCK race (BLOCKER 1): the winner
+    // used to create an empty LOCK file and only then write its PID,
+    // and a contender that read the empty file deleted it as "torn"
+    // and won too — two engines, both writing sst-000001.sst, data
+    // loss. Sequential tests never saw it; only N processes racing
+    // at once do. 12 holders x 5 rounds: each round exactly 1 winner.
+    // `hold 2` gives every contender a 2 s window to attempt while the
+    // winner is alive (spawning 12 processes takes far less than 2 s),
+    // so a second winner can only mean the race is back — never a
+    // slow spawn. 5 rounds x 2 s = ~10 s; slow, but this is the test
+    // that proves the lock actually works.
+    let zeno_bin = env!("CARGO_BIN_EXE_zeno");
+    for round in 0..5 {
+        let dir = tmp_dir(&format!("lock-race-{round}"));
+        let mut children = Vec::new();
+        for _ in 0..12 {
+            let child = std::process::Command::new(zeno_bin)
+                .args(["--data", dir.to_str().unwrap(), "hold", "2"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn zeno hold");
+            children.push(child);
+        }
+        let mut winners = 0;
+        for mut child in children {
+            let status = child.wait().expect("wait for holder process");
+            if status.success() {
+                winners += 1;
+            }
+        }
+        assert_eq!(
+            winners, 1,
+            "round {round}: exactly 1 of 12 concurrent holders must win, got {winners}"
+        );
+        // The directory must be cleanly usable afterwards.
+        let mut e = Engine::open(&dir).unwrap();
+        e.put("after-race", "ok").unwrap();
+        assert_eq!(e.get("after-race"), Some("ok".to_string()));
+        drop(e);
+        cleanup(&dir);
+    }
+}
+
+#[test]
+fn corrupt_tables_json_fails_open_and_quarantines() {
+    // Regression test for BLOCKER 2: a corrupt tables.json used to be
+    // silently reset to an empty registry, so recreating the table
+    // restarted next_row_id at 1 and overwrote the old row 1.
+    let dir = tmp_dir("tables-corrupt");
+    {
+        let mut e = Engine::open(&dir).unwrap();
+        let mut tables = TableStore::open(&dir).unwrap();
+        tables
+            .create_table("users", vec!["id".into(), "name".into()])
+            .unwrap();
+        tables
+            .insert(&mut e, "users", vec!["1".into(), "Sanjay".into()])
+            .unwrap();
+        e.flush().unwrap();
+    }
+    // Simulate a torn/corrupt registry file.
+    std::fs::write(dir.join("tables.json"), "{\"tables\": {\"users\": {\"col").unwrap();
+
+    // Reopen must FAIL at the table registry — not silently reset.
+    let mut e2 = Engine::open(&dir).unwrap();
+    // The old row is still in the KV engine, untouched.
+    let old_row = e2
+        .get("table:users:00000000000000000001")
+        .expect("old row 1 must still be in the engine");
+    assert!(
+        old_row.contains("Sanjay"),
+        "old row 1 must still be Sanjay's row: {old_row}"
+    );
+    let err = TableStore::open(&dir).expect_err("corrupt tables.json must fail open");
+    assert!(
+        err.to_string().contains("corrupt tables.json"),
+        "error must say tables.json is corrupt: {err}"
+    );
+    assert!(
+        dir.join("tables.json.corrupt").exists(),
+        "corrupt tables.json must be quarantined as tables.json.corrupt"
+    );
+    assert!(
+        !dir.join("tables.json").exists(),
+        "corrupt file must be moved to quarantine, not left in place"
+    );
+    drop(e2);
+
+    // A second open must ALSO fail while the quarantine is present:
+    // retrying the command must not silently become an empty registry
+    // and let a recreate overwrite row 1.
+    let mut e3 = Engine::open(&dir).unwrap();
+    let err2 =
+        TableStore::open(&dir).expect_err("second open must still fail while quarantine exists");
+    assert!(
+        err2.to_string().contains("tables.json.corrupt"),
+        "second-open error must point at the quarantine: {err2}"
+    );
+    let still_there = e3
+        .get("table:users:00000000000000000001")
+        .expect("old row 1 must survive the failed reopens");
+    assert!(
+        still_there.contains("Sanjay"),
+        "old row 1 must still be Sanjay's row after failed reopens: {still_there}"
+    );
+    drop(e3);
+    cleanup(&dir);
+}
+
+#[test]
+fn wal_corrupt_lines_cumulative_across_flush_and_reopen() {
+    // M2: the corrupt-line count used to be open-time only — a flush
+    // cleared the WAL and the history with it. M3: the warning now
+    // also names the exact corrupt line number(s).
+    let dir = tmp_dir("wal-cumulative");
+    {
+        let mut e = Engine::open(&dir).unwrap();
+        e.put("good-1", "v1").unwrap();
+    }
+    // Corrupt line 2, then a valid record on line 3.
+    use std::io::Write as _;
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("wal.log"))
+            .unwrap();
+        writeln!(f, "garbage-not-json").unwrap();
+        writeln!(
+            f,
+            "{}",
+            serde_json::to_string(&zeno::wal::WalRecord::put("good-2", "v2")).unwrap()
+        )
+        .unwrap();
+    }
+    let mut e2 = Engine::open(&dir).unwrap();
+    assert_eq!(e2.get("good-1"), Some("v1".to_string()));
+    assert_eq!(e2.get("good-2"), Some("v2".to_string()));
+    assert_eq!(e2.stats().wal_corrupt_lines, 1);
+    assert_eq!(e2.stats().wal_corrupt_line_numbers, vec![2]);
+    drop(e2);
+
+    // Reopening the SAME WAL again must NOT count the same corrupt
+    // line a second time — the lifetime total stays 1.
+    let e2b = Engine::open(&dir).unwrap();
+    assert_eq!(
+        e2b.stats().wal_corrupt_lines,
+        1,
+        "replaying the same WAL must not double-count its corrupt lines"
+    );
+    assert_eq!(e2b.stats().wal_corrupt_line_numbers, vec![2]);
+    drop(e2b);
+
+    // Now flush (clears the WAL file) and reopen.
+    let mut e2c = Engine::open(&dir).unwrap();
+    e2c.flush().unwrap(); // clears the WAL file
+    drop(e2c);
+
+    // After flush + reopen the count must still be 1 (cumulative,
+    // persisted in meta.json), while this open's line list is empty
+    // because the new WAL file is clean.
+    let mut e3 = Engine::open(&dir).unwrap();
+    assert_eq!(
+        e3.stats().wal_corrupt_lines,
+        1,
+        "cumulative corrupt-line count must survive flush + reopen"
+    );
+    assert!(
+        e3.stats().wal_corrupt_line_numbers.is_empty(),
+        "new WAL file is clean, no corrupt lines this open: {:?}",
+        e3.stats().wal_corrupt_line_numbers
+    );
+    assert_eq!(e3.get("good-1"), Some("v1".to_string()));
+    assert_eq!(e3.get("good-2"), Some("v2".to_string()));
+    cleanup(&dir);
+}
+
+#[test]
+fn wal_corrupt_middle_line_is_counted_and_data_safe() {
+    let dir = tmp_dir("wal-corrupt");
+    {
+        let mut e = Engine::open(&dir).unwrap();
+        e.put("good-1", "v1").unwrap();
+        e.put("good-2", "v2").unwrap();
+    }
+    // Append a corrupt line in the MIDDLE, then a valid record after it.
+    use std::io::Write as _;
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("wal.log"))
+            .unwrap();
+        writeln!(f, "garbage-not-json").unwrap();
+        writeln!(
+            f,
+            "{}",
+            serde_json::to_string(&zeno::wal::WalRecord::put("good-3", "v3")).unwrap()
+        )
+        .unwrap();
+    }
+    let mut e2 = Engine::open(&dir).unwrap();
+    // Data is safe: the records before AND after the corrupt line replay.
+    assert_eq!(e2.get("good-1"), Some("v1".to_string()));
+    assert_eq!(e2.get("good-2"), Some("v2".to_string()));
+    assert_eq!(e2.get("good-3"), Some("v3".to_string()));
+    // And the corruption is reported, not hidden.
+    assert!(
+        e2.stats().wal_corrupt_lines >= 1,
+        "stats must report the corrupt WAL line"
+    );
+    assert_eq!(
+        e2.stats().wal_corrupt_line_numbers,
+        vec![3],
+        "the corrupt line was line 3 of wal.log"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn corrupt_meta_json_opens_and_data_safe() {
+    let dir = tmp_dir("meta-corrupt");
+    {
+        let mut e = Engine::open(&dir).unwrap();
+        e.put("meta-key", "meta-value").unwrap();
+        e.flush().unwrap(); // data also in an SSTable, not just the WAL
+    }
+    // Simulate a crash mid-save: a half-written meta.json.
+    std::fs::write(dir.join("meta.json"), "{\"puts\": 12, \"gets\": 3, \"fl").unwrap();
+    let mut e2 = Engine::open(&dir).expect("engine must open despite corrupt meta.json");
+    assert_eq!(e2.get("meta-key"), Some("meta-value".to_string()));
+    assert!(
+        dir.join("meta.json.corrupt").exists(),
+        "corrupt meta.json should be quarantined as .corrupt"
+    );
+    // The recovered engine is still usable, and a later reopen works
+    // (meta.json was rewritten atomically on drop).
+    e2.put("after-meta", "works").unwrap();
+    drop(e2);
+    let mut e3 = Engine::open(&dir).unwrap();
+    assert_eq!(e3.get("meta-key"), Some("meta-value".to_string()));
+    assert_eq!(e3.get("after-meta"), Some("works".to_string()));
+    cleanup(&dir);
+}
+
+#[test]
+fn bloom_scales_on_large_sstable() {
+    let dir = tmp_dir("bloom-large");
+    // 600 keys through the real engine: many flushes, many SSTables.
+    let mut e = Engine::open(&dir).unwrap();
+    for i in 0..600 {
+        e.put(&format!("big-key-{i:04}"), &format!("v{i}")).unwrap();
+    }
+    e.flush().unwrap();
+    assert!(e.sstable_count() >= 1);
+    // No false negatives through the engine: every key still reads back.
+    for i in 0..600 {
+        assert_eq!(
+            e.get(&format!("big-key-{i:04}")),
+            Some(format!("v{i}")),
+            "false negative for big-key-{i:04}"
+        );
+    }
+    drop(e);
+
+    // Direct SSTable check at 1000 keys: the filter must be bigger
+    // than the old fixed 1 KiB, must find every key, and must stay
+    // accurate (under 5% false positives on 1000 absent keys — the
+    // old fixed filter at 1000 keys is already ~3%, and at 5000 keys
+    // it is ~60%; the scaled filter stays near 0.5%).
+    let keys: Vec<String> = (0..1000).map(|i| format!("key-{i:04}")).collect();
+    let filter = BloomFilter::from_keys(&keys);
+    assert!(
+        filter.num_bits() >= 16_000,
+        "filter did not scale for 1000 keys: {} bits",
+        filter.num_bits()
+    );
+    for key in &keys {
+        assert!(filter.may_contain(key), "false negative for {key}");
+    }
+    let false_positives = (5000..6000)
+        .filter(|i| filter.may_contain(&format!("key-{i:04}")))
+        .count();
+    assert!(
+        false_positives < 50,
+        "scaled filter too weak: {false_positives}/1000 false positives"
+    );
+
+    // Same check through a real SSTable file on disk (round-trip).
+    let path = sstable_path(&dir, 999);
+    let entries: Vec<(String, Option<String>)> = keys
+        .iter()
+        .map(|k| (k.clone(), Some(format!("v-{k}"))))
+        .collect();
+    let table = SsTable::write(&path, 999, &entries).unwrap();
+    assert!(table.filter.num_bits() >= 16_000);
+    let reopened = SsTable::open(&path, 999).unwrap();
+    for key in &keys {
+        assert!(
+            reopened.filter.may_contain(key),
+            "false negative after SSTable round-trip for {key}"
+        );
+    }
     cleanup(&dir);
 }

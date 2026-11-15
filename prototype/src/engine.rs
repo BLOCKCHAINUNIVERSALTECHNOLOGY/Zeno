@@ -10,6 +10,7 @@
 // - No PostgreSQL wire protocol yet. The CLI is the only interface.
 // - No background compaction thread; compaction runs only on command.
 
+use crate::lock::DirLock;
 use crate::memtable::MemTable;
 use crate::sstable::{parse_sstable_id, sstable_path, sync_dir, SsTable};
 use crate::wal::{Wal, WalRecord};
@@ -32,6 +33,28 @@ struct EngineMeta {
     /// readable instead of falling back to all-zero counters.
     #[serde(default)]
     deletes: u64,
+    /// Cumulative corrupt WAL lines skipped across ALL opens, not just
+    /// this one. A flush clears the WAL file, which used to erase the
+    /// history; persisting the total here keeps `stats` honest about
+    /// lifetime corruption. Each corrupt line is counted ONCE: the two
+    /// fields below track what the current WAL file already
+    /// contributed, so replaying the same WAL on every open does not
+    /// inflate the total (every CLI run reopens the engine). See
+    /// `Engine::open` and `Engine::flush` for the bookkeeping.
+    /// `#[serde(default)]` for old meta.json files.
+    #[serde(default)]
+    wal_corrupt_lines: u64,
+    /// Corrupt lines in the CURRENT WAL file, as of the last open —
+    /// the baseline the cumulative total was last updated from.
+    #[serde(default)]
+    wal_corrupt_lines_current: u64,
+    /// Size in bytes of the WAL file at the last replay. Together
+    /// with `wal_corrupt_lines_current` this tells a new generation
+    /// (WAL replaced by a flush) apart from the same file replayed
+    /// again; `flush()` also resets both fields in memory, and the
+    /// reset is persisted when the engine is dropped.
+    #[serde(default)]
+    wal_size_seen: u64,
 }
 
 pub struct Engine {
@@ -45,6 +68,15 @@ pub struct Engine {
     next_sst_id: u64,
     /// Cumulative counters for `stats` (persisted in meta.json).
     meta: EngineMeta,
+    /// Line numbers of the corrupt WAL lines skipped during THIS
+    /// open's replay (1-based, file order). The count itself is
+    /// cumulative in `meta.wal_corrupt_lines`; line numbers only make
+    /// sense for the current WAL file, so they are not persisted.
+    wal_corrupt_line_numbers: Vec<u64>,
+    /// Held for the engine's whole lifetime; declared last so it is
+    /// dropped last, after the meta.json write in `Drop`.
+    #[allow(dead_code)]
+    lock: DirLock,
 }
 
 pub struct Stats {
@@ -57,20 +89,67 @@ pub struct Stats {
     pub compactions: u64,
     pub deletes: u64,
     pub next_sst_id: u64,
+    /// WAL lines that were corrupt and skipped during open-time replay
+    /// (V0.2: counted and reported, no longer silently hidden).
+    /// CUMULATIVE across all opens, each corrupt line counted ONCE:
+    /// a flush clears the WAL file but the lifetime total in
+    /// `meta.json` is kept, so `stats` never forgets corruption that
+    /// happened before a flush — and reopening the same WAL again
+    /// does not count its corrupt lines a second time.
+    pub wal_corrupt_lines: u64,
+    /// 1-based line numbers of the corrupt WAL lines skipped during
+    /// THIS open's replay (empty if this WAL file was clean). Only
+    /// this open's lines — after a flush the WAL is a new file, so
+    /// these reset while the cumulative count above does not.
+    pub wal_corrupt_line_numbers: Vec<u64>,
 }
 
 impl Engine {
     /// Open (or create) a database in `dir`. Replays the WAL so data
     /// written before a crash comes back.
     pub fn open(dir: &Path) -> std::io::Result<Self> {
-        fs::create_dir_all(dir)?;
+        // Lock FIRST, before touching any other file: a second process
+        // must fail here, before it can read or rewrite shared state.
+        let lock = DirLock::acquire(dir)?;
         let wal_path = dir.join("wal.log");
         let meta_path = dir.join("meta.json");
 
-        // Load cumulative counters (missing file = first run).
-        let meta = match fs::read_to_string(&meta_path) {
-            Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
-            Err(_) => EngineMeta::default(),
+        // A leftover meta.json.tmp is a half-written meta from a crash
+        // mid-save; the atomic rename never reached the final name, so
+        // the old meta.json (if any) is still the good one.
+        let _ = fs::remove_file(dir.join("meta.json.tmp"));
+
+        // Load cumulative counters (missing file = first run). A corrupt
+        // meta.json is quarantined to `meta.json.corrupt` (kept for
+        // inspection, never deleted) and counters restart from zero —
+        // the DATA is unaffected: it lives in the WAL and SSTables, not
+        // in meta.json. Only the lifetime `stats` counters are lost.
+        let mut meta = match fs::read_to_string(&meta_path) {
+            Ok(text) => match serde_json::from_str::<EngineMeta>(&text) {
+                Ok(meta) => meta,
+                Err(e) => {
+                    let quarantine = dir.join("meta.json.corrupt");
+                    let _ = fs::remove_file(&quarantine);
+                    match fs::rename(&meta_path, &quarantine) {
+                        Ok(()) => eprintln!(
+                            "warning: corrupt meta.json quarantined to {} ({e}); \
+                             stats counters reset to zero, data is unaffected",
+                            quarantine.display()
+                        ),
+                        Err(rename_err) => eprintln!(
+                            "warning: corrupt meta.json could not be quarantined \
+                             ({e}; rename failed: {rename_err}); stats counters reset \
+                             to zero, data is unaffected"
+                        ),
+                    }
+                    EngineMeta::default()
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => EngineMeta::default(),
+            Err(e) => {
+                eprintln!("warning: could not read meta.json ({e}); stats counters reset");
+                EngineMeta::default()
+            }
         };
 
         // Load existing SSTables, newest first. Leftover `*.tmp` files
@@ -124,9 +203,47 @@ impl Engine {
             }
         }
 
-        // Replay the WAL into a fresh memtable.
+        // Replay the WAL into a fresh memtable. Corrupt lines are
+        // counted, not hidden: warn on open (naming the exact line
+        // numbers) and keep the count in `stats` (see wal.rs for what
+        // happens to lines after a corrupt one — they are still
+        // replayed). The count is CUMULATIVE in meta.json: this open
+        // adds only the corrupt lines it sees for the FIRST time. The
+        // WAL is append-only, so for the same file the replayed count
+        // only grows — the growth over the last open's baseline is the
+        // new corruption. A smaller file than last time means the WAL
+        // was replaced (a flush cleared it): that is a new generation,
+        // so its corrupt lines are all new. `flush()` also resets the
+        // baseline in memory, which covers the case where the new WAL
+        // has already grown past the old file's size.
+        let replayed = Wal::replay_reported(&wal_path);
+        let wal_len = fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        if wal_len < meta.wal_size_seen {
+            // New WAL generation (flush replaced the file).
+            meta.wal_corrupt_lines += replayed.corrupt_lines;
+            meta.wal_corrupt_lines_current = replayed.corrupt_lines;
+        } else if replayed.corrupt_lines > meta.wal_corrupt_lines_current {
+            // Same WAL file, new corrupt line(s) appended since last open.
+            meta.wal_corrupt_lines += replayed.corrupt_lines - meta.wal_corrupt_lines_current;
+            meta.wal_corrupt_lines_current = replayed.corrupt_lines;
+        }
+        // Else: same WAL, nothing new — replaying it again must NOT
+        // count the same corrupt lines a second time.
+        meta.wal_size_seen = wal_len;
+        if replayed.corrupt_lines > 0 {
+            eprintln!(
+                "warning: WAL replay: {} corrupt line(s) skipped in {}; \
+                 corrupt line number(s): {:?} (lifetime total: {}); \
+                 the affected write(s) are lost, later valid records were still replayed",
+                replayed.corrupt_lines,
+                wal_path.display(),
+                replayed.corrupt_line_numbers,
+                meta.wal_corrupt_lines
+            );
+        }
+        let wal_corrupt_line_numbers = replayed.corrupt_line_numbers;
         let mut memtable = MemTable::new();
-        for record in Wal::replay(&wal_path) {
+        for record in replayed.records {
             match record.op.as_str() {
                 "put" => {
                     if let Some(v) = record.value {
@@ -148,6 +265,8 @@ impl Engine {
             sstables,
             next_sst_id,
             meta,
+            wal_corrupt_line_numbers,
+            lock,
         })
     }
 
@@ -194,6 +313,15 @@ impl Engine {
         self.memtable.clear();
         self.wal.clear()?; // old WAL records are now durable in the SSTable
         self.wal = Wal::open(&self.wal_path)?; // fresh empty WAL
+                                               // The WAL file is now a NEW generation: reset the corrupt-line
+                                               // baseline so the next open counts the new file's corrupt lines
+                                               // from zero instead of comparing them against the old file's
+                                               // count. The cumulative lifetime total above is NOT reset —
+                                               // that is the point of persisting it in meta.json (saved on
+                                               // drop). `wal_corrupt_line_numbers` is this open's only, and
+                                               // is left alone: it describes the WAL this engine opened with.
+        self.meta.wal_corrupt_lines_current = 0;
+        self.meta.wal_size_seen = 0;
         self.meta.flushes += 1;
         Ok(())
     }
@@ -291,7 +419,21 @@ impl Engine {
             compactions: self.meta.compactions,
             deletes: self.meta.deletes,
             next_sst_id: self.next_sst_id,
+            wal_corrupt_lines: self.meta.wal_corrupt_lines,
+            wal_corrupt_line_numbers: self.wal_corrupt_line_numbers.clone(),
         }
+    }
+
+    /// Cumulative number of corrupt WAL lines skipped across all opens
+    /// (persisted in meta.json; a flush does not reset it).
+    pub fn wal_corrupt_lines(&self) -> u64 {
+        self.meta.wal_corrupt_lines
+    }
+
+    /// 1-based line numbers of the corrupt WAL lines skipped during
+    /// this open's replay (empty if this WAL file was clean).
+    pub fn wal_corrupt_line_numbers(&self) -> &[u64] {
+        &self.wal_corrupt_line_numbers
     }
 
     pub fn memtable_len(&self) -> usize {
@@ -303,6 +445,30 @@ impl Engine {
     }
 }
 
+impl Engine {
+    /// Persist the cumulative counters atomically: write to
+    /// `meta.json.tmp`, fsync the file, rename onto `meta.json`, fsync
+    /// the directory — the same pattern as SSTable writes and
+    /// `TableStore::save`. A crash mid-save therefore leaves either
+    /// the old complete meta.json or the new complete one, never a
+    /// half-written file at the final name.
+    fn save_meta(&self) -> std::io::Result<()> {
+        let text = serde_json::to_string_pretty(&self.meta)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let tmp_path = self.meta_path.with_extension("json.tmp");
+        fs::write(&tmp_path, &text)?;
+        {
+            let f = fs::OpenOptions::new().write(true).open(&tmp_path)?;
+            f.sync_all()?;
+        }
+        fs::rename(&tmp_path, &self.meta_path)?;
+        if let Some(parent) = self.meta_path.parent() {
+            sync_dir(parent)?;
+        }
+        Ok(())
+    }
+}
+
 impl Drop for Engine {
     fn drop(&mut self) {
         // Persist the cumulative counters (best effort — a failure here
@@ -311,8 +477,6 @@ impl Drop for Engine {
         // process exit and be replayed on the next open. It is only
         // cleared inside `flush()`, once its records are safely inside
         // an SSTable.
-        if let Ok(text) = serde_json::to_string_pretty(&self.meta) {
-            let _ = fs::write(&self.meta_path, text);
-        }
+        let _ = self.save_meta();
     }
 }

@@ -117,6 +117,13 @@ struct PreparedStatement {
 struct CachedRows {
     columns: Vec<String>,
     rows: Vec<Vec<String>>,
+    /// B2 (V0.7 review): the session `cache_epoch` this cache
+    /// was computed under. A successful ROLLBACK TO SAVEPOINT
+    /// bumps the session epoch (it rewound the transaction's
+    /// write buffer), so a cache with an older epoch may hold
+    /// rows the rollback undid — the next Execute must re-run
+    /// the statement instead of serving it.
+    epoch: u64,
 }
 
 /// A portal: a prepared statement + bound values, ready to execute.
@@ -898,6 +905,19 @@ pub(crate) fn handle_execute(
         )
     };
     let generation_before = session.generation;
+    // B2: a cache computed before the latest ROLLBACK TO
+    // SAVEPOINT is stale — the rollback rewound the write
+    // buffer, so the cached rows may include rows that no
+    // longer exist. Drop it (keeping `rows_sent`, so the
+    // re-run resumes from where the client stopped) and let
+    // the first-Execute path below re-run the statement fresh.
+    let mut cached = cached;
+    if cached
+        .as_ref()
+        .is_some_and(|c| c.epoch != session.cache_epoch)
+    {
+        cached = None;
+    }
     if kind == StmtKind::Empty {
         empty_query_response(writer).map_err(|e| sql_err("XX000", e.to_string()))?;
         return Ok(());
@@ -912,7 +932,6 @@ pub(crate) fn handle_execute(
     // they do over Simple Query (V0.6). No portal borrow is held
     // across the execution (the statement may end the
     // transaction — and close the portals — itself).
-    let mut cached = cached;
     if cached.is_none() {
         let tokens = substitute(&tokens, &params);
         let outcome = execute_tokens(shared, &tokens, session);
@@ -924,7 +943,11 @@ pub(crate) fn handle_execute(
         }
         match outcome? {
             StmtOutcome::Rows { columns, rows } => {
-                let fresh = CachedRows { columns, rows };
+                let fresh = CachedRows {
+                    columns,
+                    rows,
+                    epoch: session.cache_epoch,
+                };
                 cached = Some(fresh.clone());
                 // Store the cache back in the portal (it may have
                 // been closed above only when a transaction ended
@@ -947,7 +970,11 @@ pub(crate) fn handle_execute(
     // Stream the next slice of the cached rows.
     let cached = cached.expect("cached rows were just filled");
     let total = cached.rows.len();
-    let start = rows_sent;
+    // B2: a re-run after a ROLLBACK TO can return FEWER rows
+    // than the stale cache held, so `rows_sent` may now be past
+    // the end — clamp it instead of slicing out of bounds (the
+    // portal then completes with no further rows).
+    let start = rows_sent.min(total);
     let end = if max_rows == 0 {
         total
     } else {

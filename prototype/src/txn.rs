@@ -103,8 +103,10 @@
 // (see README).
 //
 // # What this is NOT (honest limits, see README)
-// - No savepoints, no two-phase commit, no DDL inside a
+// - No two-phase commit, no DDL inside a
 //   transaction, no SERIALIZABLE — snapshot isolation only.
+//   Savepoints exist since V0.7 (`Txn::savepoints`); they are
+//   buffer snapshots only, not sub-transactions.
 // - No READ COMMITTED: every statement in a transaction sees
 //   the BEGIN snapshot, never newer commits.
 // - The committed-transaction set is kept in memory and pruned
@@ -217,6 +219,23 @@ pub struct Txn {
     pub id: u64,
     pub snapshot: Snapshot,
     pub writes: std::collections::BTreeMap<String, Option<String>>,
+    /// Savepoints (V0.7): a stack of named snapshots of the write
+    /// buffer, oldest first. `SAVEPOINT <name>` pushes a copy of
+    /// the buffer; `ROLLBACK TO SAVEPOINT <name>` restores the
+    /// buffer to that copy (dropping every savepoint made after
+    /// it, keeping the named one); `RELEASE SAVEPOINT <name>`
+    /// drops the named savepoint and every one made after it.
+    /// A transaction that ends (COMMIT / ROLLBACK / disconnect)
+    /// drops the whole stack with the transaction itself.
+    pub savepoints: Vec<Savepoint>,
+}
+
+/// One savepoint: its name and the write buffer as it was when the
+/// savepoint was established.
+#[derive(Debug, Clone)]
+pub struct Savepoint {
+    pub name: String,
+    pub writes: std::collections::BTreeMap<String, Option<String>>,
 }
 
 impl Txn {
@@ -225,6 +244,7 @@ impl Txn {
             id,
             snapshot,
             writes: std::collections::BTreeMap::new(),
+            savepoints: Vec::new(),
         }
     }
 }

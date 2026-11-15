@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# demo.sh — Zeno V0.5 end-to-end demo.
+# demo.sh — Zeno V0.7 end-to-end demo.
 #
 # Runs a full scenario against one data directory:
 #   1. Key-value put / get / delete
@@ -40,6 +40,13 @@
 #      UPDATE, a write-write conflict on the same row fails the
 #      second COMMIT with 40001, and kill -9 mid-transaction loses
 #      only the uncommitted row on restart.
+#  13. AUTO-VACUUM + SAVEPOINTS + REAL SQL PARSER (V0.7) — the
+#      server runs with --vacuum-interval 2 (a background thread
+#      prunes dead versions every 2s while a live snapshot still
+#      reads its old data); SAVEPOINT / ROLLBACK TO SAVEPOINT /
+#      RELEASE; and the new parser: multi-row INSERT, ORDER BY /
+#      LIMIT, multi-condition WHERE, multi-SET UPDATE, plus a bad
+#      SQL line/column error and a JOIN "not supported" error.
 #
 # No fake numbers: everything printed below is real output of the binary.
 set -euo pipefail
@@ -850,6 +857,126 @@ PYEOF
 kill $SERVER4 || true
 wait $SERVER4 2>/dev/null || true
 rm -rf ./demo-data-txn
+
+say "13. AUTO-VACUUM + SAVEPOINTS + REAL SQL PARSER (V0.7)"
+echo "(server runs with --vacuum-interval 2: a background thread"
+echo " prunes dead versions every 2s; a live snapshot still reads"
+echo " its old data while that happens. Then savepoints, then the"
+echo " new parser: multi-row INSERT, ORDER BY/LIMIT, multi-condition"
+echo " WHERE, multi-SET UPDATE, and two honest errors.)"
+rm -rf ./demo-data-v7
+$ZENO --data ./demo-data-v7 serve --port 5436 --vacuum-interval 2 &
+SERVER4=$!
+sleep 1
+python3 - <<'PYEOF'
+import socket, struct, time
+
+def recvn(s, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = s.recv(n - len(buf))
+        if not chunk:
+            raise EOFError("connection closed")
+        buf += chunk
+    return buf
+
+def read_msg(s):
+    tag = recvn(s, 1)
+    (ln,) = struct.unpack("!I", recvn(s, 4))
+    return tag, recvn(s, ln - 4)
+
+def connect(label):
+    s = socket.create_connection(("127.0.0.1", 5436))
+    params = b"user\0zeno\0database\0zeno\0\0"
+    body = struct.pack("!I", 196608) + params
+    s.sendall(struct.pack("!I", len(body) + 4) + body)
+    while True:
+        tag, body = read_msg(s)
+        if tag == b'Z':
+            break
+    print(f"-- {label}: connected (trust auth)")
+    return s
+
+def q(s, sql, label):
+    body = sql.encode() + b"\0"
+    s.sendall(b"Q" + struct.pack("!I", len(body) + 4) + body)
+    rows = []
+    while True:
+        tag, body = read_msg(s)
+        if tag == b'D':
+            n = struct.unpack("!H", body[:2])[0]
+            vals, pos = [], 2
+            for _ in range(n):
+                (ln,) = struct.unpack("!I", body[pos:pos + 4]); pos += 4
+                vals.append(body[pos:pos + ln].decode() if ln >= 0 else None)
+                pos += max(ln, 0)
+            rows.append(vals)
+        elif tag == b'C':
+            print(f"   [{label}] {sql} -> {body.split(bytes([0]))[0].decode()}")
+        elif tag == b'E':
+            code, msg, p = "", "", 0
+            while p < len(body) and body[p] != 0:
+                f = chr(body[p]); p += 1
+                end = body.index(b"\0", p)
+                v = body[p:end].decode(); p = end + 1
+                if f == 'C': code = v
+                if f == 'M': msg = v
+            print(f"   [{label}] {sql} -> ErrorResponse [{code}] {msg}")
+        elif tag == b'Z':
+            print(f"   [{label}] ReadyForQuery '{body.decode()}' ({len(rows)} row(s): {rows})")
+            return rows
+
+a = connect("connection A")
+b = connect("connection B")
+q(a, "CREATE TABLE v7_users (id, name, city)", "A")
+print("-- parser: one INSERT, two rows at once:")
+q(a, "INSERT INTO v7_users VALUES (1, 'Sanjay', 'Delhi'), (2, 'Asha', 'Mumbai')", "A")
+print("-- parser: column list in a different order than the table:")
+q(a, "INSERT INTO v7_users (city, name, id) VALUES ('Jaipur', 'Vikram', 3)", "A")
+print("-- auto-vacuum: UPDATE the same row 3 times (3 dead versions);")
+print("   the background thread prunes them every 2s — wait 3s, then read:")
+q(a, "UPDATE v7_users SET city = 'Pune' WHERE id = 1", "A")
+q(a, "UPDATE v7_users SET city = 'Agra' WHERE id = 1", "A")
+q(a, "UPDATE v7_users SET city = 'Delhi' WHERE id = 1", "A")
+time.sleep(3)
+print("   (auto-vacuum ticked at least once by now — the row still reads 'Delhi')")
+q(b, "SELECT * FROM v7_users WHERE id = 1", "B")
+print("-- live snapshot safety: A BEGINs and UPDATEs; B must still see")
+print("   the old value even after the auto-vacuum ticks again:")
+q(a, "BEGIN", "A")
+q(a, "UPDATE v7_users SET city = 'Goa' WHERE id = 1", "A")
+time.sleep(3)
+q(b, "SELECT * FROM v7_users WHERE id = 1", "B")
+q(a, "SELECT * FROM v7_users WHERE id = 1", "A")
+q(a, "COMMIT", "A")
+q(b, "SELECT * FROM v7_users WHERE id = 1", "B")
+print("-- parser: ORDER BY + LIMIT, multi-condition WHERE, multi-SET UPDATE:")
+q(a, "SELECT * FROM v7_users ORDER BY id DESC LIMIT 2", "A")
+q(a, "SELECT name FROM v7_users WHERE city = 'Goa' AND id = 1", "A")
+q(a, "UPDATE v7_users SET city = 'Indore', name = 'Asha2' WHERE id = 2 AND city = 'Mumbai'", "A")
+q(a, "SELECT * FROM v7_users WHERE id = 2", "A")
+print("-- savepoints: BEGIN, INSERT, SAVEPOINT, INSERT, ROLLBACK TO, SELECT:")
+q(a, "BEGIN", "A")
+q(a, "INSERT INTO v7_users VALUES (4, 'Meera', 'Pune')", "A")
+q(a, "SAVEPOINT sp1", "A")
+q(a, "INSERT INTO v7_users VALUES (5, 'Kiran', 'Goa')", "A")
+q(a, "ROLLBACK TO SAVEPOINT sp1", "A")
+q(a, "SELECT * FROM v7_users", "A")
+q(a, "RELEASE SAVEPOINT sp1", "A")
+q(a, "ROLLBACK TO SAVEPOINT sp1", "A")
+q(a, "COMMIT", "A")
+q(b, "SELECT * FROM v7_users", "B")
+print("-- honest errors: bad SQL gets a line/column, JOIN gets 'not supported':")
+q(a, "SELECT * FROM v7_users WHERE city =", "A")
+q(a, "SELECT * FROM v7_users JOIN other ON v7_users.id = other.id", "A")
+a.sendall(b"X" + struct.pack("!I", 4)); a.close()
+b.sendall(b"X" + struct.pack("!I", 4)); b.close()
+print("V0.7 demo done")
+PYEOF
+kill $SERVER4 || true
+wait $SERVER4 2>/dev/null || true
+rm -rf ./demo-data-v7
+
 
 echo
 echo "PostgreSQL demo done. Try it yourself with psql (on a machine that has it):"

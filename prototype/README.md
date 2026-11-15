@@ -1,18 +1,19 @@
-# Zeno — One Engine, All Data (V0.6 prototype)
+# Zeno — One Engine, All Data (V0.7 prototype)
 
 > **Zeno is a hybrid SQL + JSON database in Rust — not ZenoDB (Lantern, Go
 > time-series) and not ZenDB.** The name was chosen knowing those exist.
 
-Zeno V0.6 is a small, working, single-node database prototype. One engine
+Zeno V0.7 is a small, working, single-node database prototype. One engine
 stores three kinds of data: **key-value**, **tables**, and **JSON
 documents**. It is written in Rust using `std` + `serde` +
 `serde_json` + small RustCrypto crates (`sha2`, `hmac`, `pbkdf2`,
 `base64`, `getrandom`, `subtle`) for SCRAM-SHA-256 auth, plus
 `rustls` (TLS 1.2/1.3, `ring` provider) + `rcgen` (self-signed
 certificate generation) for `serve --tls` — no heavy dependencies,
-no external database engine. V0.6 adds **MVCC transactions**
-(snapshot isolation: BEGIN / COMMIT / ROLLBACK, UPDATE) on top of
-the V0.5 server (see "What is new in V0.6").
+no external database engine. V0.7 adds **a real SQL parser**
+(lexer + recursive-descent parser), **savepoints**, and a
+**background auto-vacuum** on top of the V0.6 MVCC transactions
+(see "What is new in V0.7").
 
 > **⚠️ LOCAL PROTOTYPE ONLY. With no users configured, `zeno serve`
 > accepts EVERY local client with NO password (trust auth) and
@@ -25,6 +26,159 @@ the V0.5 server (see "What is new in V0.6").
 > shared machine, and never use it in production. Anyone on the
 > same machine can read and change all your data. See "Password
 > auth (SCRAM-SHA-256)" and "TLS" below.**
+
+## What is new in V0.7
+
+- **A real SQL parser — lexer + recursive-descent parser
+  (`src/parser.rs`).** SQL is no longer string-matched over a flat
+  token list: every statement is lexed (tokens carry their line and
+  column) and parsed into a small AST, which `pgwire.rs` then
+  executes. What it supports: SELECT with a column list or `*`,
+  WHERE with AND-joined conditions (`=`, `!=`, `<>`, `<`, `>`,
+  `<=`, `>=`), ORDER BY with several keys, each [ASC|DESC]
+  (`ORDER BY a, b DESC`), LIMIT and OFFSET in either order
+  (`OFFSET 0 LIMIT 1` as well as `LIMIT 1 OFFSET 0`); INSERT with an
+  optional column list (values are stored in registry column
+  order, so the list may name the columns in any order) and
+  multi-row VALUES; UPDATE with several SET assignments and a
+  multi-condition WHERE; DELETE with a multi-condition WHERE;
+  CREATE TABLE with column types (`VARCHAR(10)`, `NUMERIC(10,2)`,
+  `SERIAL PRIMARY KEY` — the type is parsed and then ignored,
+  every column is still text) and `IF NOT EXISTS`. A genuine syntax
+  error fails with **42601 and the line and column where parsing
+  stopped** (`syntax error at line 2, column 14: ...`), never a
+  crash. JOIN, subqueries, GROUP BY / HAVING, UNION, OR in WHERE,
+  LIKE / IS NULL, INSERT ... SELECT, a table-level PRIMARY KEY,
+  and aggregate/function calls (`COUNT(*)`, `upper('x')`, ...) fail with
+  **0A000 ("feature not supported")** naming the construct, so a
+  client can tell "not supported" apart from "syntax error" (see
+  "What the parser does not support" below). Comparisons and
+  ORDER BY compare numerically when both sides parse as numbers
+  (`"10" > "9"`), lexicographically otherwise — WHERE and ORDER BY
+  sort the same way. Integers compare as integers, exactly, at
+  any size — never through `f64`, whose 53-bit mantissa used to
+  call `9007199254740992` and `9007199254740993` equal; `f64` is
+  used only for decimals (`"1.5"` vs `"1.25"`). A duplicate
+  column name in CREATE TABLE and a column set twice in one
+  UPDATE are both rejected with 42601 instead of silently eating
+  or overwriting a value. All old SQL keeps working exactly as before
+  (225 old tests still pass); the extended protocol goes through
+  the same parser (its tokens are rebuilt into SQL after `$n`
+  substitution, so a bound value can never be re-parsed as SQL).
+  Honest limits of this parser: no OR, no expressions or
+  arithmetic, no table-qualified columns (`t.col`), no aliases,
+  no `LIMIT $1` (LIMIT/OFFSET need literal numbers), and a column
+  list in INSERT must name every column exactly once (Zeno has no
+  NULLs and no defaults to fill the rest).
+- **Savepoints (`src/txn.rs`, `src/engine.rs`, `src/pgwire.rs`).**
+  Inside a transaction: `SAVEPOINT <name>` remembers the
+  transaction's write buffer, `ROLLBACK TO [SAVEPOINT] <name>`
+  restores it (dropping every write made after the savepoint, and
+  every savepoint made after it — the named one stays, so rolling
+  back to it again still works), and `RELEASE [SAVEPOINT] <name>`
+  forgets the NEWEST savepoint of that name (a later ROLLBACK TO
+  that name fails with 3B001 only when no savepoint of that name
+  is left). A savepoint with the same name hides the earlier one
+  instead of deleting it: RELEASE of the new one reveals the old
+  one again, so ROLLBACK TO rolls back to the FIRST savepoint —
+  PostgreSQL behaviour. Unknown name:
+  **3B001** (invalid savepoint specification). Outside a
+  transaction all three fail with **25P01**. Savepoints work over
+  Simple Query AND the extended protocol. A suspended portal
+  whose cached rows predate a ROLLBACK TO SAVEPOINT is re-run
+  fresh on its next Execute (resuming from the rows already
+  sent), so it can never serve a row the rollback undid —
+  PostgreSQL closes portals created after the savepoint instead;
+  Zeno re-runs them. One PostgreSQL behaviour
+  is kept deliberately: `ROLLBACK TO SAVEPOINT` is the way back
+  out of an aborted (25P02) transaction — it runs while aborted
+  and clears the abort, so the transaction is usable again. A
+  savepoint is a snapshot of the write buffer only, not a
+  sub-transaction: it cannot commit part of a transaction, and it
+  dies with the transaction (COMMIT / ROLLBACK / disconnect).
+  Savepoint names are case-sensitive, like table names. Two
+  deliberate deviations from PostgreSQL, kept and documented:
+  a failed savepoint-control statement (unknown name, 3B001)
+  and a VACUUM inside a transaction (25001) do NOT abort the
+  transaction — PostgreSQL aborts on any error — so the
+  transaction stays usable afterwards (pinned by a test).
+- **Background auto-vacuum (`src/pgwire.rs`,
+  `start_auto_vacuum`).** `zeno serve` now runs `VACUUM` by
+  itself in a background thread, every `--vacuum-interval`
+  seconds (default 60; `--no-auto-vacuum` turns it off). It is
+  the same snapshot-safe `Engine::vacuum` the `VACUUM` statement
+  runs — versions a live snapshot can still see are kept, and the
+  committed-transaction set is pruned to the oldest live
+  snapshot's watermark — so the thread can never corrupt a running
+  transaction's view (verified by a test that holds a live
+  snapshot open while the thread ticks: the chain shrinks only by
+  the version nobody needs, and the snapshot still reads its old
+  data). A failed vacuum is logged and retried at the next
+  interval, never fatal — and a vacuum that panics is caught,
+  logged, and retried too, instead of silently killing the
+  thread. A vacuum that prunes nothing does NOT rewrite the
+  SSTables: the data is already durable as it is, so a no-op
+  vacuum burns no new SSTable id. The stop flag + join run when
+  the server stops serving (the accept loop ending on a listener
+  error) — there is no signal handling, so SIGINT/SIGTERM still
+  end the process at once and the thread dies with it, as with
+  every other server thread. The interval is
+  also settable small for tests (`--vacuum-interval 1`); the
+  manual `VACUUM` statement and the `vacuum` CLI command are
+  unchanged and still work. (The library API clamps an interval
+  below 100 ms to 100 ms — an interval of 0 used to busy-spin
+  the thread with no sleep at all; the CLI already rejects
+  intervals below 1 s.)
+- Version is now **0.7.0** (Cargo.toml, CLI, README).
+
+## V0.7 review fixes (post-review hardening)
+
+A review of V0.7 found 2 blockers, 5 must-fix items and 6
+minors; all are fixed except the two documented deviations
+below. Each has a regression test (see "Tests").
+
+- **B1 — integers compare exactly, never through `f64`.**
+  `compare_values` compares integer strings by sign, digit
+  length and digits (exact at any size); `f64` is used only
+  for decimals. `WHERE id = 9007199254740993` no longer also
+  matches `9007199254740992`, and ORDER BY sorts the same way.
+- **B2 — a suspended portal never serves rows a ROLLBACK TO
+  SAVEPOINT undid.** A successful ROLLBACK TO bumps a
+  per-connection cache epoch; a portal whose cached rows
+  predate it re-runs its statement fresh on the next Execute
+  and resumes from the rows already sent. (PostgreSQL closes
+  portals created after the savepoint; Zeno re-runs them —
+  see "What is new in V0.7".)
+- **M1 — duplicate savepoint names stack.** A second
+  `SAVEPOINT s` hides the first instead of deleting it;
+  `RELEASE s` reveals the first again, so `ROLLBACK TO s`
+  rolls back to it.
+- **M2 — duplicate column names rejected.** `CREATE TABLE t
+  (id, id)` fails with 42601; the table is not created.
+- **M3 — a no-op VACUUM does not rewrite the SSTables.**
+  When nothing is pruned, `vacuum()` skips the rewrite (and
+  burns no SSTable id); the committed-set prune and the
+  vacuum counter still happen.
+- **M4 — a column set twice in one UPDATE rejected.**
+  `UPDATE t SET a = 1, a = 2` fails with 42601 and changes
+  nothing.
+- **M5 — LIMIT/OFFSET in either order, multi-column ORDER
+  BY.** `OFFSET 0 LIMIT 1` works, and `ORDER BY a, b DESC`
+  sorts by `a`, then by `b` (each key with its own direction).
+- **Minors (m1–m6):** m1 LIKE / IS NULL / a function call as
+  a value / INSERT ... SELECT / a table-level PRIMARY KEY
+  fail with 0A000, not 42601; m2 kept deliberately — a failed
+  savepoint-control statement (3B001) or VACUUM inside a
+  transaction (25001) does NOT abort the transaction, unlike
+  PostgreSQL (see "What is new in V0.7"); m3 savepoint names
+  are case-sensitive, like table names; m4 the auto-vacuum
+  shutdown claim is corrected — the stop flag + join run only
+  when the accept loop ends, SIGINT/SIGTERM end the process
+  at once (no signal handling yet); m5 an auto-vacuum
+  interval below 100 ms is clamped to 100 ms, so 0 can never
+  busy-spin; m6 a panic inside the auto-vacuum thread is
+  caught with `catch_unwind`, logged, and the thread retries
+  at the next interval.
 
 ## What is new in V0.6
 
@@ -581,27 +735,40 @@ Each has a regression test (see "Tests").
   demonstrated and tested (used by `demo.sh` and the lock tests).
 - Version is now **0.2.0** (Cargo.toml, CLI, README).
 
-## What works in V0.6
+## What works in V0.7
 
 - **MVCC transactions (snapshot isolation)** — `BEGIN` /
   `COMMIT` / `ROLLBACK` (+ `START TRANSACTION`, `END`,
   `ABORT`) over Simple Query and the extended protocol, one
-  transaction per connection; `UPDATE` (one SET assignment);
-  write-write conflict aborts the second committer with 40001
-  (first-committer-wins); WAL + crash recovery keeps only
+  transaction per connection; `UPDATE` (several SET assignments
+  since V0.7); **savepoints** (`SAVEPOINT` / `ROLLBACK TO
+  SAVEPOINT` / `RELEASE SAVEPOINT`, V0.7 — see "What is new in
+  V0.7"); write-write conflict aborts the second committer with
+  40001 (first-committer-wins); WAL + crash recovery keeps only
   committed transactions (see "What is new in V0.6" for the
   isolation level, the WAL format, and the honest limits).
-  ReadyForQuery is 'T' inside a transaction, 'I' otherwise.
+  ReadyForQuery is 'T' inside a transaction, 'I' otherwise, 'E'
+  while the transaction is aborted.
 - **PostgreSQL wire protocol** — `zeno serve` (see "What is new in
   V0.4" above). `psql` / libpq clients connect over TCP on
-  127.0.0.1 and run CREATE TABLE / INSERT / UPDATE / SELECT (one
-  `column=value` WHERE filter) / DELETE / BEGIN / COMMIT /
-  ROLLBACK, over Simple Query AND the extended protocol
-  (prepared statements, `$1` params, named +
-  unnamed statements/portals, PortalSuspended resume). **Auth:
-  trust auth (no password) while no users are configured, SCRAM-
-  SHA-256 password auth once a user exists — local prototype only
-  (see the warning at the top and "Password auth" below).**
+  127.0.0.1 and run CREATE TABLE / INSERT / UPDATE / SELECT /
+  DELETE / VACUUM / BEGIN / COMMIT / ROLLBACK / SAVEPOINT, over
+  Simple Query AND the extended protocol (prepared statements,
+  `$1` params, named + unnamed statements/portals,
+  PortalSuspended resume). The SQL is parsed by the real V0.7
+  parser: multi-condition WHERE (`=`, `!=`, `<`, `>`, `<=`, `>=`),
+  ORDER BY / LIMIT / OFFSET, multi-row INSERT, multi-SET UPDATE
+  (see "What is new in V0.7"). **Auth: trust auth (no password)
+  while no users are configured, SCRAM-SHA-256 password auth
+  once a user exists — local prototype only (see the warning at
+  the top and "Password auth" below).**
+- **Background auto-vacuum (V0.7)** — `zeno serve` runs `VACUUM`
+  by itself every `--vacuum-interval` seconds (default 60;
+  `--no-auto-vacuum` turns it off). It prunes only versions no
+  live snapshot needs, and the committed-transaction set with
+  them; a failed vacuum is logged and retried, never fatal. The
+  manual `VACUUM` statement and the `vacuum` CLI command still
+  work the same way.
 - **Password auth (SCRAM-SHA-256)** — `zeno user set-password
   <name>` / `list` / `remove` (see "How to run"). The password is
   never stored, only its SCRAM verifier in `users.json`; the
@@ -660,11 +827,13 @@ Each has a regression test (see "Tests").
 - **Read path** — memtable first, then SSTables newest-to-oldest. A
   tombstone in a newer layer hides the same key in older layers.
 - **Tables** — `CREATE TABLE`-like registration (column names stored in
-  `tables.json`), `INSERT` rows, `SELECT` with an optional
-  `column=value` filter, `UPDATE` (one SET assignment, V0.6),
-  `DELETE`. Rows are stored as keys
-  `table:<name>:<row-id>`. **There is no real SQL parser** — SELECT is a
-  simple scan filter. `INSERT` persists the next row id (atomically
+  `tables.json`), `INSERT` rows (single-row, multi-row, or with a
+  column list — V0.7), `SELECT` with a multi-condition WHERE,
+  ORDER BY / LIMIT / OFFSET (V0.7), `UPDATE` (several SET
+  assignments, V0.7), `DELETE`. Rows are stored as keys
+  `table:<name>:<row-id>`. SELECT is still a linear scan filter
+  over the rows (no index) — only the parsing is real SQL now.
+  `INSERT` persists the next row id (atomically
   written `tables.json`) before writing the row, so a crash cannot
   reuse an id and overwrite the previous row (worst case: a gap).
   A corrupt `tables.json` is quarantined to `tables.json.corrupt.1`
@@ -722,22 +891,28 @@ Each has a regression test (see "Tests").
   types only, table/column existence is checked at
   Bind/Describe/Execute; a bound SQL NULL becomes the empty string (Zeno has no NULLs).
 - **No MVCC beyond snapshot isolation.** Transactions are snapshot
-  isolation only: no savepoints, no two-phase commit, no DDL
-  inside a transaction, no SERIALIZABLE, no READ COMMITTED (see
-  "What is new in V0.6"). Old versions are vacuumed only by an
+  isolation only: no two-phase commit, no DDL inside a
+  transaction, no SERIALIZABLE, no READ COMMITTED (see "What is
+  new in V0.6"). Savepoints exist since V0.7, and old versions are
+  vacuumed by the background auto-vacuum thread as well as by an
   explicit `VACUUM` statement (or the `vacuum` / `compact` CLI
-  commands when the server is stopped) — there is no background
-  or periodic vacuum thread, and the committed-transaction set
-  is pruned only by VACUUM / compaction.
-- **No real SQL parser.** No `JOIN`, no `WHERE` beyond one
-  `column=value`, no `UPDATE` with more than one SET assignment,
-  no `ORDER BY` / `LIMIT`. Everyday DDL/SQL that real tools emit
-  is NOT accepted yet and returns a 42601 syntax error, so
-  psql/DBeaver users should keep to the subset in "How to run":
-  `VARCHAR(10)` or `SERIAL PRIMARY KEY` in a column definition,
-  a column list in `INSERT INTO t (a, b) VALUES (...)`,
-  `WHERE id > 1` (only `=` is supported), and `ORDER BY` /
-  `LIMIT` are all unsupported.
+  commands when the server is stopped); the committed-transaction
+  set is pruned by VACUUM / compaction.
+- **What the parser does not support (V0.7).** The parser is real
+  but small: no `JOIN`, no subqueries, no `GROUP BY` / `HAVING`,
+  no `UNION`, no `OR` in WHERE, no expressions or arithmetic, no
+  table-qualified columns (`t.col`), no aliases, no aggregate or
+  scalar functions (`COUNT(*)`, ...), no `LIKE` / `IS NULL`, no
+  `INSERT ... SELECT`, no table-level `PRIMARY KEY (...)`, no
+  `LIMIT $1` (LIMIT/OFFSET need literal numbers). Those fail with 0A000 ("feature not
+  supported"), not with a silent misparse. `VARCHAR(10)` and
+  `SERIAL PRIMARY KEY` in a column definition, a column list in
+  `INSERT INTO t (a, b) VALUES (...)`, `WHERE id > 1`, and
+  `ORDER BY` / `LIMIT` all work now (V0.7) — including several
+  ORDER BY keys (`ORDER BY a, b DESC`) and LIMIT/OFFSET in either
+  order — but a column list in
+  INSERT must name every column exactly once (Zeno has no NULLs
+  or defaults to fill the rest).
 - **No secondary index on documents.** `doc find` scans the whole
   collection linearly.
 - **No multi-node / replication / clustering.** Single node only.
@@ -754,9 +929,10 @@ Each has a regression test (see "Tests").
   all fixed in V0.5 (see "What is new in V0.5"). What remains:
   the lockout is in-memory only (restart resets it), the TLS
   cert is self-signed with no channel binding, and there is
-  still no real SQL parser, no savepoints / 2PC /
+  still no JOIN / subqueries / GROUP BY / aggregates, no 2PC /
   SERIALIZABLE, and no multi-node support (see the other
-  bullets in this section).
+  bullets in this section). The V0.7 parser and savepoints are
+  done (see "What is new in V0.7").
 - **Not production-ready.** No independent audit, no benchmark against
   other databases. No speed claims are made anywhere in this repo.
 
@@ -796,11 +972,14 @@ cargo build --release
 ./target/release/zeno --data ./my-data stats
 ./target/release/zeno --data ./my-data hold 5   # diagnostic: hold the lock 5s
 
-# PostgreSQL wire protocol (V0.6) — server keeps running until killed
+# PostgreSQL wire protocol (V0.7) — server keeps running until killed
 ./target/release/zeno --data ./my-data serve --port 5433
 # With TLS (needs a certificate first — see below) and a smaller
 # connection cap than the default 20:
 ./target/release/zeno --data ./my-data serve --port 5433 --tls --max-connections 10
+# Auto-vacuum runs every 60s by default; change the interval, or off:
+./target/release/zeno --data ./my-data serve --port 5433 --vacuum-interval 10
+./target/release/zeno --data ./my-data serve --port 5433 --no-auto-vacuum
 
 # TLS (V0.5): generate a SELF-SIGNED certificate (prototype only —
 # production needs a real CA certificate; clients must pin this
@@ -834,24 +1013,27 @@ psql "host=127.0.0.1 port=5433 user=sanjay dbname=zeno sslmode=require sslrootce
 ```sql
 CREATE TABLE users (id, name, city);
 INSERT INTO users VALUES (1, 'Sanjay', 'Delhi');
-INSERT INTO users VALUES (2, 'Asha', 'Mumbai');
+INSERT INTO users VALUES (2, 'Asha', 'Mumbai'), (3, 'Ravi', 'Jaipur');
 SELECT * FROM users WHERE city = 'Delhi';
-SELECT id, name FROM users;
-UPDATE users SET city = 'Pune' WHERE id = 2;
+SELECT id, name FROM users WHERE id >= 2 AND city != 'Delhi' ORDER BY id DESC LIMIT 2;
+UPDATE users SET city = 'Pune', name = 'Asha2' WHERE id = 2;
 DELETE FROM users WHERE id = 2;
 SELECT * FROM users;
 ```
 
 ```sql
--- Transactions (V0.6, snapshot isolation — see "What is new in V0.6"):
--- inside the transaction, other connections see neither the INSERT
--- nor the UPDATE until COMMIT; a concurrent COMMIT to the same row
--- first makes this COMMIT fail with 40001.
+-- Transactions (V0.6 snapshot isolation + V0.7 savepoints — see
+-- "What is new in V0.6" / "What is new in V0.7"): inside the
+-- transaction, other connections see neither the INSERT nor the
+-- UPDATE until COMMIT; a concurrent COMMIT to the same row first
+-- makes this COMMIT fail with 40001.
 BEGIN;
 INSERT INTO users VALUES (3, 'Ravi', 'Jaipur');
+SAVEPOINT sp1;
 UPDATE users SET city = 'Agra' WHERE id = 1;
-SELECT * FROM users;   -- this connection sees its own writes
-COMMIT;                -- or ROLLBACK to drop both writes
+ROLLBACK TO SAVEPOINT sp1;   -- the UPDATE goes, the INSERT stays
+SELECT * FROM users;         -- this connection sees its own writes
+COMMIT;                      -- or ROLLBACK to drop both writes
 ```
 
 Notes for real clients: with no users configured, any
@@ -922,7 +1104,15 @@ and the V0.6 addition (section 12, fresh data dir, two connections):
 BEGIN + INSERT invisible to the other connection until COMMIT
 (snapshot isolation), ROLLBACK undoes an UPDATE, a write-write
 conflict on the same row fails the second COMMIT with 40001, and
-kill -9 mid-transaction loses only the uncommitted row on restart.
+kill -9 mid-transaction loses only the uncommitted row on restart —
+and the V0.7 addition (section 13, fresh data dir, two
+connections, `--vacuum-interval 2`): the background auto-vacuum
+prunes dead versions every 2s while a live snapshot still reads
+its old data; SAVEPOINT / ROLLBACK TO SAVEPOINT / RELEASE (with a
+3B001 for a released name); and the new parser — multi-row INSERT,
+column-list INSERT, ORDER BY + LIMIT, multi-condition WHERE,
+multi-SET UPDATE, plus a bad SQL failing with 42601 and its line
+and column, and a JOIN failing with 0A000 ("not supported").
 
 ## Tests
 
@@ -932,21 +1122,25 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-- 99 unit tests (the 80 from V0.5, plus 9 V0.6 ones: 7 MVCC
-  visibility tests — snapshot hides later commits, active-at-BEGIN
-  txns stay invisible, deletes before/after BEGIN, uncommitted
-  and aborted writes invisible, envelope round-trip, legacy value
-  decodes to one visible version — and 2 WAL tests — txn records
-  + commit marker replay in order, a commit without a txn id is
-  corrupt and old V0.5 lines still parse — plus 10 review-fix
-  ones: prefixed envelope round-trip, forged huge-xmin envelope
-  rejected, xid-above-bound envelope rejected, malformed chains
-  are plain data, duplicate `xmin = 0` is a legal legacy chain,
-  chain dedupe (newest copy wins, insertion order kept),
-  `del` with a value is corrupt, `commit` needs a txn id and no
-  value, skipped corrupt rows are counted, abandoned
-  transactions roll back on Drop)
-- 40 integration tests in `tests/engine_tests.rs` (the 23 from
+- 119 unit tests (the 99 from V0.6, plus 15 V0.7 parser ones —
+  lexer line/column tracking, comments, unterminated string
+  position, SELECT with multi-condition WHERE + ORDER BY +
+  LIMIT + OFFSET, all six comparison operators, INSERT column
+  list + multi-row VALUES, multi-SET UPDATE, multi-condition
+  DELETE, CREATE TABLE with types and constraints, syntax errors
+  with line/column, JOIN / GROUP BY / aggregates / subqueries /
+  OR as "not supported", LIMIT validation, `$1` surviving as a
+  parameter, multi-column ORDER BY + OFFSET-before-LIMIT, LIKE /
+  IS NULL / function call / INSERT ... SELECT / table-level
+  PRIMARY KEY as 0A000 — plus 1 auto-vacuum one: the background thread
+  prunes only the version no live snapshot needs, the live
+  snapshot still reads its old data, the chain prunes to one
+  version once the snapshot is gone, and the thread joins
+  cleanly on stop — plus 1 vacuum-interval clamp one (0 clamps
+  to 100 ms, never busy-spins) — plus 3 table ones: integer
+  comparison exact above 2^53, duplicate CREATE TABLE column
+  rejected, duplicate UPDATE SET column rejected)
+- 41 integration tests in `tests/engine_tests.rs` (the 23 from
   V0.5, plus 7 V0.6 ones: commit makes writes visible /
   rollback hides them, snapshot isolation hides later commits,
   write-write conflict aborts the second committer, table
@@ -959,30 +1153,37 @@ cargo test
   (migration), commit succeeds when the flush fails, WAL replay
   discards a transaction with a torn put / a torn delete,
   VACUUM prunes old versions but keeps live snapshots, VACUUM
-  drops a deleted key with no snapshot needing it, autocommit
+  drops a deleted key with no snapshot needing it, a no-op
+  VACUUM does not rewrite the SSTables, autocommit
   UPDATE/DELETE is one WAL transaction, reserved `table:` /
   `doc:` prefixes are rejected for raw puts). Two V0.5 tests changed line numbers only:
   an autocommit `put` now writes two WAL records (write +
   commit marker), so the corrupt lines the tests append land
   on lines 3 and 5 instead of 2 and 3.
-- 62 integration tests in `tests/pgwire_tests.rs` (the 48 from
-  V0.5, plus 9 V0.6 ones: snapshot isolation across two
-  connections, rollback hides writes, UPDATE visible only after
-  commit, write-write conflict returns 40001, transaction
-  errors (25P01 / 25001 / DDL-in-txn 0A000), multi-statement
-  BEGIN/INSERT/COMMIT in one Simple Query, BEGIN/COMMIT over the
-  extended protocol with a bound parameter, disconnect rolls
-  back, kill -9 crash recovery keeps only committed data — plus
-  5 review-fix ones: aborted-transaction state returns 25P02
-  until ROLLBACK, portal cache dies with the transaction,
-  DDL created after BEGIN is invisible in the transaction,
-  idle-transaction timeout rolls back, VACUUM prunes versions
-  and keeps a live snapshot). One
+- 79 integration tests in `tests/pgwire_tests.rs` (the 62 from
+  V0.6, plus 17 V0.7 ones: savepoint rollback keeps earlier
+  writes and drops later ones (and the savepoint survives a
+  ROLLBACK TO), savepoint release + unknown-name 3B001 +
+  savepoint statements outside a transaction 25P01, ROLLBACK TO
+  SAVEPOINT recovers an aborted (25P02) transaction, savepoints
+  over the extended protocol, SELECT with ORDER BY / LIMIT /
+  OFFSET, multi-condition WHERE with comparisons, multi-row
+  INSERT + column list, multi-SET UPDATE, syntax errors with
+  line/column + JOIN/aggregates as 0A000 + typed CREATE TABLE,
+  `--vacuum-interval` / `--no-auto-vacuum` flags start a working
+  server — plus 7 review-fix ones: integers above 2^53 compare
+  exactly in WHERE and ORDER BY, a suspended portal is re-run
+  fresh after ROLLBACK TO SAVEPOINT, RELEASE of a duplicate
+  savepoint reveals the older one, duplicate CREATE TABLE
+  columns rejected with 42601, duplicate UPDATE SET column
+  rejected with 42601, OFFSET-before-LIMIT + multi-column
+  ORDER BY, LIKE / IS NULL / function call / INSERT ... SELECT /
+  table-level PRIMARY KEY as 0A000). One
   V0.5 test changed deliberately: UPDATE is supported now, so
   the "unsupported SQL" test asserts UPDATE succeeds (UPDATE 1)
   and uses DROP TABLE for the 0A000 case instead; one extended
   Parse test does the same.
-- 201 tests total, all passing.
+- 239 tests total, all passing.
 
 **How the wire protocol is verified without `psql`:** `psql` is not
 installed in this sandbox, so `tests/pgwire_tests.rs` builds the

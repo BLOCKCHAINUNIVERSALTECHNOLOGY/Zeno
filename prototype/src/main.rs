@@ -30,11 +30,11 @@ use zeno::doc;
 use zeno::engine::Engine;
 use zeno::table::TableStore;
 
-const VERSION: &str = "0.6.0";
+const VERSION: &str = "0.7.0";
 
 fn usage() -> String {
     format!(
-        "Zeno {VERSION} — One Engine, All Data (V0.6 prototype)\n\
+        "Zeno {VERSION} — One Engine, All Data (V0.7 prototype)\n\
         \n\
         Usage: zeno [--data <dir>] <command> [args]   (default data dir: ./zeno-data)\n\
         \n\
@@ -43,7 +43,8 @@ fn usage() -> String {
         \x20 get <key>                fetch a value\n\
         \x20 del <key>                delete a key (tombstone)\n\
         \n\
-        Table (no real SQL yet — SELECT is a simple scan filter):\n\
+        Table (SQL over the wire protocol is parsed by the V0.7 parser;\n\
+        \x20 the CLI below is still the simple one-command form):\n\
         \x20 table create <name> <col1,col2,...>\n\
         \x20 table insert <name> <val1,val2,...>\n\
         \x20 table select <name> [column=value]\n\
@@ -64,12 +65,20 @@ fn usage() -> String {
         \x20 hold <seconds>           open the engine and hold its lock for N seconds\n\
         \x20                          (diagnostic for the lock demo / tests only)\n\
         \n\
-        PostgreSQL wire protocol (V0.6, Simple + extended query, trust or SCRAM auth):\n\
+        PostgreSQL wire protocol (V0.7, Simple + extended query, trust or SCRAM auth):\n\
         \x20 serve [--port <port>] [--tls] [--max-connections <n>]\n\
+        \x20       [--vacuum-interval <seconds>] [--no-auto-vacuum]\n\
         \x20                          listen on 127.0.0.1:<port> (default 5432) and\n\
         \x20                          answer psql / libpq clients (prepared statements\n\
         \x20                          work now; MVCC transactions too: BEGIN /\n\
-        \x20                          COMMIT / ROLLBACK, UPDATE, snapshot isolation).\n\
+        \x20                          COMMIT / ROLLBACK, SAVEPOINT, UPDATE, snapshot\n\
+        \x20                          isolation; real SQL parser: multi-condition\n\
+        \x20                          WHERE, ORDER BY / LIMIT / OFFSET, multi-row\n\
+        \x20                          INSERT, multi-SET UPDATE). A background\n\
+        \x20                          auto-vacuum runs every --vacuum-interval\n\
+        \x20                          seconds (default 60; --no-auto-vacuum turns\n\
+        \x20                          it off) — it prunes only versions no live\n\
+        \x20                          snapshot needs.\n\
         \x20                          LOCAL PROTOTYPE ONLY: with no users\n\
         \x20                          configured any local client may connect, no\n\
         \x20                          password. Example: zeno --data ./my-data serve\n\
@@ -104,6 +113,7 @@ fn main() -> ExitCode {
     let mut port: u16 = 5432;
     let mut tls = false;
     let mut max_connections: usize = zeno::pgwire::DEFAULT_MAX_CONNECTIONS;
+    let mut vacuum_interval_secs: Option<u64> = Some(zeno::pgwire::DEFAULT_VACUUM_INTERVAL_SECS);
     let mut args: Vec<String> = Vec::new();
     let mut i = 0;
     while i < argv.len() {
@@ -137,6 +147,21 @@ fn main() -> ExitCode {
                 }
             }
             i += 2;
+        } else if argv[i] == "--vacuum-interval" && i + 1 < argv.len() {
+            match argv[i + 1].parse::<u64>() {
+                Ok(n) if n >= 1 => vacuum_interval_secs = Some(n),
+                _ => {
+                    eprintln!(
+                        "error: --vacuum-interval needs a number >= 1 (seconds), got '{}'",
+                        argv[i + 1]
+                    );
+                    return ExitCode::FAILURE;
+                }
+            }
+            i += 2;
+        } else if argv[i] == "--no-auto-vacuum" {
+            vacuum_interval_secs = None;
+            i += 1;
         } else {
             args.push(argv[i].clone());
             i += 1;
@@ -148,7 +173,14 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    match run(&data_dir, port, tls, max_connections, &args) {
+    match run(
+        &data_dir,
+        port,
+        tls,
+        max_connections,
+        vacuum_interval_secs,
+        &args,
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
             eprintln!("error: {msg}");
@@ -169,6 +201,7 @@ fn run(
     port: u16,
     tls: bool,
     max_connections: usize,
+    vacuum_interval_secs: Option<u64>,
     args: &[String],
 ) -> Result<(), String> {
     let cmd = args[0].as_str();
@@ -180,6 +213,7 @@ fn run(
         let opts = zeno::pgwire::ServeOptions {
             tls,
             max_connections,
+            vacuum_interval_secs,
         };
         return zeno::pgwire::serve(data_dir, port, &opts)
             .map_err(|e| format!("cannot serve on port {port}: {e}"));

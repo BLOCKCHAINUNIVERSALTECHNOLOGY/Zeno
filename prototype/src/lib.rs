@@ -8,6 +8,7 @@ pub mod engine;
 pub mod extended;
 pub mod lock;
 pub mod memtable;
+pub mod parser;
 pub mod pgwire;
 pub mod quarantine;
 pub mod sstable;

@@ -21,9 +21,11 @@
 //   The online alternative is `VACUUM` (SQL statement and CLI
 //   command): it prunes only versions no live snapshot can see,
 //   and prunes the committed-transaction set with them, so it is
-//   safe while the server runs. There is still no automatic
-//   periodic vacuum — an operator (or a client) runs VACUUM.
-// - No savepoints, 2PC, DDL-in-transaction, or SERIALIZABLE.
+//   safe while the server runs. Since V0.7 the server also runs
+//   VACUUM by itself on a timer (auto-vacuum, see `pgwire.rs`);
+//   the operator can still run VACUUM by hand.
+// - No 2PC, DDL-in-transaction, or SERIALIZABLE. Savepoints exist
+//   since V0.7 (see `txn_savepoint` below).
 
 use crate::lock::DirLock;
 use crate::memtable::MemTable;
@@ -928,6 +930,23 @@ impl Engine {
             }
             live.push((k, Some(encode_chain(&kept))));
         }
+        if pruned == 0 {
+            // M3 (V0.7 review): nothing was pruned, so rewriting
+            // every SSTable into a fresh one would be a byte-for-
+            // byte copy that only burns a new SSTable id (and a
+            // full rewrite on every auto-vacuum tick). Skip the
+            // rewrite: the live data is already durable exactly
+            // as it is, in the existing SSTables. The vacuum
+            // still counts as a run (the committed set above was
+            // pruned), and a flush that just moved memtable data
+            // into a new SSTable is untouched by this skip.
+            self.meta.vacuums += 1;
+            return Ok(VacuumReport {
+                pruned_versions: 0,
+                sstables: self.sstables.len(),
+                committed_pruned,
+            });
+        }
         let id = self.next_sst_id;
         self.next_sst_id += 1;
         let path = sstable_path(&self.dir, id);
@@ -1356,6 +1375,72 @@ impl Engine {
             }
             None => Err(Self::no_such_txn(txn)),
         }
+    }
+
+    /// SAVEPOINT (V0.7): remember the transaction's write buffer
+    /// under `name`, so a later ROLLBACK TO can restore it. A
+    /// savepoint with the same name does NOT delete the earlier
+    /// one: the new savepoint hides the old one (PostgreSQL
+    /// behaviour, M1 of the V0.7 review — the old code dropped
+    /// the earlier savepoint, so `RELEASE` of the new one made
+    /// `ROLLBACK TO` fail with 3B001 instead of rolling back to
+    /// the first savepoint). `RELEASE` removes only the newest
+    /// savepoint of that name and reveals the older one again;
+    /// `ROLLBACK TO` addresses the newest one.
+    pub fn txn_savepoint(&mut self, txn: u64, name: &str) -> Result<(), String> {
+        let t = self
+            .active_txns
+            .get_mut(&txn)
+            .ok_or_else(|| Self::no_such_txn(txn))?;
+        t.savepoints.push(crate::txn::Savepoint {
+            name: name.to_string(),
+            writes: t.writes.clone(),
+        });
+        Ok(())
+    }
+
+    /// ROLLBACK TO SAVEPOINT (V0.7): restore the write buffer to
+    /// the buffer the named savepoint captured, dropping every
+    /// write made after it. The named savepoint itself STAYS, so
+    /// rolling back to it again still works; savepoints made
+    /// after it are gone (they described a buffer state that no
+    /// longer exists). Unknown name: 3B001 at the SQL layer.
+    pub fn txn_rollback_to_savepoint(&mut self, txn: u64, name: &str) -> Result<(), String> {
+        let t = self
+            .active_txns
+            .get_mut(&txn)
+            .ok_or_else(|| Self::no_such_txn(txn))?;
+        let pos = t
+            .savepoints
+            .iter()
+            .rposition(|s| s.name == name)
+            .ok_or_else(|| format!("no such savepoint '{name}'"))?;
+        let saved = t.savepoints[pos].writes.clone();
+        t.writes = saved;
+        t.savepoints.truncate(pos + 1);
+        Ok(())
+    }
+
+    /// RELEASE SAVEPOINT (V0.7): forget the NEWEST savepoint of
+    /// the name — and every savepoint made after it, which only
+    /// made sense on top of it. When the same name was used
+    /// twice, releasing the newest reveals the older one again,
+    /// so a later ROLLBACK TO that name rolls back to the older
+    /// savepoint (PostgreSQL behaviour). Only when no savepoint
+    /// of that name is left does a later ROLLBACK TO fail with
+    /// 3B001 (at the SQL layer).
+    pub fn txn_release_savepoint(&mut self, txn: u64, name: &str) -> Result<(), String> {
+        let t = self
+            .active_txns
+            .get_mut(&txn)
+            .ok_or_else(|| Self::no_such_txn(txn))?;
+        let pos = t
+            .savepoints
+            .iter()
+            .rposition(|s| s.name == name)
+            .ok_or_else(|| format!("no such savepoint '{name}'"))?;
+        t.savepoints.truncate(pos);
+        Ok(())
     }
 }
 

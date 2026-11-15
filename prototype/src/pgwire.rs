@@ -16,14 +16,18 @@
 // - ParameterStatus (server_version, client_encoding,
 //   standard_conforming_strings), BackendKeyData, ReadyForQuery.
 // - Simple Query 'Q': CREATE TABLE / INSERT / UPDATE / SELECT
-//   (WHERE column=value) / DELETE / VACUUM, plus BEGIN / COMMIT /
-//   ROLLBACK for MVCC transactions (V0.6, see txn.rs), mapped
-//   onto the engine's table API. One Query message may hold
-//   several statements separated by ';'; each runs in turn, then
-//   one ReadyForQuery closes the cycle. The ReadyForQuery status
-//   byte is 'T' while a transaction is open, 'I' otherwise, 'E'
-//   while the transaction is aborted (M2: 25P02 — only ROLLBACK
-//   runs in that state).
+//   / DELETE / VACUUM, plus BEGIN / COMMIT / ROLLBACK and
+//   SAVEPOINT / ROLLBACK TO SAVEPOINT / RELEASE SAVEPOINT for
+//   MVCC transactions (V0.6, see txn.rs; savepoints V0.7), mapped
+//   onto the engine's table API through the real SQL parser in
+//   `parser.rs` (V0.7: multi-condition WHERE, ORDER BY / LIMIT /
+//   OFFSET, multi-row INSERT, multi-SET UPDATE). One Query message
+//   may hold several statements separated by ';'; each runs in
+//   turn, then one ReadyForQuery closes the cycle. The
+//   ReadyForQuery status byte is 'T' while a transaction is open,
+//   'I' otherwise, 'E' while the transaction is aborted (M2:
+//   25P02 — only ROLLBACK and ROLLBACK TO SAVEPOINT run in that
+//   state).
 // - Extended query protocol (see `extended.rs`): Parse/Bind/
 //   Describe/Execute/Close/Sync over the same statements,
 //   with $1, $2 parameters (text format, plus binary int4/text),
@@ -42,9 +46,11 @@
 //
 // What it deliberately does NOT implement (see README, honest limits):
 // - COPY, LISTEN/NOTIFY, cursors.
-// - Savepoints, two-phase commit, DDL inside a transaction, or
-//   SERIALIZABLE / READ COMMITTED: transactions are snapshot
-//   isolation only (V0.6, see txn.rs).
+// - Two-phase commit, DDL inside a transaction, or SERIALIZABLE /
+//   READ COMMITTED: transactions are snapshot isolation only
+//   (V0.6, see txn.rs). Savepoints exist since V0.7; JOIN,
+//   subqueries, GROUP BY and aggregates do not (the parser
+//   reports them as 0A000, not supported).
 //
 // All values travel as text (type OID 25, `text`), because every
 // Zeno table column is a string. RowDescription therefore always
@@ -61,14 +67,15 @@ use crate::auth;
 use crate::auth::LoginRateLimiter;
 use crate::engine::Engine;
 use crate::extended::ExtendedState;
-use crate::table::TableStore;
+use crate::parser::{parse_sql, CmpOp, Stmt as ParsedStmt, Value as ParsedValue};
+use crate::table::{compare_values, FilterOp, RowFilter, TableStore};
 use crate::tls;
 use crate::txn::CommitError;
 use std::collections::BTreeSet;
 use std::io::{BufReader, Cursor, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -141,6 +148,16 @@ pub(crate) struct Session {
     /// (PostgreSQL closes portals at transaction end), so its
     /// cached rows can never be served again.
     pub(crate) generation: u64,
+    /// B2 (V0.7 review, second half): bumped every time this
+    /// connection runs a successful ROLLBACK TO SAVEPOINT. A
+    /// suspended portal's cached rows were computed from the
+    /// transaction's write buffer BEFORE the rollback, so they
+    /// may contain rows the rollback just undid. The portal
+    /// itself survives (unlike at transaction end), but its
+    /// cache is stale: the next Execute re-runs the statement
+    /// fresh and resumes from the rows already sent. See
+    /// `CachedRows.epoch` in `extended.rs`.
+    pub(crate) cache_epoch: u64,
     /// m1: the tables that existed when this transaction began
     /// (its DDL snapshot). A table created by another connection
     /// AFTER this BEGIN is invisible inside the transaction —
@@ -162,6 +179,7 @@ impl Session {
             txn: None,
             aborted: false,
             generation: 0,
+            cache_epoch: 0,
             txn_tables: None,
             last_activity: Instant::now(),
         }
@@ -215,7 +233,8 @@ pub(crate) fn recover_lock<'a, T>(lock: &'a Mutex<T>) -> MutexGuard<'a, T> {
     })
 }
 
-/// Options for `serve`: TLS on/off and the connection cap.
+/// Options for `serve`: TLS on/off, the connection cap, and the
+/// auto-vacuum interval.
 #[derive(Debug, Clone, Copy)]
 pub struct ServeOptions {
     /// Serve over TLS (`--tls`): SSLRequest is answered 'S' and
@@ -227,16 +246,26 @@ pub struct ServeOptions {
     /// (too_many_connections) and is closed; the server keeps
     /// running.
     pub max_connections: usize,
+    /// Auto-vacuum (V0.7): `Some(secs)` runs `VACUUM` in a
+    /// background thread every `secs` seconds (default 60);
+    /// `None` disables it (`--no-auto-vacuum`). The vacuum is
+    /// the same snapshot-safe `Engine::vacuum` the `VACUUM`
+    /// statement runs — a live snapshot's data is never pruned.
+    pub vacuum_interval_secs: Option<u64>,
 }
 
 /// Default connection limit for `serve` (also the CLI default).
 pub const DEFAULT_MAX_CONNECTIONS: usize = 20;
+
+/// Default auto-vacuum interval for `serve` (also the CLI default).
+pub const DEFAULT_VACUUM_INTERVAL_SECS: u64 = 60;
 
 impl Default for ServeOptions {
     fn default() -> Self {
         Self {
             tls: false,
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            vacuum_interval_secs: Some(DEFAULT_VACUUM_INTERVAL_SECS),
         }
     }
 }
@@ -269,7 +298,7 @@ pub fn serve(data_dir: &Path, port: u16, opts: &ServeOptions) -> std::io::Result
     }));
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     println!(
-        "zeno 0.6.0 listening on 127.0.0.1:{} (data dir: {})",
+        "zeno 0.7.0 listening on 127.0.0.1:{} (data dir: {})",
         port,
         data_dir.display()
     );
@@ -286,6 +315,28 @@ pub fn serve(data_dir: &Path, port: u16, opts: &ServeOptions) -> std::io::Result
         println!("TLS enabled: SSLRequest is answered 'S' (self-signed cert — prototype only, see README)");
     }
     println!("max connections: {}", opts.max_connections);
+    // Auto-vacuum (V0.7): a background thread that runs
+    // `Engine::vacuum` every interval. The stop flag + join at
+    // the end of this function are the clean shutdown: the
+    // thread never outlives the server process, and a vacuum
+    // never runs concurrently with a statement (both take the
+    // same shared lock — the vacuum simply waits its turn).
+    let (vacuum_stop, vacuum_thread) = match opts.vacuum_interval_secs {
+        Some(secs) => {
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread = start_auto_vacuum(
+                Arc::clone(&shared),
+                Duration::from_secs(secs),
+                Arc::clone(&stop),
+            );
+            println!("auto-vacuum: every {secs}s (disable with --no-auto-vacuum)");
+            (Some(stop), Some(thread))
+        }
+        None => {
+            println!("auto-vacuum: off (--no-auto-vacuum)");
+            (None, None)
+        }
+    };
     // Live connection count. Incremented on accept (before the
     // thread starts) and decremented when the thread ends, so a
     // connection counts from the moment it is accepted — including
@@ -349,7 +400,98 @@ pub fn serve(data_dir: &Path, port: u16, opts: &ServeOptions) -> std::io::Result
             Err(e) => eprintln!("pgwire accept error: {e}"),
         }
     }
+    // The accept loop only ends on a listener error (in practice
+    // it runs until the process is killed): stop the auto-vacuum
+    // thread and wait for it, so no vacuum is left running after
+    // the server has stopped serving.
+    if let Some(stop) = vacuum_stop {
+        stop.store(true, Ordering::Relaxed);
+    }
+    if let Some(thread) = vacuum_thread {
+        let _ = thread.join();
+    }
     Ok(())
+}
+
+/// Background auto-vacuum (V0.7): run `Engine::vacuum` every
+/// `interval` until `stop` is set. The vacuum itself is the same
+/// snapshot-safe prune the `VACUUM` statement runs — versions a
+/// live snapshot can still see are kept, and the committed set is
+/// pruned to the oldest live snapshot's watermark — so this thread
+/// can never corrupt a running transaction's view. A vacuum
+/// failure (e.g. an I/O error writing the merged SSTable) is
+/// logged and retried at the next interval, never fatal: the
+/// thread's job is housekeeping, not serving. The sleep is split
+/// into 100 ms slices so a stop request is noticed promptly even
+/// with a long interval.
+/// Minimum auto-vacuum interval: m5 (V0.7 review) — an
+/// interval of 0 (reachable only through the library API, the
+/// CLI already rejects it) made the thread busy-spin, running
+/// `VACUUM` back to back with no sleep at all. Clamp to 100 ms:
+/// short enough that the tests' 50 ms interval still works (it
+/// becomes 100 ms), long enough that no interval can ever turn
+/// the thread into a tight loop.
+fn clamp_vacuum_interval(interval: Duration) -> Duration {
+    interval.max(Duration::from_millis(100))
+}
+
+pub(crate) fn start_auto_vacuum(
+    shared: Arc<Mutex<Shared>>,
+    interval: Duration,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    let interval = clamp_vacuum_interval(interval);
+    std::thread::Builder::new()
+        .name("zeno-auto-vacuum".to_string())
+        .spawn(move || {
+            loop {
+                let mut waited = Duration::ZERO;
+                while waited < interval {
+                    let step = std::cmp::min(Duration::from_millis(100), interval - waited);
+                    std::thread::sleep(step);
+                    waited += step;
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                }
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                // m6 (V0.7 review): a panic inside `vacuum`
+                // used to kill this thread silently — the server
+                // kept running, but no auto-vacuum ever ran
+                // again and nothing said so. Catch the panic,
+                // log it loudly, and keep the thread alive for
+                // the next interval. (The shared lock is taken
+                // through `recover_lock`, so a panic that
+                // poisoned it does not wedge the server either.)
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut guard = recover_lock(&shared);
+                    guard.engine.vacuum()
+                }));
+                match result {
+                    Ok(Ok(report)) => {
+                        if report.pruned_versions > 0 || report.committed_pruned > 0 {
+                            eprintln!(
+                                "auto-vacuum: pruned {} old version(s) and {} committed txn id(s); {} SSTable(s) remain",
+                                report.pruned_versions, report.committed_pruned, report.sstables
+                            );
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        eprintln!(
+                            "auto-vacuum: vacuum failed ({e}); will retry at the next interval"
+                        );
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "auto-vacuum: vacuum panicked; thread continues and will retry at the next interval"
+                        );
+                    }
+                }
+            }
+        })
+        .expect("could not spawn the auto-vacuum thread")
 }
 
 /// One counted connection slot (M2). The accept loop increments
@@ -1276,14 +1418,30 @@ pub(crate) enum StmtOutcome {
     Empty,
 }
 
-/// Run one statement given as SQL text.
+/// Run one statement given as SQL text. The raw text is passed
+/// through to `execute_tokens_with_sql` so the V0.7 parser can
+/// report syntax errors with their real line and column; the
+/// extended protocol has no raw text (its tokens already carry
+/// substituted parameter values) and goes through `execute_tokens`
+/// instead, which reconstructs the SQL from the tokens.
 pub(crate) fn execute_statement(
     shared: &Arc<Mutex<Shared>>,
     stmt: &str,
     session: &mut Session,
 ) -> Result<StmtOutcome, SqlError> {
-    let tokens = tokenize(stmt).ok_or_else(|| sql_err("42601", "unterminated string literal"))?;
-    execute_tokens(shared, &tokens, session)
+    let tokens = match tokenize(stmt) {
+        Some(tokens) => tokens,
+        None => {
+            // The old tokenizer only fails on an unterminated
+            // string literal or block comment — the new parser
+            // reports the same failure with its line and column.
+            if let Err(e) = parse_sql(stmt) {
+                return Err(sql_err(e.code, e.to_sql_message()));
+            }
+            return Err(sql_err("42601", "unterminated string literal"));
+        }
+    };
+    execute_tokens_with_sql(shared, &tokens, session, Some(stmt))
 }
 
 /// Run one statement given as tokens. Extended Execute uses this
@@ -1297,11 +1455,27 @@ pub(crate) fn execute_tokens(
     tokens: &[Token],
     session: &mut Session,
 ) -> Result<StmtOutcome, SqlError> {
+    execute_tokens_with_sql(shared, tokens, session, None)
+}
+
+/// The shared execution path: `raw_sql` is `Some` for Simple
+/// Query (the statement text as the client sent it) and `None`
+/// for the extended protocol (whose SQL is reconstructed from the
+/// substituted tokens — line numbers there are approximate, but
+/// the statement is the same one Parse already accepted).
+fn execute_tokens_with_sql(
+    shared: &Arc<Mutex<Shared>>,
+    tokens: &[Token],
+    session: &mut Session,
+    raw_sql: Option<&str>,
+) -> Result<StmtOutcome, SqlError> {
     let kind = classify_statement(tokens)?;
-    // M2: in an aborted transaction only ROLLBACK runs. Anything
-    // else — including COMMIT — is 25P02, and the transaction
-    // stays open (aborted) until that ROLLBACK.
-    if session.aborted && kind != StmtKind::Rollback {
+    // M2: in an aborted transaction only ROLLBACK and ROLLBACK TO
+    // SAVEPOINT run. Anything else — including COMMIT — is 25P02,
+    // and the transaction stays open (aborted) until one of them.
+    // (V0.7: ROLLBACK TO SAVEPOINT is PostgreSQL's way back out
+    // of the aborted state, so it is allowed here too.)
+    if session.aborted && !matches!(kind, StmtKind::Rollback | StmtKind::RollbackTo) {
         return Err(sql_err(
             "25P02",
             "current transaction is aborted, commands ignored until end of transaction block",
@@ -1333,14 +1507,28 @@ pub(crate) fn execute_tokens(
     }
     session.last_activity = Instant::now();
     let outcome = match kind {
-        StmtKind::Create => exec_create(shared, tokens, session),
-        StmtKind::Insert => exec_insert(shared, tokens, session),
-        StmtKind::Select => exec_select(shared, tokens, session),
-        StmtKind::Delete => exec_delete(shared, tokens, session),
-        StmtKind::Update => exec_update(shared, tokens, session),
+        // V0.7: data statements go through the real parser
+        // (`parser.rs`) — Simple Query parses the raw text (real
+        // line/column errors), the extended protocol parses the
+        // SQL reconstructed from its substituted tokens.
+        StmtKind::Create
+        | StmtKind::Insert
+        | StmtKind::Select
+        | StmtKind::Delete
+        | StmtKind::Update => {
+            let sql = match raw_sql {
+                Some(text) => text.to_string(),
+                None => tokens_to_sql(tokens),
+            };
+            let parsed = parse_sql(&sql).map_err(|e| sql_err(e.code, e.to_sql_message()))?;
+            execute_parsed(shared, &parsed, session)
+        }
         StmtKind::Begin => exec_begin(shared, tokens, session),
         StmtKind::Commit => exec_commit(shared, tokens, session),
         StmtKind::Rollback => exec_rollback(shared, tokens, session),
+        StmtKind::Savepoint => exec_savepoint(shared, tokens, session),
+        StmtKind::RollbackTo => exec_rollback_to(shared, tokens, session),
+        StmtKind::Release => exec_release(shared, tokens, session),
         StmtKind::Vacuum => exec_vacuum(shared, tokens, session),
         StmtKind::Empty => Ok(StmtOutcome::Empty),
     };
@@ -1376,6 +1564,12 @@ pub(crate) enum StmtKind {
     Begin,
     Commit,
     Rollback,
+    /// `SAVEPOINT <name>` (V0.7).
+    Savepoint,
+    /// `ROLLBACK TO [SAVEPOINT] <name>` (V0.7).
+    RollbackTo,
+    /// `RELEASE [SAVEPOINT] <name>` (V0.7).
+    Release,
     Vacuum,
     Empty,
 }
@@ -1393,12 +1587,26 @@ pub(crate) fn classify_statement(tokens: &[Token]) -> Result<StmtKind, SqlError>
         "UPDATE" => Ok(StmtKind::Update),
         "BEGIN" | "START" => Ok(StmtKind::Begin),
         "COMMIT" | "END" => Ok(StmtKind::Commit),
-        "ROLLBACK" | "ABORT" => Ok(StmtKind::Rollback),
+        // `ROLLBACK TO ...` is a savepoint rollback, not a full
+        // rollback — it keeps the transaction open (V0.7).
+        "ROLLBACK" | "ABORT" => {
+            if tokens
+                .get(1)
+                .map(|t| t.text.eq_ignore_ascii_case("TO"))
+                .unwrap_or(false)
+            {
+                Ok(StmtKind::RollbackTo)
+            } else {
+                Ok(StmtKind::Rollback)
+            }
+        }
+        "SAVEPOINT" => Ok(StmtKind::Savepoint),
+        "RELEASE" => Ok(StmtKind::Release),
         "VACUUM" => Ok(StmtKind::Vacuum),
         "DROP" | "ALTER" | "SET" | "SHOW" | "GRANT" | "REVOKE" | "TRUNCATE" | "COPY"
         | "EXPLAIN" => Err(sql_err(
             "0A000",
-            format!("{first} is not supported in Zeno 0.6.0 (only CREATE TABLE, INSERT, UPDATE, SELECT, DELETE, VACUUM, BEGIN, COMMIT, ROLLBACK)"),
+            format!("{first} is not supported in Zeno 0.7.0 (only CREATE TABLE, INSERT, UPDATE, SELECT, DELETE, VACUUM, BEGIN, COMMIT, ROLLBACK, SAVEPOINT, RELEASE SAVEPOINT, ROLLBACK TO SAVEPOINT)"),
         )),
         "" => Ok(StmtKind::Empty),
         other => Err(sql_err(
@@ -1406,6 +1614,31 @@ pub(crate) fn classify_statement(tokens: &[Token]) -> Result<StmtKind, SqlError>
             format!("syntax error: unsupported statement starting with '{other}'"),
         )),
     }
+}
+
+/// Rebuild SQL text from old-style tokens (extended protocol):
+/// quoted strings are re-quoted with `''` escaping, quoted
+/// identifiers with `""` escaping, everything else is its text.
+/// The result is re-parsed by the V0.7 parser, so a substituted
+/// parameter value can never be re-parsed as SQL — it arrives
+/// here as a quoted-string token and leaves as a quoted literal.
+/// `;` tokens are dropped (Simple Query splits on them first,
+/// and the extended protocol forbids multi-statement strings).
+pub(crate) fn tokens_to_sql(tokens: &[Token]) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(tokens.len());
+    for t in tokens {
+        if t.text == ";" {
+            continue;
+        }
+        if t.quoted_string {
+            parts.push(format!("'{}'", t.text.replace('\'', "''")));
+        } else if t.quoted_ident {
+            parts.push(format!("\"{}\"", t.text.replace('"', "\"\"")));
+        } else {
+            parts.push(t.text.clone());
+        }
+    }
+    parts.join(" ")
 }
 
 // ---------------------------------------------------------------------
@@ -1567,27 +1800,8 @@ pub(crate) fn expect_name(tokens: &[Token], i: usize) -> Option<(String, usize)>
     Some((t.text.clone(), i + 1))
 }
 
-pub(crate) fn expect_punct(tokens: &[Token], i: usize, p: &str) -> Option<usize> {
-    if tokens.get(i).map(|t| t.text.as_str()) == Some(p) {
-        Some(i + 1)
-    } else {
-        None
-    }
-}
-
-/// `WHERE col = value` at `tokens[i]`; `value` may be a quoted string
-/// or a bare token (number or word). Returns (column, value, next).
-pub(crate) fn parse_where(tokens: &[Token], i: usize) -> Option<(String, String, usize)> {
-    let mut i = expect_keyword(tokens, i, "WHERE")?;
-    let (col, next) = expect_name(tokens, i)?;
-    i = next;
-    i = expect_punct(tokens, i, "=")?;
-    let value = tokens.get(i)?.text.clone();
-    Some((col, value, i + 1))
-}
-
 // ---------------------------------------------------------------------
-// The four statements.
+// The four statements (V0.7: parsed by `parser.rs`, executed below).
 // ---------------------------------------------------------------------
 
 /// m1: a table is visible inside a transaction only if it
@@ -1613,236 +1827,261 @@ fn check_table_visible_in_txn(session: &Session, name: &str) -> Result<(), SqlEr
     Ok(())
 }
 
-/// CREATE TABLE name (col1, col2, ...) — column types are NOT parsed:
-/// every Zeno column is text. `CREATE TABLE users (id int, name text)`
-/// therefore also works: the type words are skipped.
-/// DDL inside a transaction is NOT supported in V0.6: the table
-/// registry (`tables.json`) is not versioned, so a CREATE that
-/// later rolled back could not be undone — it fails with 0A000.
-/// Run DDL outside transactions (COMMIT or ROLLBACK first).
-fn exec_create(
+/// Run a parsed data statement (V0.7): the AST from `parser.rs`
+/// against the engine/table registry. Transaction control never
+/// reaches here — it is dispatched from `execute_tokens_with_sql`
+/// on the old token list.
+fn execute_parsed(
     shared: &Arc<Mutex<Shared>>,
-    tokens: &[Token],
+    parsed: &ParsedStmt,
     session: &mut Session,
 ) -> Result<StmtOutcome, SqlError> {
-    let mut i =
-        expect_keyword(tokens, 0, "CREATE").ok_or_else(|| sql_err("42601", "expected CREATE"))?;
-    i = expect_keyword(tokens, i, "TABLE")
-        .ok_or_else(|| sql_err("42601", "expected CREATE TABLE"))?;
-    let (name, next) = expect_name(tokens, i)
-        .ok_or_else(|| sql_err("42601", "expected a table name after CREATE TABLE"))?;
-    i = next;
-    i = expect_punct(tokens, i, "(").ok_or_else(|| {
-        sql_err(
+    match parsed {
+        ParsedStmt::Create { table, columns } => exec_create_ast(shared, table, columns, session),
+        ParsedStmt::Insert {
+            table,
+            columns,
+            rows,
+        } => exec_insert_ast(shared, table, columns, rows, session),
+        ParsedStmt::Select { .. } => exec_select_ast(shared, parsed, session),
+        ParsedStmt::Delete { table, conditions } => {
+            exec_delete_ast(shared, table, conditions, session)
+        }
+        ParsedStmt::Update {
+            table,
+            sets,
+            conditions,
+        } => exec_update_ast(shared, table, sets, conditions, session),
+    }
+}
+
+/// A parsed value as stored text. A `$n` placeholder that
+/// survived substitution (a prepared statement executed without
+/// Bind, which cannot happen through the wire protocol) is a
+/// syntax error, not data — storing the literal "$1" would be a
+/// silent corruption of the row.
+fn resolve_value(value: &ParsedValue) -> Result<String, SqlError> {
+    match value {
+        ParsedValue::Text(text) => Ok(text.clone()),
+        ParsedValue::Param(n) => Err(sql_err(
             "42601",
-            "expected a column list in parentheses after the table name",
-        )
-    })?;
-    let mut columns: Vec<String> = Vec::new();
-    loop {
-        let (col, next) = expect_name(tokens, i)
-            .ok_or_else(|| sql_err("42601", "expected a column name in the column list"))?;
-        columns.push(col);
-        i = next;
-        // A type word after the column (e.g. `id int`) is skipped:
-        // every column is text in V0.3. Only known type words are
-        // skipped, so a missing comma (`(id name)`) is an error
-        // instead of silently dropping the `name` column.
-        if let Some((ty, next)) = expect_name(tokens, i) {
-            if matches!(
-                ty.to_ascii_uppercase().as_str(),
-                "INT"
-                    | "INTEGER"
-                    | "BIGINT"
-                    | "SMALLINT"
-                    | "TEXT"
-                    | "VARCHAR"
-                    | "CHAR"
-                    | "BOOLEAN"
-                    | "BOOL"
-                    | "REAL"
-                    | "DOUBLE"
-                    | "NUMERIC"
-                    | "DECIMAL"
-                    | "SERIAL"
-                    | "BIGSERIAL"
-                    | "TIMESTAMP"
-                    | "DATE"
-                    | "TIME"
-                    | "UUID"
-                    | "JSONB"
-                    | "JSON"
-            ) {
-                i = next;
-            }
-        }
-        if let Some(next) = expect_punct(tokens, i, ",") {
-            i = next;
-            continue;
-        }
-        break;
+            format!("parameter ${n} has no bound value — Bind the statement before executing it"),
+        )),
     }
-    i = expect_punct(tokens, i, ")")
-        .ok_or_else(|| sql_err("42601", "expected ')' after the column list"))?;
-    if i != tokens.len() {
-        return Err(sql_err("42601", "unexpected text after CREATE TABLE"));
+}
+
+/// A parsed WHERE (AND-joined conditions) as a `RowFilter` for
+/// the table store.
+fn to_filter(conditions: &[crate::parser::Condition]) -> Result<RowFilter, SqlError> {
+    let mut filter = RowFilter::default();
+    for cond in conditions {
+        let op = match cond.op {
+            CmpOp::Eq => FilterOp::Eq,
+            CmpOp::Ne => FilterOp::Ne,
+            CmpOp::Lt => FilterOp::Lt,
+            CmpOp::Gt => FilterOp::Gt,
+            CmpOp::Le => FilterOp::Le,
+            CmpOp::Ge => FilterOp::Ge,
+        };
+        filter
+            .conditions
+            .push((cond.column.clone(), op, resolve_value(&cond.value)?));
     }
-    if columns.is_empty() {
-        return Err(sql_err("42601", "a table needs at least one column"));
+    Ok(filter)
+}
+
+/// Map a table-store error to its SQLSTATE: "no such table" is
+/// 42P01, an unknown column is 42703, anything else is 42601
+/// (a count mismatch or a registry error).
+fn table_err(e: String) -> SqlError {
+    if e.contains("no such table") {
+        sql_err("42P01", e)
+    } else if e.contains("does not exist") {
+        sql_err("42703", e)
+    } else {
+        sql_err("42601", e)
     }
+}
+
+/// CREATE TABLE name (col [type ...], ...) — column types are
+/// parsed by `parser.rs` and ignored: every Zeno column is text.
+/// `CREATE TABLE users (id int, name text)` therefore also works,
+/// and so does `VARCHAR(10)` (V0.6 rejected it).
+/// DDL inside a transaction is NOT supported in V0.7 either: the
+/// table registry (`tables.json`) is not versioned, so a CREATE
+/// that later rolled back could not be undone — it fails with
+/// 0A000. Run DDL outside transactions (COMMIT or ROLLBACK first).
+fn exec_create_ast(
+    shared: &Arc<Mutex<Shared>>,
+    name: &str,
+    columns: &[(String, Option<String>)],
+    session: &mut Session,
+) -> Result<StmtOutcome, SqlError> {
     if session.txn.is_some() {
         return Err(sql_err(
             "0A000",
-            "CREATE TABLE is not supported inside a transaction in Zeno 0.6.0 \
+            "CREATE TABLE is not supported inside a transaction in Zeno 0.7.0 \
              (DDL is not versioned — run it outside a transaction, after COMMIT or ROLLBACK)",
         ));
     }
     // Poison recovery (V0.5): a thread that panicked while holding
     // this lock must not wedge the server — see `recover_lock`.
     let mut guard = recover_lock(shared);
-    guard.tables.create_table(&name, columns).map_err(|e| {
-        if e.contains("already exists") {
-            sql_err("42P07", e)
-        } else {
-            sql_err("42601", e)
-        }
-    })?;
+    guard
+        .tables
+        .create_table(name, columns.iter().map(|(c, _)| c.clone()).collect())
+        .map_err(|e| {
+            if e.contains("already exists") {
+                sql_err("42P07", e)
+            } else {
+                sql_err("42601", e)
+            }
+        })?;
     Ok(StmtOutcome::Command("CREATE TABLE".to_string()))
 }
 
-/// INSERT INTO name VALUES (v1, v2, ...) — values are quoted strings
-/// or bare tokens; the count must match the table's columns.
-/// Inside a transaction the row is buffered (visible to this
-/// connection only) until COMMIT.
-fn exec_insert(
+/// INSERT INTO name [(cols)] VALUES (...), (...), ... — values are
+/// quoted strings, numbers or bare words; the count must match
+/// the table's columns (or the column list, when given). With a
+/// column list the values are stored in registry column order,
+/// so `INSERT INTO t (city, id) VALUES ('Delhi', 1)` lands in
+/// the right columns. Inside a transaction the rows are buffered
+/// (visible to this connection only) until COMMIT.
+fn exec_insert_ast(
     shared: &Arc<Mutex<Shared>>,
-    tokens: &[Token],
+    name: &str,
+    columns: &Option<Vec<String>>,
+    rows: &[Vec<ParsedValue>],
     session: &mut Session,
 ) -> Result<StmtOutcome, SqlError> {
-    let mut i =
-        expect_keyword(tokens, 0, "INSERT").ok_or_else(|| sql_err("42601", "expected INSERT"))?;
-    i = expect_keyword(tokens, i, "INTO")
-        .ok_or_else(|| sql_err("42601", "expected INSERT INTO"))?;
-    let (name, next) = expect_name(tokens, i)
-        .ok_or_else(|| sql_err("42601", "expected a table name after INSERT INTO"))?;
-    i = next;
-    i = expect_keyword(tokens, i, "VALUES")
-        .ok_or_else(|| sql_err("42601", "expected VALUES after the table name"))?;
-    i = expect_punct(tokens, i, "(")
-        .ok_or_else(|| sql_err("42601", "expected a value list in parentheses after VALUES"))?;
-    let mut values: Vec<String> = Vec::new();
-    loop {
-        let t = tokens
-            .get(i)
-            .ok_or_else(|| sql_err("42601", "expected a value in the value list"))?;
-        // Only an UNQUOTED ')' closes the value list: a quoted
-        // string value of ')' (or any other punctuation) is data,
-        // not syntax — `VALUES (9, ')', 'Delhi')` must insert.
-        if t.text == ")" && !t.quoted_string {
-            break;
-        }
-        values.push(t.text.clone());
-        i += 1;
-        if let Some(next) = expect_punct(tokens, i, ",") {
-            i = next;
-            continue;
-        }
-        break;
-    }
-    i = expect_punct(tokens, i, ")")
-        .ok_or_else(|| sql_err("42601", "expected ')' after the value list"))?;
-    if i != tokens.len() {
-        return Err(sql_err("42601", "unexpected text after INSERT"));
-    }
-    check_table_visible_in_txn(session, &name)?;
-    // Poison recovery (V0.5): a thread that panicked while holding
-    // this lock must not wedge the server — see `recover_lock`.
+    check_table_visible_in_txn(session, name)?;
+    // Poison recovery (V0.5): see `recover_lock`.
     let mut guard = recover_lock(shared);
+    let registry_columns = guard
+        .tables
+        .columns(name)
+        .ok_or_else(|| sql_err("42P01", format!("no such table '{name}'")))?
+        .to_vec();
+    // Resolve every value first, then map each row onto the
+    // registry column order (validating the column list here,
+    // before any row is written — a bad column must fail the
+    // whole statement, not half of it).
+    let mut full_rows: Vec<Vec<String>> = Vec::with_capacity(rows.len());
+    match columns {
+        Some(list) => {
+            for col in list {
+                if !registry_columns.iter().any(|c| c == col) {
+                    return Err(sql_err(
+                        "42703",
+                        format!("column '{col}' does not exist in table '{name}'"),
+                    ));
+                }
+            }
+            if list.len() != registry_columns.len() {
+                // A column list that names only some columns
+                // would leave the rest unspecified — Zeno has no
+                // NULLs and no defaults, so every column must be
+                // given exactly once.
+                return Err(sql_err(
+                    "42601",
+                    format!(
+                        "INSERT column list has {} columns but table '{name}' has {} — \
+                         every column must be listed exactly once (Zeno has no NULLs or defaults)",
+                        list.len(),
+                        registry_columns.len()
+                    ),
+                ));
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for col in list {
+                if !seen.insert(col) {
+                    return Err(sql_err(
+                        "42601",
+                        format!("column '{col}' is listed twice in the INSERT column list"),
+                    ));
+                }
+            }
+            for row in rows {
+                let mut full = vec![String::new(); registry_columns.len()];
+                for (col, value) in list.iter().zip(row.iter()) {
+                    let pos = registry_columns
+                        .iter()
+                        .position(|c| c == col)
+                        .expect("column list was validated against the registry above");
+                    full[pos] = resolve_value(value)?;
+                }
+                full_rows.push(full);
+            }
+        }
+        None => {
+            for row in rows {
+                if row.len() != registry_columns.len() {
+                    return Err(sql_err(
+                        "42601",
+                        format!(
+                            "table '{name}' has {} columns, got {} values",
+                            registry_columns.len(),
+                            row.len()
+                        ),
+                    ));
+                }
+                let mut full = Vec::with_capacity(row.len());
+                for value in row {
+                    full.push(resolve_value(value)?);
+                }
+                full_rows.push(full);
+            }
+        }
+    }
     let Shared { engine, tables, .. } = &mut *guard;
-    let _row_id = match session.txn {
-        Some(txn) => tables.insert_txn(engine, txn, &name, values).map_err(|e| {
-            if e.contains("no such table") {
-                sql_err("42P01", e)
-            } else {
-                sql_err("42601", e)
+    let mut inserted = 0usize;
+    for values in full_rows {
+        match session.txn {
+            Some(txn) => {
+                tables
+                    .insert_txn(engine, txn, name, values)
+                    .map_err(table_err)?;
             }
-        })?,
-        None => tables.insert(engine, &name, values).map_err(|e| {
-            if e.contains("no such table") {
-                sql_err("42P01", e)
-            } else {
-                sql_err("42601", e)
+            None => {
+                tables.insert(engine, name, values).map_err(table_err)?;
             }
-        })?,
-    };
-    Ok(StmtOutcome::Command("INSERT 0 1".to_string()))
+        }
+        inserted += 1;
+    }
+    Ok(StmtOutcome::Command(format!("INSERT 0 {inserted}")))
 }
 
 /// A parsed SELECT, ready to run: output columns (resolved
 /// against the registry — `*` becomes all columns in registry
-/// order), table name, and the optional WHERE filter. Extended
-/// Bind/Describe reuse this so a prepared SELECT is checked the
-/// same way a Simple Query SELECT is, without executing it.
+/// order). Extended Bind/Describe reuse this so a prepared SELECT
+/// is checked the same way a Simple Query SELECT is, without
+/// executing it. (V0.7: the SQL is rebuilt from the tokens and
+/// re-parsed by the real parser, so ORDER BY / LIMIT /
+/// multi-condition WHERE parse here too — but only the output
+/// columns are needed for Describe, so the rest of the AST is
+/// dropped.)
 pub(crate) struct SelectPlan {
     pub columns: Vec<String>,
-    pub table: String,
-    pub filter: Option<(String, String)>,
 }
 
-/// Parse `SELECT * | col1, col2 FROM name [WHERE col = value]` and
+/// Parse `SELECT ... FROM name ...` from old-style tokens and
 /// resolve its output columns. The WHERE column is NOT checked
-/// against the registry here — matching `exec_select`'s V0.3
-/// behaviour, a filter on an unknown column simply matches no rows.
+/// against the registry here — matching the V0.3 behaviour, a
+/// filter on an unknown column simply matches no rows.
 pub(crate) fn parse_select(
     shared: &Arc<Mutex<Shared>>,
     tokens: &[Token],
 ) -> Result<SelectPlan, SqlError> {
-    let mut i =
-        expect_keyword(tokens, 0, "SELECT").ok_or_else(|| sql_err("42601", "expected SELECT"))?;
-    // Column list: '*' or comma-separated names.
-    let mut columns: Option<Vec<String>> = None; // None = *
-    if tokens.get(i).map(|t| t.text.as_str()) == Some("*") {
-        i += 1;
-    } else {
-        let mut cols = Vec::new();
-        loop {
-            let (col, next) = expect_name(tokens, i)
-                .ok_or_else(|| sql_err("42601", "expected a column name or * after SELECT"))?;
-            cols.push(col);
-            i = next;
-            if let Some(next) = expect_punct(tokens, i, ",") {
-                i = next;
-                continue;
-            }
-            break;
-        }
-        columns = Some(cols);
-    }
-    i = expect_keyword(tokens, i, "FROM")
-        .ok_or_else(|| sql_err("42601", "expected FROM after the column list"))?;
-    let (name, next) = expect_name(tokens, i)
-        .ok_or_else(|| sql_err("42601", "expected a table name after FROM"))?;
-    i = next;
-    let mut filter: Option<(String, String)> = None;
-    if i < tokens.len() {
-        let (col, value, next) = parse_where(tokens, i).ok_or_else(|| {
-            sql_err(
-                "42601",
-                "expected WHERE column = value after the table name",
-            )
-        })?;
-        filter = Some((col, value));
-        i = next;
-    }
-    if i != tokens.len() {
-        return Err(sql_err("42601", "unexpected text after SELECT"));
-    }
-
+    let sql = tokens_to_sql(tokens);
+    let parsed = parse_sql(&sql).map_err(|e| sql_err(e.code, e.to_sql_message()))?;
+    let ParsedStmt::Select { columns, table, .. } = parsed else {
+        return Err(sql_err("42601", "expected SELECT"));
+    };
     let guard = recover_lock(shared);
     let all_columns = guard
         .tables
-        .columns(&name)
-        .ok_or_else(|| sql_err("42P01", format!("no such table '{name}'")))?
+        .columns(&table)
+        .ok_or_else(|| sql_err("42P01", format!("no such table '{table}'")))?
         .to_vec();
     // Resolve the output columns; '*' = all columns, registry order.
     let out_columns: Vec<String> = match &columns {
@@ -1852,7 +2091,7 @@ pub(crate) fn parse_select(
                 if !all_columns.iter().any(|c| c == col) {
                     return Err(sql_err(
                         "42703",
-                        format!("column '{col}' does not exist in table '{name}'"),
+                        format!("column '{col}' does not exist in table '{table}'"),
                     ));
                 }
             }
@@ -1861,204 +2100,185 @@ pub(crate) fn parse_select(
     };
     Ok(SelectPlan {
         columns: out_columns,
-        table: name,
-        filter,
     })
 }
 
-/// SELECT * | col1, col2 FROM name [WHERE col = value]
+/// SELECT * | col1, col2 FROM name [WHERE ...] [ORDER BY col
+/// [ASC|DESC]] [LIMIT n] [OFFSET m] (V0.7 — see `parser.rs`).
 /// Inside a transaction this reads the transaction's BEGIN
 /// snapshot (plus its own writes) — never newer commits.
-fn exec_select(
+/// ORDER BY sorts on the column's value (numbers numerically,
+/// everything else lexicographically — the same comparison the
+/// WHERE `<`/`>` use); LIMIT/OFFSET slice after sorting.
+fn exec_select_ast(
     shared: &Arc<Mutex<Shared>>,
-    tokens: &[Token],
+    parsed: &ParsedStmt,
     session: &mut Session,
 ) -> Result<StmtOutcome, SqlError> {
-    let plan = parse_select(shared, tokens)?;
+    let ParsedStmt::Select {
+        columns,
+        table,
+        conditions,
+        order_by,
+        limit,
+        offset,
+    } = parsed
+    else {
+        // `execute_parsed` only calls this for a SELECT — this
+        // arm is unreachable, but returning an error beats
+        // panicking if the dispatch ever changes.
+        return Err(sql_err(
+            "XX000",
+            "internal error: exec_select_ast called with a non-SELECT statement",
+        ));
+    };
+    let filter = to_filter(conditions)?;
+    // Resolve the output columns against the registry first, so
+    // a missing table is 42P01 and an unknown column is 42703
+    // before anything is read.
+    let (out_columns, all_columns) = {
+        let guard = recover_lock(shared);
+        let all = guard
+            .tables
+            .columns(table)
+            .ok_or_else(|| sql_err("42P01", format!("no such table '{table}'")))?
+            .to_vec();
+        let out = match columns {
+            None => all.clone(),
+            Some(want) => {
+                for col in want {
+                    if !all.iter().any(|c| c == col) {
+                        return Err(sql_err(
+                            "42703",
+                            format!("column '{col}' does not exist in table '{table}'"),
+                        ));
+                    }
+                }
+                want.clone()
+            }
+        };
+        (out, all)
+    };
+    for (col, _) in order_by {
+        if !all_columns.iter().any(|c| c == col) {
+            return Err(sql_err(
+                "42703",
+                format!("column '{col}' does not exist in table '{table}'"),
+            ));
+        }
+    }
     // m1: the table must have existed at this transaction's
-    // BEGIN (parse_select only checks the live registry).
-    check_table_visible_in_txn(session, &plan.table)?;
+    // BEGIN (the registry check above only looks at the live one).
+    check_table_visible_in_txn(session, table)?;
     // Poison recovery (V0.5): a thread that panicked while holding
     // this lock must not wedge the server — see `recover_lock`.
     let mut guard = recover_lock(shared);
     let Shared { engine, tables, .. } = &mut *guard;
-    let rows = match session.txn {
+    let mut rows = match session.txn {
         Some(txn) => tables
-            .select_txn(
-                engine,
-                txn,
-                &plan.table,
-                plan.filter.as_ref().map(|(c, v)| (c.as_str(), v.as_str())),
-            )
-            .map_err(|e| sql_err("42P01", e))?,
+            .select_txn_filtered(engine, txn, table, Some(&filter))
+            .map_err(table_err)?,
         None => tables
-            .select(
-                engine,
-                &plan.table,
-                plan.filter.as_ref().map(|(c, v)| (c.as_str(), v.as_str())),
-            )
-            .map_err(|e| sql_err("42P01", e))?,
+            .select_filtered(engine, table, Some(&filter))
+            .map_err(table_err)?,
     };
+    if !order_by.is_empty() {
+        rows.sort_by(|(_, a), (_, b)| {
+            // M5: several ORDER BY keys — the first key whose
+            // values differ decides; later keys break ties.
+            for (col, asc) in order_by {
+                let ord = compare_values(
+                    a.get(col).map(String::as_str).unwrap_or(""),
+                    b.get(col).map(String::as_str).unwrap_or(""),
+                );
+                if ord != std::cmp::Ordering::Equal {
+                    return if *asc { ord } else { ord.reverse() };
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+    }
+    let offset = (*offset).unwrap_or(0) as usize;
+    let limit = (*limit).map(|n| n as usize);
+    let rows: Vec<_> = rows
+        .into_iter()
+        .skip(offset)
+        .take(limit.unwrap_or(usize::MAX))
+        .collect();
     let out_rows: Vec<Vec<String>> = rows
         .iter()
         .map(|(_, row)| {
-            plan.columns
+            out_columns
                 .iter()
                 .map(|c| row.get(c).cloned().unwrap_or_default())
                 .collect()
         })
         .collect();
     Ok(StmtOutcome::Rows {
-        columns: plan.columns,
+        columns: out_columns,
         rows: out_rows,
     })
 }
 
-/// DELETE FROM name [WHERE col = value] — without WHERE, all rows go.
+/// DELETE FROM name [WHERE ...] — without WHERE, all rows go.
 /// Inside a transaction the deletes are buffered until COMMIT.
-fn exec_delete(
+fn exec_delete_ast(
     shared: &Arc<Mutex<Shared>>,
-    tokens: &[Token],
+    name: &str,
+    conditions: &[crate::parser::Condition],
     session: &mut Session,
 ) -> Result<StmtOutcome, SqlError> {
-    let mut i =
-        expect_keyword(tokens, 0, "DELETE").ok_or_else(|| sql_err("42601", "expected DELETE"))?;
-    i = expect_keyword(tokens, i, "FROM")
-        .ok_or_else(|| sql_err("42601", "expected DELETE FROM"))?;
-    let (name, next) = expect_name(tokens, i)
-        .ok_or_else(|| sql_err("42601", "expected a table name after DELETE FROM"))?;
-    i = next;
-    let mut filter: Option<(String, String)> = None;
-    if i < tokens.len() {
-        let (col, value, next) = parse_where(tokens, i).ok_or_else(|| {
-            sql_err(
-                "42601",
-                "expected WHERE column = value after the table name",
-            )
-        })?;
-        filter = Some((col, value));
-        i = next;
-    }
-    if i != tokens.len() {
-        return Err(sql_err("42601", "unexpected text after DELETE"));
-    }
-    check_table_visible_in_txn(session, &name)?;
+    let filter = to_filter(conditions)?;
+    check_table_visible_in_txn(session, name)?;
     // Poison recovery (V0.5): a thread that panicked while holding
     // this lock must not wedge the server — see `recover_lock`.
     let mut guard = recover_lock(shared);
     let Shared { engine, tables, .. } = &mut *guard;
     let deleted = match session.txn {
         Some(txn) => tables
-            .delete_txn(
-                engine,
-                txn,
-                &name,
-                filter.as_ref().map(|(c, v)| (c.as_str(), v.as_str())),
-            )
-            .map_err(|e| {
-                if e.contains("no such table") {
-                    sql_err("42P01", e)
-                } else {
-                    sql_err("42601", e)
-                }
-            })?,
+            .delete_filtered(engine, Some(txn), name, Some(&filter))
+            .map_err(table_err)?,
         None => tables
-            .delete(
-                engine,
-                &name,
-                filter.as_ref().map(|(c, v)| (c.as_str(), v.as_str())),
-            )
-            .map_err(|e| {
-                if e.contains("no such table") {
-                    sql_err("42P01", e)
-                } else {
-                    sql_err("42601", e)
-                }
-            })?,
+            .delete_filtered(engine, None, name, Some(&filter))
+            .map_err(table_err)?,
     };
     Ok(StmtOutcome::Command(format!("DELETE {deleted}")))
 }
 
-/// UPDATE name SET col = value [WHERE col = value] (V0.6) — one
-/// SET assignment only. Each matching row is rewritten as a new
-/// version; the CommandComplete tag reports the row count
-/// (`UPDATE n`). Inside a transaction the new versions are
-/// buffered until COMMIT, and the rows matched are the ones the
-/// transaction's snapshot sees.
-fn exec_update(
+/// UPDATE name SET col = value [, col = value ...] [WHERE ...]
+/// (V0.7: several SET assignments, multi-condition WHERE). Each
+/// matching row is rewritten as a new version; the CommandComplete
+/// tag reports the row count (`UPDATE n`). Inside a transaction
+/// the new versions are buffered until COMMIT, and the rows
+/// matched are the ones the transaction's snapshot sees.
+fn exec_update_ast(
     shared: &Arc<Mutex<Shared>>,
-    tokens: &[Token],
+    name: &str,
+    sets: &[(String, ParsedValue)],
+    conditions: &[crate::parser::Condition],
     session: &mut Session,
 ) -> Result<StmtOutcome, SqlError> {
-    let mut i =
-        expect_keyword(tokens, 0, "UPDATE").ok_or_else(|| sql_err("42601", "expected UPDATE"))?;
-    let (name, next) = expect_name(tokens, i)
-        .ok_or_else(|| sql_err("42601", "expected a table name after UPDATE"))?;
-    i = next;
-    i = expect_keyword(tokens, i, "SET")
-        .ok_or_else(|| sql_err("42601", "expected SET after the table name"))?;
-    let (set_col, next) = expect_name(tokens, i)
-        .ok_or_else(|| sql_err("42601", "expected a column name after SET"))?;
-    i = next;
-    i = expect_punct(tokens, i, "=")
-        .ok_or_else(|| sql_err("42601", "expected '=' after the SET column"))?;
-    let set_val = tokens
-        .get(i)
-        .ok_or_else(|| sql_err("42601", "expected a value after SET column ="))?
-        .text
-        .clone();
-    i += 1;
-    let mut filter: Option<(String, String)> = None;
-    if i < tokens.len() {
-        let (col, value, next) = parse_where(tokens, i)
-            .ok_or_else(|| sql_err("42601", "expected WHERE column = value after the SET value"))?;
-        filter = Some((col, value));
-        i = next;
+    let filter = to_filter(conditions)?;
+    let mut resolved_sets: Vec<(String, String)> = Vec::with_capacity(sets.len());
+    for (col, value) in sets {
+        resolved_sets.push((col.clone(), resolve_value(value)?));
     }
-    if i != tokens.len() {
-        return Err(sql_err("42601", "unexpected text after UPDATE"));
-    }
-    check_table_visible_in_txn(session, &name)?;
+    let set_refs: Vec<(&str, &str)> = resolved_sets
+        .iter()
+        .map(|(c, v)| (c.as_str(), v.as_str()))
+        .collect();
+    check_table_visible_in_txn(session, name)?;
     // Poison recovery (V0.5): a thread that panicked while holding
     // this lock must not wedge the server — see `recover_lock`.
     let mut guard = recover_lock(shared);
     let Shared { engine, tables, .. } = &mut *guard;
     let updated = match session.txn {
         Some(txn) => tables
-            .update_txn(
-                engine,
-                txn,
-                &name,
-                &set_col,
-                &set_val,
-                filter.as_ref().map(|(c, v)| (c.as_str(), v.as_str())),
-            )
-            .map_err(|e| {
-                if e.contains("no such table") {
-                    sql_err("42P01", e)
-                } else if e.contains("does not exist") {
-                    sql_err("42703", e)
-                } else {
-                    sql_err("42601", e)
-                }
-            })?,
+            .update_many_filtered(engine, Some(txn), name, &set_refs, Some(&filter))
+            .map_err(table_err)?,
         None => tables
-            .update(
-                engine,
-                &name,
-                &set_col,
-                &set_val,
-                filter.as_ref().map(|(c, v)| (c.as_str(), v.as_str())),
-            )
-            .map_err(|e| {
-                if e.contains("no such table") {
-                    sql_err("42P01", e)
-                } else if e.contains("does not exist") {
-                    sql_err("42703", e)
-                } else {
-                    sql_err("42601", e)
-                }
-            })?,
+            .update_many_filtered(engine, None, name, &set_refs, Some(&filter))
+            .map_err(table_err)?,
     };
     Ok(StmtOutcome::Command(format!("UPDATE {updated}")))
 }
@@ -2091,7 +2311,7 @@ fn exec_begin(
         return Err(sql_err(
             "25001",
             "already in a transaction — COMMIT or ROLLBACK first \
-             (Zeno 0.6.0 has no nested transactions)",
+             (Zeno 0.7.0 has no nested transactions)",
         ));
     }
     // Poison recovery (V0.5): see `recover_lock`.
@@ -2181,6 +2401,137 @@ fn exec_rollback(
     Ok(StmtOutcome::Command("ROLLBACK".to_string()))
 }
 
+/// SAVEPOINT <name> (V0.7): remember this transaction's write
+/// buffer under `name`. Only inside a transaction — outside one
+/// it fails with 25P01, like COMMIT/ROLLBACK do. A savepoint with
+/// the same name hides the earlier one (see
+/// `Engine::txn_savepoint`): RELEASE of the new one reveals the
+/// old one again.
+fn exec_savepoint(
+    shared: &Arc<Mutex<Shared>>,
+    tokens: &[Token],
+    session: &mut Session,
+) -> Result<StmtOutcome, SqlError> {
+    let (name, next) = expect_name(tokens, 1)
+        .ok_or_else(|| sql_err("42601", "expected a savepoint name after SAVEPOINT"))?;
+    if next != tokens.len() {
+        return Err(sql_err("42601", "unexpected text after SAVEPOINT <name>"));
+    }
+    let txn = session.txn.ok_or_else(|| {
+        sql_err(
+            "25P01",
+            "there is no transaction in progress — SAVEPOINT outside a transaction (BEGIN first)",
+        )
+    })?;
+    // Poison recovery (V0.5): see `recover_lock`.
+    let mut guard = recover_lock(shared);
+    guard
+        .engine
+        .txn_savepoint(txn, &name)
+        .map_err(|e| sql_err("25P01", e))?;
+    Ok(StmtOutcome::Command("SAVEPOINT".to_string()))
+}
+
+/// ROLLBACK TO [SAVEPOINT] <name> (V0.7): restore this
+/// transaction's write buffer to the named savepoint's snapshot,
+/// dropping every write made after it. The savepoint itself
+/// stays, so rolling back to it again still works. Unknown name:
+/// 3B001 (invalid savepoint specification). This is the one
+/// statement besides ROLLBACK that runs in an aborted transaction
+/// (M2) — it recovers the transaction, so `session.aborted` is
+/// cleared here; the failed statement's effects never reached the
+/// buffer, so there is nothing else to undo.
+fn exec_rollback_to(
+    shared: &Arc<Mutex<Shared>>,
+    tokens: &[Token],
+    session: &mut Session,
+) -> Result<StmtOutcome, SqlError> {
+    let mut i = expect_keyword(tokens, 1, "TO")
+        .ok_or_else(|| sql_err("42601", "expected ROLLBACK TO [SAVEPOINT] <name>"))?;
+    // The SAVEPOINT keyword is optional in PostgreSQL.
+    if let Some(next) = expect_keyword(tokens, i, "SAVEPOINT") {
+        i = next;
+    }
+    let (name, next) = expect_name(tokens, i)
+        .ok_or_else(|| sql_err("42601", "expected a savepoint name after ROLLBACK TO"))?;
+    if next != tokens.len() {
+        return Err(sql_err(
+            "42601",
+            "unexpected text after ROLLBACK TO SAVEPOINT <name>",
+        ));
+    }
+    let txn = session.txn.ok_or_else(|| {
+        sql_err(
+            "25P01",
+            "there is no transaction in progress — ROLLBACK TO SAVEPOINT outside a transaction (BEGIN first)",
+        )
+    })?;
+    // Poison recovery (V0.5): see `recover_lock`.
+    let mut guard = recover_lock(shared);
+    guard
+        .engine
+        .txn_rollback_to_savepoint(txn, &name)
+        .map_err(|e| {
+            if e.contains("no such savepoint") {
+                sql_err("3B001", e)
+            } else {
+                sql_err("25P01", e)
+            }
+        })?;
+    session.aborted = false;
+    // B2 (V0.7 review): the rollback rewound the transaction's
+    // write buffer, so any suspended portal's cached rows may
+    // contain rows that no longer exist. Bump the cache epoch
+    // so the next Execute of such a portal re-runs its
+    // statement fresh instead of serving the stale cache (the
+    // portal itself stays alive — see `Session::cache_epoch`).
+    session.cache_epoch += 1;
+    Ok(StmtOutcome::Command("ROLLBACK".to_string()))
+}
+
+/// RELEASE [SAVEPOINT] <name> (V0.7): forget the named savepoint
+/// (and every savepoint made after it). A later ROLLBACK TO that
+/// name fails with 3B001, because the name no longer exists.
+/// Only inside a transaction — outside one it fails with 25P01.
+fn exec_release(
+    shared: &Arc<Mutex<Shared>>,
+    tokens: &[Token],
+    session: &mut Session,
+) -> Result<StmtOutcome, SqlError> {
+    let mut i = 1;
+    // The SAVEPOINT keyword is optional in PostgreSQL.
+    if let Some(next) = expect_keyword(tokens, i, "SAVEPOINT") {
+        i = next;
+    }
+    let (name, next) = expect_name(tokens, i)
+        .ok_or_else(|| sql_err("42601", "expected a savepoint name after RELEASE"))?;
+    if next != tokens.len() {
+        return Err(sql_err(
+            "42601",
+            "unexpected text after RELEASE SAVEPOINT <name>",
+        ));
+    }
+    let txn = session.txn.ok_or_else(|| {
+        sql_err(
+            "25P01",
+            "there is no transaction in progress — RELEASE SAVEPOINT outside a transaction (BEGIN first)",
+        )
+    })?;
+    // Poison recovery (V0.5): see `recover_lock`.
+    let mut guard = recover_lock(shared);
+    guard
+        .engine
+        .txn_release_savepoint(txn, &name)
+        .map_err(|e| {
+            if e.contains("no such savepoint") {
+                sql_err("3B001", e)
+            } else {
+                sql_err("25P01", e)
+            }
+        })?;
+    Ok(StmtOutcome::Command("RELEASE".to_string()))
+}
+
 /// VACUUM (V0.6-fix, M5): online vacuum — prune version chains
 /// and the committed set while the server runs (see
 /// `Engine::vacuum`). No arguments are supported yet (`VACUUM`
@@ -2194,7 +2545,7 @@ fn exec_vacuum(
     session: &mut Session,
 ) -> Result<StmtOutcome, SqlError> {
     if tokens.len() != 1 {
-        return Err(sql_err("42601", "VACUUM takes no arguments in Zeno 0.6.0"));
+        return Err(sql_err("42601", "VACUUM takes no arguments in Zeno 0.7.0"));
     }
     if session.txn.is_some() {
         return Err(sql_err(
@@ -2589,5 +2940,105 @@ mod tests {
             0,
             "a panicking connection must still free its slot"
         );
+    }
+
+    #[test]
+    fn vacuum_interval_zero_is_clamped_not_busy_spin() {
+        // m5: an interval of 0 used to make the auto-vacuum
+        // thread run VACUUM back to back with no sleep. The
+        // clamp floors it (and any sub-100 ms interval) at
+        // 100 ms; longer intervals pass through unchanged.
+        assert_eq!(
+            clamp_vacuum_interval(Duration::ZERO),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            clamp_vacuum_interval(Duration::from_millis(50)),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            clamp_vacuum_interval(Duration::from_secs(60)),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn auto_vacuum_prunes_dead_versions_but_keeps_live_snapshot_data() {
+        // V0.7: the background auto-vacuum thread must prune
+        // versions no live snapshot can see, and must NEVER prune
+        // a version a live snapshot still needs. The test builds
+        // one key with four versions — v1, v2, then a BEGIN whose
+        // snapshot sees v2, then v3 and v4 — and runs the real
+        // thread on a 50 ms interval.
+        let dir = std::env::temp_dir().join("zeno-pgwire-autovacuum-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = Engine::open(&dir).unwrap();
+        let tables = TableStore::open(&dir).unwrap();
+        let shared = Arc::new(Mutex::new(Shared {
+            engine,
+            tables,
+            data_dir: dir.clone(),
+            rate_limiter: Arc::new(LoginRateLimiter::new()),
+        }));
+
+        let txn = {
+            let mut guard = recover_lock(&shared);
+            guard.engine.put("k", "v1").unwrap();
+            guard.engine.put("k", "v2").unwrap();
+            let txn = guard.engine.begin(); // snapshot sees v2
+            guard.engine.put("k", "v3").unwrap();
+            guard.engine.put("k", "v4").unwrap();
+            assert_eq!(guard.engine.version_chain_len("k"), 4);
+            txn
+        };
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = start_auto_vacuum(
+            Arc::clone(&shared),
+            Duration::from_millis(50),
+            Arc::clone(&stop),
+        );
+        std::thread::sleep(Duration::from_millis(400));
+        {
+            let mut guard = recover_lock(&shared);
+            // v1 is dead to everyone (superseded before the
+            // snapshot began); v2 is what the live snapshot
+            // sees; v3/v4 are newer than its watermark. Only v1
+            // may go — the chain must shrink 4 -> 3, not to 1.
+            assert_eq!(
+                guard.engine.version_chain_len("k"),
+                3,
+                "auto-vacuum must prune only the version no snapshot needs"
+            );
+            assert_eq!(
+                guard.engine.txn_get(txn, "k").unwrap().as_deref(),
+                Some("v2"),
+                "the live snapshot must still read v2 after auto-vacuum runs"
+            );
+            assert_eq!(
+                guard.engine.get("k").as_deref(),
+                Some("v4"),
+                "outside the snapshot the newest value must still read"
+            );
+            guard.engine.rollback(txn).unwrap();
+        }
+        // With the snapshot gone, the next auto-vacuum may prune
+        // everything but the newest version.
+        std::thread::sleep(Duration::from_millis(300));
+        {
+            let mut guard = recover_lock(&shared);
+            assert_eq!(
+                guard.engine.version_chain_len("k"),
+                1,
+                "once the snapshot is gone the chain must prune to the newest version"
+            );
+            assert_eq!(guard.engine.get("k").as_deref(), Some("v4"));
+        }
+        // Clean shutdown: the stop flag must end the thread, and
+        // the join must return (no hung thread left behind).
+        stop.store(true, Ordering::Relaxed);
+        handle.join().expect("auto-vacuum thread must join cleanly");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

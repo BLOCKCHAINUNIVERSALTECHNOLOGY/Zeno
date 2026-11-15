@@ -1516,6 +1516,60 @@ fn vacuum_drops_deleted_key_when_no_snapshot_needs_it() {
     cleanup(&dir);
 }
 
+#[test]
+fn vacuum_with_nothing_to_prune_does_not_rewrite_sstables() {
+    // M3 (V0.7 review): vacuum used to rewrite every SSTable
+    // into a fresh one on every run, even when it pruned
+    // nothing — two no-op vacuums burned two SSTable ids.
+    // A no-op vacuum must leave `next_sst_id` (and the data)
+    // exactly alone.
+    let dir = tmp_dir("vacuum-noop");
+    let mut e = Engine::open(&dir).unwrap();
+    e.put("k", "v1").unwrap();
+    e.flush().unwrap();
+    let before = e.stats().next_sst_id;
+    let report = e.vacuum().unwrap();
+    assert_eq!(
+        report.pruned_versions, 0,
+        "one live key has nothing to prune"
+    );
+    assert_eq!(
+        e.stats().next_sst_id,
+        before,
+        "first no-op vacuum must not burn an SSTable id"
+    );
+    let report = e.vacuum().unwrap();
+    assert_eq!(report.pruned_versions, 0);
+    assert_eq!(
+        e.stats().next_sst_id,
+        before,
+        "second no-op vacuum must not burn one either"
+    );
+    assert_eq!(
+        e.stats().sstable_count,
+        1,
+        "the single SSTable must stay as it is"
+    );
+    assert_eq!(
+        e.get("k"),
+        Some("v1".to_string()),
+        "the live key must survive both vacuums"
+    );
+    // And a vacuum that DOES prune still rewrites, as before.
+    e.put("k", "v2").unwrap();
+    e.flush().unwrap();
+    e.delete("k").unwrap();
+    e.flush().unwrap();
+    let report = e.vacuum().unwrap();
+    assert!(
+        report.pruned_versions > 0,
+        "the deleted key must prune something"
+    );
+    assert_eq!(e.get("k"), None);
+    drop(e);
+    cleanup(&dir);
+}
+
 fn wal_txn_summary(dir: &Path) -> Vec<serde_json::Value> {
     let text = std::fs::read_to_string(dir.join("wal.log")).unwrap();
     text.lines()

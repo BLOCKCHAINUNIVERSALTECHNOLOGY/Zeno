@@ -3572,3 +3572,613 @@ fn vacuum_sql_prunes_versions_and_keeps_live_snapshot() {
     a.terminate();
     b.terminate();
 }
+
+// ---------------------------------------------------------------------
+// V0.7 tests: savepoints, the real SQL parser, auto-vacuum flags.
+// ---------------------------------------------------------------------
+
+/// Seed the four-row users table every parser test uses, and
+/// return the row count afterwards.
+fn seed_users_four(client: &mut Client) {
+    client.query("CREATE TABLE users (id, name, city)");
+    client.query("INSERT INTO users VALUES (1, 'Sanjay', 'Delhi')");
+    client.query("INSERT INTO users VALUES (2, 'Asha', 'Mumbai')");
+    client.query("INSERT INTO users VALUES (3, 'Ravi', 'Delhi')");
+    client.query("INSERT INTO users VALUES (4, 'Meera', 'Pune')");
+}
+
+#[test]
+fn savepoint_rollback_keeps_earlier_writes_drops_later_ones() {
+    let server = Server::start("savepoint-rollback");
+    let (mut a, _) = Client::connect(server.port);
+    let (mut b, _) = Client::connect(server.port);
+    a.query("CREATE TABLE users (id, city)");
+    a.query("INSERT INTO users VALUES (1, 'Delhi')");
+
+    a.query("BEGIN");
+    a.query("INSERT INTO users VALUES (2, 'Mumbai')");
+    let msgs = a.query("SAVEPOINT sp1");
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("SAVEPOINT"), "{msgs:?}");
+    assert_eq!(
+        ready_status(&msgs),
+        b'T',
+        "savepoint must keep the txn open"
+    );
+    a.query("INSERT INTO users VALUES (3, 'Jaipur')");
+    a.query("UPDATE users SET city = 'Agra' WHERE id = 1");
+    assert_eq!(
+        Client::rows(&a.query("SELECT * FROM users")).len(),
+        3,
+        "inside the txn all three rows are visible"
+    );
+    // Roll back to the savepoint: row 3 and the Agra update go,
+    // rows 1 (Delhi) and 2 (Mumbai) stay.
+    let msgs = a.query("ROLLBACK TO SAVEPOINT sp1");
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("ROLLBACK"), "{msgs:?}");
+    assert_eq!(ready_status(&msgs), b'T', "ROLLBACK TO keeps the txn open");
+    let rows = Client::rows(&a.query("SELECT * FROM users"));
+    assert_eq!(rows.len(), 2, "only the pre-savepoint rows must remain");
+    assert_eq!(rows[0][1], Some("Delhi".to_string()));
+    assert_eq!(rows[1][1], Some("Mumbai".to_string()));
+    // The savepoint itself survives: rolling back to it again is
+    // still fine (a no-op now, not an error).
+    let msgs = a.query("ROLLBACK TO SAVEPOINT sp1");
+    assert!(Client::error(&msgs).is_none(), "{msgs:?}");
+    // COMMIT lands exactly the pre-savepoint writes.
+    a.query("COMMIT");
+    assert_eq!(Client::rows(&b.query("SELECT * FROM users")).len(), 2);
+    a.terminate();
+    b.terminate();
+}
+
+#[test]
+fn savepoint_release_and_unknown_name_errors() {
+    let server = Server::start("savepoint-release");
+    let (mut client, _) = Client::connect(server.port);
+    client.query("CREATE TABLE users (id, city)");
+    client.query("INSERT INTO users VALUES (1, 'Delhi')");
+
+    // SAVEPOINT / RELEASE / ROLLBACK TO outside a transaction: 25P01.
+    for sql in [
+        "SAVEPOINT sp",
+        "RELEASE SAVEPOINT sp",
+        "ROLLBACK TO SAVEPOINT sp",
+    ] {
+        let msgs = client.query(sql);
+        let (code, _) = Client::error(&msgs).expect("must error outside a txn");
+        assert_eq!(code, "25P01", "{sql}: {msgs:?}");
+    }
+
+    client.query("BEGIN");
+    // Unknown name: 3B001, for both ROLLBACK TO and RELEASE.
+    for sql in ["ROLLBACK TO SAVEPOINT nope", "RELEASE SAVEPOINT nope"] {
+        let msgs = client.query(sql);
+        let (code, _) = Client::error(&msgs).expect("unknown savepoint must error");
+        assert_eq!(code, "3B001", "{sql}: {msgs:?}");
+    }
+    assert_eq!(
+        ready_status(&client.query("SELECT * FROM users")),
+        b'T',
+        "a failed savepoint statement must not end the transaction"
+    );
+
+    // RELEASE removes the name: ROLLBACK TO afterwards is 3B001.
+    client.query("SAVEPOINT sp");
+    client.query("INSERT INTO users VALUES (2, 'Mumbai')");
+    let msgs = client.query("RELEASE SAVEPOINT sp");
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("RELEASE"), "{msgs:?}");
+    let msgs = client.query("ROLLBACK TO SAVEPOINT sp");
+    let (code, _) = Client::error(&msgs).expect("released savepoint must error");
+    assert_eq!(code, "3B001", "{msgs:?}");
+    // The insert made after the (now released) savepoint is still
+    // in the transaction — RELEASE only forgets the name.
+    assert_eq!(Client::rows(&client.query("SELECT * FROM users")).len(), 2);
+    client.query("COMMIT");
+    assert_eq!(Client::rows(&client.query("SELECT * FROM users")).len(), 2);
+    client.terminate();
+}
+
+#[test]
+fn savepoint_rollback_recovers_aborted_transaction() {
+    // PostgreSQL lets ROLLBACK TO SAVEPOINT recover from the
+    // aborted (25P02) state; a plain statement cannot.
+    let server = Server::start("savepoint-aborted");
+    let (mut client, _) = Client::connect(server.port);
+    client.query("CREATE TABLE users (id, city)");
+    client.query("INSERT INTO users VALUES (1, 'Delhi')");
+    client.query("BEGIN");
+    client.query("SAVEPOINT sp");
+    // A failing statement aborts the transaction...
+    let msgs = client.query("INSERT INTO nosuch VALUES (9, 'X')");
+    let (code, _) = Client::error(&msgs).expect("insert into a missing table must error");
+    assert_eq!(code, "42P01", "{msgs:?}");
+    let msgs = client.query("SELECT * FROM users");
+    let (code, _) = Client::error(&msgs).expect("aborted txn must refuse SELECT");
+    assert_eq!(code, "25P02", "{msgs:?}");
+    assert_eq!(ready_status(&msgs), b'E');
+    // ...but ROLLBACK TO SAVEPOINT runs, and clears the abort.
+    let msgs = client.query("ROLLBACK TO SAVEPOINT sp");
+    assert!(Client::error(&msgs).is_none(), "{msgs:?}");
+    assert_eq!(ready_status(&msgs), b'T', "txn must be usable again");
+    let msgs = client.query("INSERT INTO users VALUES (2, 'Mumbai')");
+    assert_eq!(
+        Client::tag(&msgs).as_deref(),
+        Some("INSERT 0 1"),
+        "{msgs:?}"
+    );
+    client.query("COMMIT");
+    assert_eq!(Client::rows(&client.query("SELECT * FROM users")).len(), 2);
+    client.terminate();
+}
+
+#[test]
+fn savepoint_works_over_the_extended_protocol() {
+    // SAVEPOINT / ROLLBACK TO go through Parse/Bind/Execute too.
+    let server = Server::start("savepoint-extended");
+    let (mut client, _) = Client::connect(server.port);
+    client.query("CREATE TABLE users (id, city)");
+    client.query("INSERT INTO users VALUES (1, 'Delhi')");
+
+    let run = |client: &mut Client, sql: &str| -> Vec<Msg> {
+        client.extended(&[
+            parse_frame("", sql, &[]),
+            bind_frame("", "", &[], &[], &[]),
+            execute_frame("", 0),
+            sync_frame(),
+        ])
+    };
+    let msgs = run(&mut client, "BEGIN");
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("BEGIN"), "{msgs:?}");
+    let msgs = run(&mut client, "SAVEPOINT sp");
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("SAVEPOINT"), "{msgs:?}");
+    let msgs = run(&mut client, "INSERT INTO users VALUES (2, 'Mumbai')");
+    assert_eq!(
+        Client::tag(&msgs).as_deref(),
+        Some("INSERT 0 1"),
+        "{msgs:?}"
+    );
+    let msgs = run(&mut client, "ROLLBACK TO SAVEPOINT sp");
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("ROLLBACK"), "{msgs:?}");
+    let msgs = run(&mut client, "COMMIT");
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("COMMIT"), "{msgs:?}");
+    // The rolled-back insert never landed.
+    assert_eq!(Client::rows(&client.query("SELECT * FROM users")).len(), 1);
+    client.terminate();
+}
+
+#[test]
+fn parser_select_order_by_limit_offset() {
+    let server = Server::start("parser-order-limit");
+    let (mut client, _) = Client::connect(server.port);
+    seed_users_four(&mut client);
+
+    // ORDER BY id DESC + LIMIT 2: the two highest ids first.
+    let rows = Client::rows(&client.query("SELECT * FROM users ORDER BY id DESC LIMIT 2"));
+    assert_eq!(
+        rows.iter().map(|r| r[0].clone()).collect::<Vec<_>>(),
+        vec![Some("4".to_string()), Some("3".to_string())],
+        "ORDER BY id DESC LIMIT 2 must return ids 4, 3"
+    );
+    // OFFSET skips, LIMIT caps: ids 3, 2.
+    let rows =
+        Client::rows(&client.query("SELECT id FROM users ORDER BY id DESC LIMIT 2 OFFSET 1"));
+    assert_eq!(
+        rows,
+        vec![vec![Some("3".to_string())], vec![Some("2".to_string())]]
+    );
+    // ORDER BY on text sorts lexicographically; ties keep row-id
+    // order (stable sort over the row-id-ordered scan).
+    let rows = Client::rows(&client.query("SELECT city FROM users ORDER BY city ASC"));
+    assert_eq!(
+        rows.iter().map(|r| r[0].clone()).collect::<Vec<_>>(),
+        vec![
+            Some("Delhi".to_string()),
+            Some("Delhi".to_string()),
+            Some("Mumbai".to_string()),
+            Some("Pune".to_string()),
+        ]
+    );
+    // LIMIT 0 returns no rows (but still a valid SELECT).
+    let msgs = client.query("SELECT * FROM users LIMIT 0");
+    assert_eq!(Client::rows(&msgs).len(), 0);
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("SELECT 0"), "{msgs:?}");
+    // ORDER BY on an unknown column: 42703.
+    let msgs = client.query("SELECT * FROM users ORDER BY nope");
+    let (code, _) = Client::error(&msgs).expect("unknown ORDER BY column must error");
+    assert_eq!(code, "42703", "{msgs:?}");
+    client.terminate();
+}
+
+#[test]
+fn review_bigint_where_and_order_by_are_exact_above_2_pow_53() {
+    // B1 (V0.7 review): 2^53 and 2^53+1 are the SAME f64, so a
+    // WHERE on the odd value used to match both rows.
+    let server = Server::start("review-bigint");
+    let (mut client, _) = Client::connect(server.port);
+    client.query("CREATE TABLE t (id, v)");
+    client.query("INSERT INTO t VALUES (9007199254740992, 'even')");
+    client.query("INSERT INTO t VALUES (9007199254740993, 'odd')");
+    let rows = Client::rows(&client.query("SELECT * FROM t WHERE id = 9007199254740993"));
+    assert_eq!(rows.len(), 1, "only the odd row must match: {rows:?}");
+    assert_eq!(rows[0][1], Some("odd".to_string()));
+    let rows = Client::rows(&client.query("SELECT * FROM t WHERE id > 9007199254740992"));
+    assert_eq!(rows.len(), 1, "only the odd row is greater: {rows:?}");
+    let rows = Client::rows(&client.query("SELECT * FROM t WHERE id < 9007199254740993"));
+    assert_eq!(rows.len(), 1, "only the even row is smaller: {rows:?}");
+    let rows = Client::rows(&client.query("SELECT * FROM t ORDER BY id"));
+    assert_eq!(
+        rows.iter().map(|r| r[0].clone()).collect::<Vec<_>>(),
+        vec![
+            Some("9007199254740992".to_string()),
+            Some("9007199254740993".to_string()),
+        ],
+        "ORDER BY must put the even row first: {rows:?}"
+    );
+    let rows = Client::rows(&client.query("SELECT * FROM t ORDER BY id DESC"));
+    assert_eq!(rows[0][1], Some("odd".to_string()));
+    client.terminate();
+}
+
+#[test]
+fn review_portal_cache_invalidated_after_rollback_to_savepoint() {
+    // B2 (V0.7 review): a suspended portal's cached rows
+    // included a row the ROLLBACK TO SAVEPOINT had just undone,
+    // and resuming the portal served it. The cache must be
+    // re-run fresh (resuming from the rows already sent).
+    let server = Server::start("fix-portal-stale");
+    let (mut client, _) = Client::connect(server.port);
+    client.query("CREATE TABLE t (id, name)");
+    client.query("INSERT INTO t VALUES (1, 'n1')");
+    client.query("INSERT INTO t VALUES (2, 'n2')");
+    client.query("BEGIN");
+    client.query("SAVEPOINT sp");
+    client.query("INSERT INTO t VALUES (3, 'n3')");
+    let msgs = client.extended(&[
+        parse_frame("s1", "SELECT * FROM t", &[]),
+        bind_frame("p1", "s1", &[], &[], &[]),
+        execute_frame("p1", 1),
+        sync_frame(),
+    ]);
+    assert_eq!(
+        Client::rows(&msgs).len(),
+        1,
+        "first Execute sends 1 row: {msgs:?}"
+    );
+    assert!(
+        msgs.iter().any(|m| matches!(m, Msg::PortalSuspended)),
+        "must suspend: {msgs:?}"
+    );
+    // Roll back the insert of row 3, via the extended protocol.
+    let msgs = client.extended(&[
+        parse_frame("", "ROLLBACK TO SAVEPOINT sp", &[]),
+        bind_frame("", "", &[], &[], &[]),
+        execute_frame("", 0),
+        sync_frame(),
+    ]);
+    assert!(Client::error(&msgs).is_none(), "{msgs:?}");
+    assert_eq!(
+        Client::rows(&client.query("SELECT * FROM t")).len(),
+        2,
+        "row 3 must be gone after ROLLBACK TO"
+    );
+    // Resume the suspended portal: only row 2 remains to send.
+    let msgs = client.extended(&[execute_frame("p1", 0), sync_frame()]);
+    let rows = Client::rows(&msgs);
+    assert_eq!(rows.len(), 1, "resume must serve only row 2: {rows:?}");
+    assert_eq!(
+        rows[0][0],
+        Some("2".to_string()),
+        "resumed row must be row 2: {rows:?}"
+    );
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("SELECT 2"), "{msgs:?}");
+    client.query("COMMIT");
+    client.terminate();
+}
+
+#[test]
+fn review_duplicate_savepoint_release_reveals_older_one() {
+    // M1 (V0.7 review): SAVEPOINT s twice hides the first s;
+    // RELEASE of the newest reveals it, so ROLLBACK TO s rolls
+    // back to the FIRST savepoint (PostgreSQL behaviour). The
+    // old code dropped the first s, so ROLLBACK TO failed with
+    // 3B001 and every write stayed.
+    let server = Server::start("fix-dup-savepoint");
+    let (mut client, _) = Client::connect(server.port);
+    client.query("CREATE TABLE t (id, city)");
+    client.query("INSERT INTO t VALUES (1, 'Delhi')");
+    client.query("BEGIN");
+    client.query("SAVEPOINT s");
+    client.query("INSERT INTO t VALUES (2, 'Mumbai')");
+    client.query("SAVEPOINT s");
+    client.query("INSERT INTO t VALUES (3, 'Jaipur')");
+    client.query("RELEASE SAVEPOINT s");
+    let msgs = client.query("ROLLBACK TO SAVEPOINT s");
+    assert!(Client::error(&msgs).is_none(), "{msgs:?}");
+    let rows = Client::rows(&client.query("SELECT * FROM t"));
+    assert_eq!(rows.len(), 1, "only row 1 must remain: {rows:?}");
+    assert_eq!(rows[0][1], Some("Delhi".to_string()));
+    // Rolling back to the (still present) first savepoint again
+    // is a no-op, not an error.
+    let msgs = client.query("ROLLBACK TO SAVEPOINT s");
+    assert!(Client::error(&msgs).is_none(), "{msgs:?}");
+    client.query("ROLLBACK");
+    client.terminate();
+}
+
+#[test]
+fn review_create_table_rejects_duplicate_column_names() {
+    // M2 (V0.7 review): CREATE TABLE t (id, id) used to be
+    // accepted, and INSERT (1, 2) then stored only {"id": "2"}.
+    let server = Server::start("review-dup-col");
+    let (mut client, _) = Client::connect(server.port);
+    let msgs = client.query("CREATE TABLE t (id, id)");
+    let (code, _) = Client::error(&msgs).expect("duplicate column must error");
+    assert_eq!(code, "42601", "{msgs:?}");
+    // The rejected table does not exist: creating it properly
+    // now works, and the old name is free.
+    let msgs = client.query("CREATE TABLE t (id, v)");
+    assert!(Client::error(&msgs).is_none(), "{msgs:?}");
+    client.query("INSERT INTO t VALUES (1, 2)");
+    let rows = Client::rows(&client.query("SELECT * FROM t"));
+    assert_eq!(
+        rows,
+        vec![vec![Some("1".to_string()), Some("2".to_string())]],
+        "both values must be stored under their own columns"
+    );
+    client.terminate();
+}
+
+#[test]
+fn review_update_rejects_duplicate_set_column() {
+    // M4 (V0.7 review): UPDATE t SET a = 1, a = 2 used to be
+    // silently last-wins. PostgreSQL rejects it — so does Zeno.
+    let server = Server::start("review-dup-set");
+    let (mut client, _) = Client::connect(server.port);
+    client.query("CREATE TABLE t (a, b)");
+    client.query("INSERT INTO t VALUES (0, 'x')");
+    let msgs = client.query("UPDATE t SET a = 1, a = 2");
+    let (code, _) = Client::error(&msgs).expect("duplicate SET column must error");
+    assert_eq!(code, "42601", "{msgs:?}");
+    let rows = Client::rows(&client.query("SELECT * FROM t"));
+    assert_eq!(
+        rows[0][0],
+        Some("0".to_string()),
+        "a failed UPDATE must change nothing: {rows:?}"
+    );
+    // Two different columns in one SET still work.
+    let msgs = client.query("UPDATE t SET a = 1, b = 'y'");
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("UPDATE 1"), "{msgs:?}");
+    client.terminate();
+}
+
+#[test]
+fn review_offset_before_limit_and_multi_column_order_by() {
+    // M5 (V0.7 review): OFFSET before LIMIT, and several ORDER
+    // BY keys, both used to fail with 42601.
+    let server = Server::start("fix-offset-limit");
+    let (mut client, _) = Client::connect(server.port);
+    client.query("CREATE TABLE t (a, b)");
+    client.query("INSERT INTO t VALUES (1, 2)");
+    client.query("INSERT INTO t VALUES (1, 1)");
+    client.query("INSERT INTO t VALUES (2, 9)");
+    let rows = Client::rows(&client.query("SELECT * FROM t OFFSET 0 LIMIT 1"));
+    assert_eq!(rows.len(), 1, "OFFSET before LIMIT must work: {rows:?}");
+    let rows = Client::rows(&client.query("SELECT * FROM t ORDER BY a, b"));
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".to_string()), Some("1".to_string())],
+            vec![Some("1".to_string()), Some("2".to_string())],
+            vec![Some("2".to_string()), Some("9".to_string())],
+        ],
+        "ORDER BY a, b must sort by a, then by b: {rows:?}"
+    );
+    let rows = Client::rows(&client.query("SELECT * FROM t ORDER BY a ASC, b DESC"));
+    assert_eq!(
+        rows[0],
+        vec![Some("1".to_string()), Some("2".to_string())],
+        "per-key direction must apply: {rows:?}"
+    );
+    // LIMIT then OFFSET still works, and OFFSET before LIMIT
+    // with a real offset skips rows.
+    let rows = Client::rows(&client.query("SELECT * FROM t ORDER BY a, b OFFSET 1 LIMIT 1"));
+    assert_eq!(
+        rows,
+        vec![vec![Some("1".to_string()), Some("2".to_string())]],
+        "{rows:?}"
+    );
+    client.terminate();
+}
+
+#[test]
+fn review_unsupported_constructs_are_0a000() {
+    // m1 (V0.7 review): known-but-unsupported constructs fail
+    // with 0A000 (feature not supported), not 42601.
+    let server = Server::start("review-0a000");
+    let (mut client, _) = Client::connect(server.port);
+    client.query("CREATE TABLE t (a, b)");
+    for sql in [
+        "SELECT * FROM t WHERE a LIKE '1'",
+        "SELECT * FROM t WHERE a IS NULL",
+        "SELECT * FROM t WHERE a IS NOT NULL",
+        "SELECT * FROM t WHERE a = upper('x')",
+        "INSERT INTO t SELECT * FROM t",
+        "CREATE TABLE u (id, PRIMARY KEY (id))",
+    ] {
+        let msgs = client.query(sql);
+        let (code, _) = Client::error(&msgs).unwrap_or_else(|| panic!("{sql} must error"));
+        assert_eq!(code, "0A000", "{sql}: {msgs:?}");
+    }
+    client.terminate();
+}
+
+#[test]
+fn parser_multi_condition_where_with_comparisons() {
+    let server = Server::start("parser-where");
+    let (mut client, _) = Client::connect(server.port);
+    seed_users_four(&mut client);
+
+    // AND-joined conditions, `=` and `>`.
+    let rows =
+        Client::rows(&client.query("SELECT name FROM users WHERE city = 'Delhi' AND id > 1"));
+    assert_eq!(rows, vec![vec![Some("Ravi".to_string())]]);
+    // Range with >= and <=.
+    let rows =
+        Client::rows(&client.query("SELECT id FROM users WHERE id >= 2 AND id <= 3 ORDER BY id"));
+    assert_eq!(
+        rows,
+        vec![vec![Some("2".to_string())], vec![Some("3".to_string())]]
+    );
+    // `!=` and `<=`: numeric comparison, not lexicographic
+    // ("10" > "9" numerically — a string compare would disagree).
+    let rows = Client::rows(
+        &client.query("SELECT id FROM users WHERE city != 'Delhi' AND id <= 4 ORDER BY id"),
+    );
+    assert_eq!(
+        rows,
+        vec![vec![Some("2".to_string())], vec![Some("4".to_string())]]
+    );
+    // A condition on an unknown column matches no rows (as before).
+    let rows = Client::rows(&client.query("SELECT * FROM users WHERE nope = 'x'"));
+    assert_eq!(rows.len(), 0);
+    client.terminate();
+}
+
+#[test]
+fn parser_multi_row_insert_and_column_list() {
+    let server = Server::start("parser-insert");
+    let (mut client, _) = Client::connect(server.port);
+    client.query("CREATE TABLE users (id, name, city)");
+
+    // Two rows in one statement: one CommandComplete, INSERT 0 2.
+    let msgs =
+        client.query("INSERT INTO users VALUES (1, 'Sanjay', 'Delhi'), (2, 'Asha', 'Mumbai')");
+    assert_eq!(
+        Client::tag(&msgs).as_deref(),
+        Some("INSERT 0 2"),
+        "{msgs:?}"
+    );
+    // Column list, in a different order than the registry: the
+    // values must land in the right columns.
+    let msgs = client.query("INSERT INTO users (city, name, id) VALUES ('Jaipur', 'Vikram', 3)");
+    assert_eq!(
+        Client::tag(&msgs).as_deref(),
+        Some("INSERT 0 1"),
+        "{msgs:?}"
+    );
+    let rows = Client::rows(&client.query("SELECT * FROM users WHERE id = 3"));
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some("3".to_string()),
+            Some("Vikram".to_string()),
+            Some("Jaipur".to_string()),
+        ]]
+    );
+    // A column list with an unknown column: 42703, nothing inserted.
+    let msgs = client.query("INSERT INTO users (id, nope) VALUES (9, 'x')");
+    let (code, _) = Client::error(&msgs).expect("unknown INSERT column must error");
+    assert_eq!(code, "42703", "{msgs:?}");
+    assert_eq!(Client::rows(&client.query("SELECT * FROM users")).len(), 3);
+    // A row with the wrong value count: 42601.
+    let msgs = client.query("INSERT INTO users VALUES (9, 'only-two')");
+    let (code, _) = Client::error(&msgs).expect("short row must error");
+    assert_eq!(code, "42601", "{msgs:?}");
+    client.terminate();
+}
+
+#[test]
+fn parser_multi_set_update() {
+    let server = Server::start("parser-update");
+    let (mut client, _) = Client::connect(server.port);
+    seed_users_four(&mut client);
+
+    // Two SET assignments, one WHERE with AND.
+    let msgs = client
+        .query("UPDATE users SET city = 'Pune', name = 'Asha2' WHERE id = 2 AND city = 'Mumbai'");
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("UPDATE 1"), "{msgs:?}");
+    let rows = Client::rows(&client.query("SELECT * FROM users WHERE id = 2"));
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some("2".to_string()),
+            Some("Asha2".to_string()),
+            Some("Pune".to_string()),
+        ]]
+    );
+    // The other rows are untouched.
+    assert_eq!(
+        Client::rows(&client.query("SELECT * FROM users WHERE id = 1"))[0][1],
+        Some("Sanjay".to_string())
+    );
+    // An unknown SET column is still 42703.
+    let msgs = client.query("UPDATE users SET nope = 'x', city = 'Y' WHERE id = 1");
+    let (code, _) = Client::error(&msgs).expect("unknown SET column must error");
+    assert_eq!(code, "42703", "{msgs:?}");
+    client.terminate();
+}
+
+#[test]
+fn parser_syntax_errors_carry_line_and_column() {
+    let server = Server::start("parser-errors");
+    let (mut client, _) = Client::connect(server.port);
+    seed_users_four(&mut client);
+
+    // A missing value after `=`: 42601, with the position.
+    let msgs = client.query("SELECT * FROM users WHERE city =");
+    let (code, message) = Client::error(&msgs).expect("bad SQL must error");
+    assert_eq!(code, "42601", "{msgs:?}");
+    assert!(
+        message.contains("line 1, column"),
+        "syntax error must carry its position: {message}"
+    );
+    // Multi-line SQL: the error points at line 3, not line 1.
+    let msgs = client.query("SELECT *\nFROM users\nWHERE city =");
+    let (code, message) = Client::error(&msgs).expect("bad multi-line SQL must error");
+    assert_eq!(code, "42601", "{msgs:?}");
+    assert!(
+        message.contains("line 3, column"),
+        "multi-line syntax error must point at line 3: {message}"
+    );
+    // JOIN is a clean "not supported" (0A000), not a syntax error.
+    let msgs = client.query("SELECT * FROM users JOIN other ON users.id = other.id");
+    let (code, message) = Client::error(&msgs).expect("JOIN must error");
+    assert_eq!(code, "0A000", "{msgs:?}");
+    assert!(message.contains("JOIN"), "{message}");
+    // Aggregates are "not supported" too.
+    let msgs = client.query("SELECT COUNT(*) FROM users");
+    let (code, _) = Client::error(&msgs).expect("COUNT(*) must error");
+    assert_eq!(code, "0A000", "{msgs:?}");
+    // A missing comma in CREATE TABLE is still a syntax error.
+    let msgs = client.query("CREATE TABLE broken (id name)");
+    let (code, _) = Client::error(&msgs).expect("bad CREATE TABLE must error");
+    assert_eq!(code, "42601", "{msgs:?}");
+    // ...but a typed CREATE TABLE now works (V0.6 rejected it).
+    let msgs = client.query("CREATE TABLE typed (id SERIAL PRIMARY KEY, name VARCHAR(10))");
+    assert_eq!(
+        Client::tag(&msgs).as_deref(),
+        Some("CREATE TABLE"),
+        "{msgs:?}"
+    );
+    // The connection survives every error above.
+    assert_eq!(Client::rows(&client.query("SELECT * FROM users")).len(), 4);
+    client.terminate();
+}
+
+#[test]
+fn serve_accepts_vacuum_interval_and_no_auto_vacuum_flags() {
+    // The flags must at least start a working server: a 1-second
+    // auto-vacuum and a disabled one both serve queries fine.
+    // (The pruning itself is covered by the unit test in pgwire.rs.)
+    for (name, extra) in [
+        ("autovacuum-flag", ["--vacuum-interval", "1"].as_slice()),
+        ("no-autovacuum-flag", ["--no-auto-vacuum"].as_slice()),
+    ] {
+        let server = Server::start_with_args(name, extra);
+        let (mut client, _) = Client::connect(server.port);
+        client.query("CREATE TABLE t (id, city)");
+        client.query("INSERT INTO t VALUES (1, 'Delhi')");
+        assert_eq!(Client::rows(&client.query("SELECT * FROM t")).len(), 1);
+        client.terminate();
+    }
+}

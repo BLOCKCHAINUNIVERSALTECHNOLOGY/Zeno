@@ -3,9 +3,12 @@
 // A table is just a namespace of keys:
 //   table:<name>:<row-id>  ->  {"col1": "value1", "col2": "value2", ...}
 //
-// There is NO real SQL parser in V0.1. "SELECT" here means: scan all rows
-// of the table, optionally keeping only rows where one column equals one
-// value. That is a simple scan filter, not SQL.
+// The SQL itself is parsed in `parser.rs` (V0.7: a real lexer +
+// recursive-descent parser); this file is the storage layer the
+// parser's AST executes against. `select` here means: scan all
+// rows of the table, keeping only rows matching a `RowFilter`
+// (AND-joined conditions, V0.7) — still a linear scan, not an
+// indexed query.
 //
 // Table schemas (the list of column names) are kept in a small JSON file
 // `tables.json` inside the data directory, so they survive a restart.
@@ -19,6 +22,136 @@ use std::path::{Path, PathBuf};
 
 /// One row from `select`: (row id, column name -> value).
 pub type TableRow = (u64, BTreeMap<String, String>);
+
+/// A comparison operator in a WHERE condition (V0.7: the SQL
+/// parser supports all six; V0.6 only had `=`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterOp {
+    Eq,
+    Ne,
+    Lt,
+    Gt,
+    Le,
+    Ge,
+}
+
+/// A WHERE filter: AND-joined `column <op> value` conditions
+/// (V0.7). An empty filter matches every row. A condition on a
+/// column the row does not have matches NO row — including `!=`,
+/// because a missing value is not a value at all (this keeps the
+/// V0.6 behaviour, where a filter on an unknown column matched
+/// nothing, instead of silently matching everything under `!=`).
+#[derive(Debug, Clone, Default)]
+pub struct RowFilter {
+    pub conditions: Vec<(String, FilterOp, String)>,
+}
+
+impl RowFilter {
+    /// The V0.6 single-condition filter: `column = value`.
+    pub fn one(column: &str, value: &str) -> Self {
+        Self {
+            conditions: vec![(column.to_string(), FilterOp::Eq, value.to_string())],
+        }
+    }
+
+    pub fn matches(&self, row: &BTreeMap<String, String>) -> bool {
+        self.conditions.iter().all(|(col, op, want)| {
+            let Some(got) = row.get(col) else {
+                return false;
+            };
+            let ord = compare_values(got, want);
+            match op {
+                FilterOp::Eq => ord == std::cmp::Ordering::Equal,
+                FilterOp::Ne => ord != std::cmp::Ordering::Equal,
+                FilterOp::Lt => ord == std::cmp::Ordering::Less,
+                FilterOp::Gt => ord == std::cmp::Ordering::Greater,
+                FilterOp::Le => ord != std::cmp::Ordering::Greater,
+                FilterOp::Ge => ord != std::cmp::Ordering::Less,
+            }
+        })
+    }
+}
+
+/// Compare two stored values: numerically when BOTH parse as
+/// numbers (`"10" > "9"` — a plain string compare would say the
+/// opposite), lexicographically otherwise. Used by WHERE
+/// `<`/`>`/`<=`/`>=` and by ORDER BY, so both sort the same way.
+///
+/// B1 (V0.7 review): integers compare as integers, at arbitrary
+/// precision — never through `f64`. An `f64` has only 53 bits of
+/// mantissa, so `9007199254740992` and `9007199254740993` parse
+/// to the SAME `f64` and a `WHERE id = 9007199254740993` matched
+/// both rows. Integer strings (optional sign + digits) are
+/// compared by sign, then digit length, then lexicographically,
+/// which is exact for any size. `f64` is used only once both
+/// sides are NOT plain integers (a decimal point or exponent
+/// in at least one of them — e.g. `"1.5"` vs `"1.25"`); `NaN`
+/// still falls back to a plain string compare so ORDER BY
+/// keeps a total order.
+pub fn compare_values(a: &str, b: &str) -> std::cmp::Ordering {
+    if let Some(ord) = compare_integers(a, b) {
+        return ord;
+    }
+    if let (Ok(x), Ok(y)) = (a.parse::<f64>(), b.parse::<f64>()) {
+        // NaN cannot come from a parse of stored text that is
+        // itself a number literal... `f64::parse` accepts "NaN"
+        // as text, so guard it: NaN compares equal to nothing,
+        // which would break ORDER BY's total order.
+        if x.is_nan() || y.is_nan() {
+            return a.cmp(b);
+        }
+        return x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal);
+    }
+    a.cmp(b)
+}
+
+/// Exact comparison of two integer strings (`[+-]?[0-9]+`),
+/// or `None` when either side is not a plain integer. Compares
+/// by sign, then by number of digits (after stripping leading
+/// zeros), then lexicographically — exact for integers of any
+/// size, including values far above `i64`/`u64`/`f64` range.
+fn compare_integers(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    let (a_neg, a_digits) = split_int(a)?;
+    let (b_neg, b_digits) = split_int(b)?;
+    // Zero has no sign: "-0" == "0" == "+0". (`split_int`
+    // strips leading zeros, so an all-zero value has empty
+    // digits here — that is zero, not "not an integer".)
+    let a_zero = a_digits.iter().all(|c| *c == b'0');
+    let b_zero = b_digits.iter().all(|c| *c == b'0');
+    if a_zero && b_zero {
+        return Some(Ordering::Equal);
+    }
+    if a_neg != b_neg {
+        return Some(if a_neg {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        });
+    }
+    let ord = a_digits
+        .len()
+        .cmp(&b_digits.len())
+        .then_with(|| a_digits.cmp(b_digits));
+    Some(if a_neg { ord.reverse() } else { ord })
+}
+
+/// Split an integer string into (is_negative, digits without
+/// sign or leading zeros). Returns `None` unless the whole
+/// string is an optional sign followed by one or more digits.
+fn split_int(s: &str) -> Option<(bool, &[u8])> {
+    let bytes = s.as_bytes();
+    let (neg, digits) = match bytes.first() {
+        Some(b'+') => (false, &bytes[1..]),
+        Some(b'-') => (true, &bytes[1..]),
+        _ => (false, bytes),
+    };
+    if digits.is_empty() || !digits.iter().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let stripped = &digits[digits.iter().take_while(|c| **c == b'0').count()..];
+    Some((neg, stripped))
+}
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct TableRegistry {
@@ -165,6 +298,21 @@ impl TableStore {
         if columns.is_empty() {
             return Err("a table needs at least one column".to_string());
         }
+        // M2 (V0.7 review): a duplicate column name used to be
+        // accepted, and an INSERT then silently overwrote the
+        // first value with the second (the stored row kept only
+        // one "id"). Reject it at CREATE TABLE (42601 at the SQL
+        // layer) instead of eating data.
+        {
+            let mut seen = std::collections::BTreeSet::new();
+            for col in &columns {
+                if !seen.insert(col) {
+                    return Err(format!(
+                        "duplicate column name '{col}' in CREATE TABLE '{name}'"
+                    ));
+                }
+            }
+        }
         self.registry.tables.insert(
             name.to_string(),
             TableMeta {
@@ -280,7 +428,8 @@ impl TableStore {
         name: &str,
         filter: Option<(&str, &str)>,
     ) -> Result<usize, String> {
-        self.delete_inner(engine, None, name, filter)
+        let filter = filter.map(|(c, v)| RowFilter::one(c, v));
+        self.delete_filtered(engine, None, name, filter.as_ref())
     }
 
     /// Delete rows inside transaction `txn` (V0.6): the rows
@@ -293,7 +442,19 @@ impl TableStore {
         name: &str,
         filter: Option<(&str, &str)>,
     ) -> Result<usize, String> {
-        self.delete_inner(engine, Some(txn), name, filter)
+        let filter = filter.map(|(c, v)| RowFilter::one(c, v));
+        self.delete_filtered(engine, Some(txn), name, filter.as_ref())
+    }
+
+    /// Delete rows matching a multi-condition filter (V0.7).
+    pub fn delete_filtered(
+        &mut self,
+        engine: &mut Engine,
+        txn: Option<u64>,
+        name: &str,
+        filter: Option<&RowFilter>,
+    ) -> Result<usize, String> {
+        self.delete_inner(engine, txn, name, filter)
     }
 
     fn delete_inner(
@@ -301,11 +462,11 @@ impl TableStore {
         engine: &mut Engine,
         txn: Option<u64>,
         name: &str,
-        filter: Option<(&str, &str)>,
+        filter: Option<&RowFilter>,
     ) -> Result<usize, String> {
         let rows = match txn {
-            Some(txn) => self.select_txn(engine, txn, name, filter)?,
-            None => self.select(engine, name, filter)?,
+            Some(txn) => self.select_txn_filtered(engine, txn, name, filter)?,
+            None => self.select_filtered(engine, name, filter)?,
         };
         match txn {
             Some(txn) => {
@@ -350,7 +511,8 @@ impl TableStore {
         set_val: &str,
         filter: Option<(&str, &str)>,
     ) -> Result<usize, String> {
-        self.update_inner(engine, None, name, set_col, set_val, filter)
+        let filter = filter.map(|(c, v)| RowFilter::one(c, v));
+        self.update_many_filtered(engine, None, name, &[(set_col, set_val)], filter.as_ref())
     }
 
     /// UPDATE inside transaction `txn` (V0.6).
@@ -363,7 +525,28 @@ impl TableStore {
         set_val: &str,
         filter: Option<(&str, &str)>,
     ) -> Result<usize, String> {
-        self.update_inner(engine, Some(txn), name, set_col, set_val, filter)
+        let filter = filter.map(|(c, v)| RowFilter::one(c, v));
+        self.update_many_filtered(
+            engine,
+            Some(txn),
+            name,
+            &[(set_col, set_val)],
+            filter.as_ref(),
+        )
+    }
+
+    /// UPDATE with several SET assignments and a multi-condition
+    /// filter (V0.7): `UPDATE name SET a = 1, b = 2 WHERE ...`.
+    /// Every SET column must exist (42703 otherwise).
+    pub fn update_many_filtered(
+        &mut self,
+        engine: &mut Engine,
+        txn: Option<u64>,
+        name: &str,
+        sets: &[(&str, &str)],
+        filter: Option<&RowFilter>,
+    ) -> Result<usize, String> {
+        self.update_inner(engine, txn, name, sets, filter)
     }
 
     fn update_inner(
@@ -371,9 +554,8 @@ impl TableStore {
         engine: &mut Engine,
         txn: Option<u64>,
         name: &str,
-        set_col: &str,
-        set_val: &str,
-        filter: Option<(&str, &str)>,
+        sets: &[(&str, &str)],
+        filter: Option<&RowFilter>,
     ) -> Result<usize, String> {
         let columns = self
             .registry
@@ -382,20 +564,38 @@ impl TableStore {
             .ok_or_else(|| format!("no such table '{name}'"))?
             .columns
             .clone();
-        if !columns.iter().any(|c| c == set_col) {
-            return Err(format!(
-                "column '{set_col}' does not exist in table '{name}'"
-            ));
+        for (set_col, _) in sets {
+            if !columns.iter().any(|c| c == set_col) {
+                return Err(format!(
+                    "column '{set_col}' does not exist in table '{name}'"
+                ));
+            }
+        }
+        // M4 (V0.7 review): the same column twice in one SET
+        // list used to be silently last-wins (`SET a = 1, a = 2`
+        // stored 2). PostgreSQL rejects it — so does Zeno now
+        // (42601 at the SQL layer), before any row is touched.
+        {
+            let mut seen = std::collections::BTreeSet::new();
+            for (set_col, _) in sets {
+                if !seen.insert(set_col) {
+                    return Err(format!(
+                        "column '{set_col}' is set twice in UPDATE of table '{name}'"
+                    ));
+                }
+            }
         }
         let rows = match txn {
-            Some(txn) => self.select_txn(engine, txn, name, filter)?,
-            None => self.select(engine, name, filter)?,
+            Some(txn) => self.select_txn_filtered(engine, txn, name, filter)?,
+            None => self.select_filtered(engine, name, filter)?,
         };
         match txn {
             Some(txn) => {
                 let mut updated = 0;
                 for (row_id, mut row) in rows {
-                    row.insert(set_col.to_string(), set_val.to_string());
+                    for (set_col, set_val) in sets {
+                        row.insert(set_col.to_string(), set_val.to_string());
+                    }
                     let value = row_to_json(row);
                     engine.txn_put(txn, &row_key(name, row_id), &value)?;
                     updated += 1;
@@ -407,7 +607,9 @@ impl TableStore {
                 let writes: Vec<(String, Option<String>)> = rows
                     .into_iter()
                     .map(|(row_id, mut row)| {
-                        row.insert(set_col.to_string(), set_val.to_string());
+                        for (set_col, set_val) in sets {
+                            row.insert(set_col.to_string(), set_val.to_string());
+                        }
                         (row_key(name, row_id), Some(row_to_json(row)))
                     })
                     .collect();
@@ -429,7 +631,8 @@ impl TableStore {
         name: &str,
         filter: Option<(&str, &str)>,
     ) -> Result<Vec<TableRow>, String> {
-        self.select_inner(engine, None, name, filter)
+        let filter = filter.map(|(c, v)| RowFilter::one(c, v));
+        self.select_filtered(engine, name, filter.as_ref())
     }
 
     /// Scan all rows of a table as transaction `txn` sees them
@@ -441,6 +644,29 @@ impl TableStore {
         name: &str,
         filter: Option<(&str, &str)>,
     ) -> Result<Vec<TableRow>, String> {
+        let filter = filter.map(|(c, v)| RowFilter::one(c, v));
+        self.select_txn_filtered(engine, txn, name, filter.as_ref())
+    }
+
+    /// Scan all rows matching a multi-condition filter (V0.7).
+    pub fn select_filtered(
+        &mut self,
+        engine: &mut Engine,
+        name: &str,
+        filter: Option<&RowFilter>,
+    ) -> Result<Vec<TableRow>, String> {
+        self.select_inner(engine, None, name, filter)
+    }
+
+    /// Scan as transaction `txn` sees them, with a multi-condition
+    /// filter (V0.7).
+    pub fn select_txn_filtered(
+        &mut self,
+        engine: &mut Engine,
+        txn: u64,
+        name: &str,
+        filter: Option<&RowFilter>,
+    ) -> Result<Vec<TableRow>, String> {
         self.select_inner(engine, Some(txn), name, filter)
     }
 
@@ -449,7 +675,7 @@ impl TableStore {
         engine: &mut Engine,
         txn: Option<u64>,
         name: &str,
-        filter: Option<(&str, &str)>,
+        filter: Option<&RowFilter>,
     ) -> Result<Vec<TableRow>, String> {
         if !self.registry.tables.contains_key(name) {
             return Err(format!("no such table '{name}'"));
@@ -489,8 +715,8 @@ impl TableStore {
                     row.insert(k, s);
                 }
             }
-            if let Some((col, want)) = filter {
-                if row.get(col).map(String::as_str) != Some(want) {
+            if let Some(filter) = filter {
+                if !filter.matches(&row) {
                     continue;
                 }
             }
@@ -510,6 +736,83 @@ mod tests {
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn compare_values_is_exact_for_integers_above_2_pow_53() {
+        // B1: 2^53 and 2^53+1 parse to the SAME f64 — an f64
+        // comparison would call them equal. Integer strings
+        // must compare exactly.
+        use std::cmp::Ordering::*;
+        assert_eq!(compare_values("9007199254740992", "9007199254740993"), Less);
+        assert_eq!(
+            compare_values("9007199254740993", "9007199254740992"),
+            Greater
+        );
+        assert_eq!(
+            compare_values("9007199254740993", "9007199254740993"),
+            Equal
+        );
+        // Beyond u64/i64 entirely (arbitrary precision).
+        assert_eq!(
+            compare_values(
+                "340282366920938463463374607431768211456",
+                "340282366920938463463374607431768211455"
+            ),
+            Greater
+        );
+        assert_eq!(compare_values("-5", "3"), Less);
+        assert_eq!(compare_values("-0", "0"), Equal);
+        assert_eq!(compare_values("007", "7"), Equal);
+        assert_eq!(compare_values("10", "9"), Greater);
+        // Decimals still compare numerically, and a decimal
+        // against an integer too.
+        assert_eq!(compare_values("1.5", "1.25"), Greater);
+        assert_eq!(compare_values("1.0", "1"), Equal);
+        assert_eq!(compare_values("1e3", "999"), Greater);
+        // Non-numbers stay lexicographic.
+        assert_eq!(compare_values("Delhi", "Mumbai"), Less);
+        assert_eq!(compare_values("10", "Delhi"), Less);
+    }
+
+    #[test]
+    fn create_table_rejects_duplicate_column_names() {
+        // M2: CREATE TABLE t (id, id) must fail, not accept a
+        // table whose INSERT silently eats one value.
+        let dir = tmp_dir("dup-col");
+        let mut tables = TableStore::open(&dir).unwrap();
+        let err = tables
+            .create_table("t", vec!["id".into(), "id".into()])
+            .unwrap_err();
+        assert!(err.contains("duplicate column"), "{err}");
+        assert!(!tables.table_exists("t"), "rejected table must not exist");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_rejects_duplicate_set_column() {
+        // M4: UPDATE t SET a = 1, a = 2 must fail, not store
+        // the last value silently.
+        let dir = tmp_dir("dup-set");
+        let mut engine = Engine::open(&dir).unwrap();
+        let mut tables = TableStore::open(&dir).unwrap();
+        tables
+            .create_table("t", vec!["a".into(), "b".into()])
+            .unwrap();
+        tables
+            .insert(&mut engine, "t", vec!["1".into(), "x".into()])
+            .unwrap();
+        let err = tables
+            .update_many_filtered(&mut engine, None, "t", &[("a", "1"), ("a", "2")], None)
+            .unwrap_err();
+        assert!(err.contains("set twice"), "{err}");
+        let rows = tables.select(&mut engine, "t", None).unwrap();
+        assert_eq!(
+            rows[0].1.get("a").unwrap(),
+            "1",
+            "failed UPDATE must change nothing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

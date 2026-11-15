@@ -22,7 +22,7 @@
 //   is not really held.
 // - If the file already exists, the PID inside is read and checked
 //   against Linux `/proc/<pid>`: if that process is alive, open fails
-//   with "data directory already in use / locked by another process".
+//   with "LOCK is locked by another process (pid ...)".
 // - If the PID is dead, the lock is stale: it is removed and
 //   acquisition is retried. Two processes racing to take over a stale
 //   lock cannot both win, because only one `create_new` succeeds.
@@ -138,8 +138,17 @@ impl DirLock {
     /// Acquire the lock for `dir`, creating the directory if needed.
     /// Fails if another live process holds it.
     pub fn acquire(dir: &Path) -> std::io::Result<Self> {
+        Self::acquire_named(dir, LOCK_FILE_NAME)
+    }
+
+    /// Acquire a lock file called `file_name` in `dir` — the same
+    /// PID + `create_new` + stale-takeover rules as `acquire`, but
+    /// for a different file. Used for `users.lock` (see `auth.rs`):
+    /// the data-dir LOCK must stay exclusive to the engine, so the
+    /// users file gets its own lock file with the same semantics.
+    pub fn acquire_named(dir: &Path, file_name: &str) -> std::io::Result<Self> {
         fs::create_dir_all(dir)?;
-        let path = dir.join(LOCK_FILE_NAME);
+        let path = dir.join(file_name);
         let pid = std::process::id();
         // A few retries cover the stale-takeover race (remove + recreate).
         for _ in 0..10 {
@@ -162,15 +171,14 @@ impl DirLock {
                         Some(owner) if owner == pid => Ok(Self { path, pid }),
                         Some(owner) => Err(std::io::Error::new(
                             std::io::ErrorKind::AlreadyExists,
-                            format!(
-                                "lost the lock race: LOCK is now held by pid {owner}; \
-                                 data directory already in use"
-                            ),
+                            format!("lost the lock race: {file_name} is now held by pid {owner}"),
                         )),
                         None => Err(std::io::Error::new(
                             std::io::ErrorKind::AlreadyExists,
-                            "lost the lock race: LOCK file was removed or replaced \
-                             before our PID was visible; data directory already in use",
+                            format!(
+                                "lost the lock race: {file_name} was removed or replaced \
+                             before our PID was visible"
+                            ),
                         )),
                     };
                 }
@@ -181,17 +189,13 @@ impl DirLock {
                             // holds it (e.g. a second open in-process).
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::AlreadyExists,
-                                "data directory already in use / locked by this process",
+                                format!("{file_name} is already locked by this process"),
                             ));
                         }
                         Some(owner) if pid_alive(owner) => {
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::AlreadyExists,
-                                format!(
-                                    "data directory already in use / locked by another \
-                                     process (pid {owner}); open the same data directory \
-                                     from only one process at a time"
-                                ),
+                                format!("{file_name} is locked by another process (pid {owner})"),
                             ));
                         }
                         Some(_) => {
@@ -212,16 +216,14 @@ impl DirLock {
                                 LockContent::Pid(owner) if owner == pid => {
                                     return Err(std::io::Error::new(
                                         std::io::ErrorKind::AlreadyExists,
-                                        "data directory already in use / locked by this process",
+                                        format!("{file_name} is already locked by this process"),
                                     ));
                                 }
                                 LockContent::Pid(owner) if pid_alive(owner) => {
                                     return Err(std::io::Error::new(
                                         std::io::ErrorKind::AlreadyExists,
                                         format!(
-                                            "data directory already in use / locked by another \
-                                             process (pid {owner}); open the same data directory \
-                                             from only one process at a time"
+                                            "{file_name} is locked by another process (pid {owner})"
                                         ),
                                     ));
                                 }
@@ -245,8 +247,7 @@ impl DirLock {
         }
         Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
-            "data directory already in use / locked by another process \
-             (could not acquire lock after retries)",
+            format!("could not acquire {file_name} after retries"),
         ))
     }
 }
@@ -279,8 +280,8 @@ mod tests {
         let _first = DirLock::acquire(&dir).unwrap();
         let err = DirLock::acquire(&dir).expect_err("second acquire must fail");
         assert!(
-            err.to_string().contains("already in use"),
-            "error must say the directory is in use: {err}"
+            err.to_string().contains("locked by"),
+            "error must say the directory is locked: {err}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

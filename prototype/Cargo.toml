@@ -1,8 +1,8 @@
 [package]
 name = "zeno"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
-description = "Zeno — One Engine, All Data. Hybrid key-value + table + JSON document database in Rust (V0.4 prototype)."
+description = "Zeno — One Engine, All Data. Hybrid key-value + table + JSON document database in Rust (V0.5 prototype)."
 license = "Apache-2.0"
 
 [[bin]]
@@ -23,6 +23,16 @@ getrandom = "0.2"
 subtle = "2"
 # SASLprep (RFC 4013) needs NFKC normalization for passwords.
 unicode-normalization = "0.1"
+# TLS for `zeno serve --tls` (V0.5): rustls (pure-Rust TLS 1.2/1.3,
+# `ring` crypto provider — no OpenSSL, no cmake-needed aws-lc-sys)
+# + rcgen (self-signed certificate generation for the prototype
+# only) + `time` (certificate validity dates; same 0.3 line rcgen
+# uses). PEM parsing uses rustls's own `pki_types` — the old
+# `rustls-pemfile` crate is unmaintained (RUSTSEC-2025-0134) and is
+# deliberately NOT used.
+rustls = { version = "0.23", features = ["ring"] }
+rcgen = "0.14"
+time = "0.3"
 
 [profile.release]
 opt-level = 2

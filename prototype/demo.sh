@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# demo.sh — Zeno V0.4 end-to-end demo.
+# demo.sh — Zeno V0.5 end-to-end demo.
 #
 # Runs a full scenario against one data directory:
 #   1. Key-value put / get / delete
@@ -26,6 +26,14 @@
 #      then sets a password with `zeno user set-password` and logs in
 #      with a full SCRAM-SHA-256 handshake (Python hashlib client),
 #      plus a wrong-password rejection.
+#  11. TLS + SCRAM RATE LIMIT + CONNECTION LIMIT (V0.5) — `zeno cert
+#      generate` makes a self-signed cert (0600), the server runs
+#      with --tls (SSLRequest answered 'S', TLS 1.3 handshake, SCRAM
+#      login + query inside the encrypted stream), then 5 wrong
+#      SCRAM logins lock the 'ratelimit' user and even the right
+#      password is still 28P01 — and a --max-connections 2 server
+#      refuses its 3rd (idle) connection with 53300, then lets a
+#      new one in once a slot frees up.
 #
 # No fake numbers: everything printed below is real output of the binary.
 set -euo pipefail
@@ -468,6 +476,208 @@ print("SCRAM demo done")
 PYEOF
 kill $SERVER || true
 wait $SERVER 2>/dev/null || true
+
+say "11. TLS + SCRAM RATE LIMIT + CONNECTION LIMIT (V0.5)"
+echo "(self-signed certificate, TLS handshake, then 5 wrong SCRAM"
+echo " logins lock the account — and a 2-connection server refuses"
+echo " the 3rd connection with 53300)"
+echo "-- generating a self-signed certificate for the demo data dir:"
+$ZENO --data "$DATA" cert generate
+ls -l "$DATA/server-cert.pem" "$DATA/server-key.pem"
+echo "-- starting the server with --tls (same data dir, same users):"
+$ZENO --data "$DATA" serve --port 5433 --tls &
+SERVER=$!
+sleep 1
+echo "-- setting a password for a second user 'ratelimit' (typed twice on stdin):"
+printf '%s\n%s\n' "rate-password" "rate-password" | $ZENO --data "$DATA" user set-password ratelimit
+python3 - <<'PYEOF'
+import socket, ssl, struct, hashlib, hmac, base64
+
+def recvn(s, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = s.recv(n - len(buf))
+        if not chunk:
+            raise EOFError("connection closed")
+        buf += chunk
+    return buf
+
+def read_msg(s):
+    tag = recvn(s, 1)
+    (ln,) = struct.unpack("!I", recvn(s, 4))
+    return tag, recvn(s, ln - 4)
+
+def read_until_ready(s, label):
+    print(f"-- {label}:")
+    while True:
+        tag, body = read_msg(s)
+        if tag == b'R' and struct.unpack("!I", body[:4])[0] == 0:
+            print("   AuthenticationOk")
+        elif tag == b'S':
+            print("   ParameterStatus")
+        elif tag == b'K':
+            print("   BackendKeyData")
+        elif tag == b'T':
+            print("   RowDescription")
+        elif tag == b'D':
+            print("   DataRow")
+        elif tag == b'C':
+            print(f"   CommandComplete {body.split(bytes([0]))[0].decode()}")
+        elif tag == b'E':
+            print("   ErrorResponse")
+        elif tag == b'Z':
+            print(f"   ReadyForQuery '{body.decode()}'")
+            return
+        else:
+            print(f"   (other message {tag!r})")
+
+def tls_connect():
+    raw = socket.create_connection(("127.0.0.1", 5433))
+    raw.sendall(struct.pack("!II", 8, 80877103))  # SSLRequest
+    ans = raw.recv(1)
+    assert ans == b"S", f"expected 'S' to SSLRequest, got {ans!r}"
+    print("-- SSLRequest answered 'S' (TLS, not 'N')")
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE  # self-signed demo cert: no verification
+    tls = ctx.wrap_socket(raw, server_hostname="localhost")
+    print(f"   TLS handshake done: {tls.version()} {tls.cipher()[0]}")
+    return tls
+
+def scram_login(s, user, password, expect_ok):
+    params = f"user\0{user}\0database\0zeno\0\0".encode()
+    body = struct.pack("!I", 196608) + params
+    s.sendall(struct.pack("!I", len(body) + 4) + body)
+    tag, body = read_msg(s)
+    assert tag == b'R' and struct.unpack("!I", body[:4])[0] == 10, f"expected AuthenticationSASL, got {tag}"
+    client_nonce = "demo-nonce-12345"
+    client_first_bare = f"n={user},r={client_nonce}"
+    client_first = f"n,,{client_first_bare}".encode()
+    pbody = b"SCRAM-SHA-256\0" + struct.pack("!I", len(client_first)) + client_first
+    s.sendall(b"p" + struct.pack("!I", len(pbody) + 4) + pbody)
+    tag, body = read_msg(s)
+    assert tag == b'R' and struct.unpack("!I", body[:4])[0] == 11, "expected SASLContinue"
+    server_first = body[4:].decode()
+    parts = dict(kv.split("=", 1) for kv in server_first.split(","))
+    salt = base64.b64decode(parts["s"])
+    salted = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, int(parts["i"]), 32)
+    client_key = hmac.new(salted, b"Client Key", hashlib.sha256).digest()
+    stored_key = hashlib.sha256(client_key).digest()
+    server_key = hmac.new(salted, b"Server Key", hashlib.sha256).digest()
+    client_final_wo = f"c=biws,r={parts['r']}"
+    auth_msg = f"{client_first_bare},{server_first},{client_final_wo}".encode()
+    sig = hmac.new(stored_key, auth_msg, hashlib.sha256).digest()
+    proof = bytes(a ^ b for a, b in zip(client_key, sig))
+    client_final = f"{client_final_wo},p={base64.b64encode(proof).decode()}"
+    s.sendall(b"p" + struct.pack("!I", len(client_final) + 4) + client_final.encode())
+    tag, body = read_msg(s)
+    if expect_ok:
+        assert tag == b'R' and struct.unpack("!I", body[:4])[0] == 12, f"expected SASLFinal, got {tag}"
+        print(f"   SCRAM login as '{user}' over TLS: OK (server signature verified)")
+        read_until_ready(s, f"post-login handshake for '{user}'")
+    else:
+        assert tag == b'E', f"expected ErrorResponse, got {tag}"
+        code = ""
+        p = 0
+        while p < len(body) and body[p] != 0:
+            f = chr(body[p]); p += 1
+            end = body.index(b"\0", p)
+            if f == 'C': code = body[p:end].decode()
+            p = end + 1
+        print(f"   SCRAM login as '{user}': ErrorResponse {code} (rejected, as expected)")
+        try:
+            read_msg(s)
+            print("   (unexpected: server sent more after the error)")
+        except EOFError:
+            print("   connection closed by the server, as expected")
+    return s
+
+print("-- TLS + SCRAM login as 'sanjay' (correct password, over TLS):")
+s = tls_connect()
+s = scram_login(s, "sanjay", "demo-password", expect_ok=True)
+body = b"SELECT * FROM demo_users\0"
+s.sendall(b"Q" + struct.pack("!I", len(body) + 4) + body)
+read_until_ready(s, "QUERY over TLS: SELECT * FROM demo_users")
+s.sendall(b"X" + struct.pack("!I", 4))
+s.close()
+
+print("-- RATE LIMIT: 5 wrong passwords for 'ratelimit', then the RIGHT one:")
+for attempt in range(1, 6):
+    s = tls_connect()
+    print(f"   wrong-password attempt {attempt}/5:")
+    scram_login(s, "ratelimit", "wrong-password", expect_ok=False)
+    s.close()
+print("-- 6th attempt with the CORRECT password (account is now locked for 5 minutes):")
+s = tls_connect()
+scram_login(s, "ratelimit", "rate-password", expect_ok=False)
+s.close()
+print("   (the locked-out login looks exactly like a wrong password: same 28P01,")
+print("    same closed connection — it leaks nothing about the lockout or the user)")
+print("TLS + rate-limit demo done")
+PYEOF
+kill $SERVER || true
+wait $SERVER 2>/dev/null || true
+
+echo "-- connection limit (fresh data dir, --max-connections 2):"
+rm -rf ./demo-data-limit
+$ZENO --data ./demo-data-limit serve --port 5434 --max-connections 2 &
+SERVER3=$!
+sleep 1
+python3 - <<'PYEOF'
+import socket, struct, time
+
+def recvn(s, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = s.recv(n - len(buf))
+        if not chunk:
+            raise EOFError("connection closed")
+        buf += chunk
+    return buf
+
+def read_msg(s):
+    tag = recvn(s, 1)
+    (ln,) = struct.unpack("!I", recvn(s, 4))
+    return tag, recvn(s, ln - 4)
+
+def idle_conn(label):
+    s = socket.create_connection(("127.0.0.1", 5434))
+    params = b"user\0zeno\0database\0zeno\0\0"
+    body = struct.pack("!I", 196608) + params
+    s.sendall(struct.pack("!I", len(body) + 4) + body)
+    while True:
+        tag, body = read_msg(s)
+        if tag == b'Z':
+            break
+    print(f"   {label}: handshake done, connection held idle (no query)")
+    return s
+
+a = idle_conn("idle connection 1")
+b = idle_conn("idle connection 2")
+c = socket.create_connection(("127.0.0.1", 5434))
+tag, body = read_msg(c)
+assert tag == b'E', f"expected ErrorResponse, got {tag!r}"
+code = ""
+p = 0
+while p < len(body) and body[p] != 0:
+    f = chr(body[p]); p += 1
+    end = body.index(b"\0", p)
+    if f == 'C': code = body[p:end].decode()
+    p = end + 1
+print(f"   3rd connection: ErrorResponse {code} (too many connections), as expected")
+c.close()
+b.close()
+time.sleep(0.5)  # let the server reap the freed slot
+d = idle_conn("new connection after one slot freed")
+print("   (the server itself kept running throughout — only the extra connection was refused)")
+for s in (a, d):
+    s.sendall(b"X" + struct.pack("!I", 4))
+    s.close()
+print("connection-limit demo done")
+PYEOF
+kill $SERVER3 || true
+wait $SERVER3 2>/dev/null || true
+rm -rf ./demo-data-limit
 
 echo
 echo "PostgreSQL demo done. Try it yourself with psql (on a machine that has it):"

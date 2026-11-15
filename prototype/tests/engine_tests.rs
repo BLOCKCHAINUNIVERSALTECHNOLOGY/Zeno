@@ -331,8 +331,8 @@ fn lock_second_open_fails_while_first_open() {
         Err(e) => e,
     };
     assert!(
-        err.to_string().contains("already in use"),
-        "error must say the directory is in use: {err}"
+        err.to_string().contains("locked by"),
+        "error must say the directory is locked: {err}"
     );
     // The first engine is unaffected and the data is intact.
     assert_eq!(e1.get("k"), Some("v".to_string()));
@@ -856,5 +856,63 @@ fn corrupt_wal_del_line_resurrects_old_value() {
     // The reopened engine is still usable: a fresh delete works.
     e2.delete("res-key").unwrap();
     assert_eq!(e2.get("res-key"), None);
+    cleanup(&dir);
+}
+
+// ---------------------------------------------------------------------
+// V0.5 test: concurrent `user set-password` must not lose users.
+// ---------------------------------------------------------------------
+
+#[test]
+fn concurrent_set_password_keeps_all_users() {
+    // Eight `zeno user set-password` processes at once, different
+    // users, same data directory. Without the users.lock each one
+    // loads the same users.json, adds its own user, and the last
+    // save silently drops the others — the test fails. With the
+    // lock they serialize and all eight survive.
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let dir = tmp_dir("setpw-race");
+    let bin = env!("CARGO_BIN_EXE_zeno");
+    let names: Vec<String> = (0..8).map(|i| format!("user{i}")).collect();
+    let mut children = Vec::new();
+    for name in &names {
+        let mut child = Command::new(bin)
+            .args([
+                "--data",
+                dir.to_str().unwrap(),
+                "user",
+                "set-password",
+                name,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn zeno user set-password");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"password123\npassword123\n")
+            .unwrap();
+        children.push(child);
+    }
+    for child in children {
+        let output = child.wait_with_output().expect("wait zeno user");
+        assert!(
+            output.status.success(),
+            "set-password failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let users = zeno::auth::list_users(&dir).unwrap();
+    for name in &names {
+        assert!(
+            users.contains(name),
+            "user {name} was lost in the race: {users:?}"
+        );
+    }
+    assert_eq!(users.len(), 8, "all eight users must survive: {users:?}");
     cleanup(&dir);
 }

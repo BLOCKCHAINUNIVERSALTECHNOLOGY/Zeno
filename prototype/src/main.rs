@@ -30,11 +30,11 @@ use zeno::doc;
 use zeno::engine::Engine;
 use zeno::table::TableStore;
 
-const VERSION: &str = "0.4.0";
+const VERSION: &str = "0.5.0";
 
 fn usage() -> String {
     format!(
-        "Zeno {VERSION} — One Engine, All Data (V0.4 prototype)\n\
+        "Zeno {VERSION} — One Engine, All Data (V0.5 prototype)\n\
         \n\
         Usage: zeno [--data <dir>] <command> [args]   (default data dir: ./zeno-data)\n\
         \n\
@@ -49,7 +49,7 @@ fn usage() -> String {
         \x20 table select <name> [column=value]\n\
         \x20 table list\n\
         \n\
-        JSON document (find is a linear scan in V0.4):\n\
+        JSON document (find is a linear scan in V0.5):\n\
         \x20 doc put <collection> <id> <json>\n\
         \x20 doc get <collection> <id>\n\
         \x20 doc find <collection> <field>=<value>\n\
@@ -61,13 +61,23 @@ fn usage() -> String {
         \x20 hold <seconds>           open the engine and hold its lock for N seconds\n\
         \x20                          (diagnostic for the lock demo / tests only)\n\
         \n\
-        PostgreSQL wire protocol (V0.4, Simple + extended query, trust or SCRAM auth):\n\
-        \x20 serve [--port <port>]    listen on 127.0.0.1:<port> (default 5432) and\n\
+        PostgreSQL wire protocol (V0.5, Simple + extended query, trust or SCRAM auth):\n\
+        \x20 serve [--port <port>] [--tls] [--max-connections <n>]\n\
+        \x20                          listen on 127.0.0.1:<port> (default 5432) and\n\
         \x20                          answer psql / libpq clients (prepared statements\n\
         \x20                          work now). LOCAL PROTOTYPE ONLY: with no users\n\
         \x20                          configured any local client may connect, no\n\
         \x20                          password. Example: zeno --data ./my-data serve\n\
         \x20                          --port 5433\n\
+        \x20                          --tls needs a certificate first: run\n\
+        \x20                          `zeno cert generate` (self-signed, prototype\n\
+        \x20                          only). --max-connections defaults to 20; past\n\
+        \x20                          it a new connection gets ErrorResponse 53300.\n\
+        \n\
+        TLS certificate (self-signed — prototype only, see README):\n\
+        \x20 cert generate            create server-cert.pem + server-key.pem\n\
+        \x20                          (mode 0600) in the data dir for `serve --tls`.\n\
+        \x20                          Refuses to overwrite an existing cert.\n\
         \n\
         Users (SCRAM-SHA-256 password auth for `serve`):\n\
         \x20 user set-password <name> set a password (asked twice on stdin;\n\
@@ -75,7 +85,8 @@ fn usage() -> String {
         \x20                          use a private terminal). The password is never\n\
         \x20                          stored; only its SCRAM verifier is kept. A\n\
         \x20                          server re-reads users on every new connection,\n\
-        \x20                          so no restart is needed.\n\
+        \x20                          so no restart is needed. 5 wrong logins lock\n\
+        \x20                          a user@IP for 5 minutes (in-memory only).\n\
         \x20 user list                list users (empty = trust auth)\n\
         \x20 user remove <name>       remove a user (removing the last user\n\
         \x20                          switches new connections back to trust auth)"
@@ -86,6 +97,8 @@ fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut data_dir = PathBuf::from("zeno-data");
     let mut port: u16 = 5432;
+    let mut tls = false;
+    let mut max_connections: usize = zeno::pgwire::DEFAULT_MAX_CONNECTIONS;
     let mut args: Vec<String> = Vec::new();
     let mut i = 0;
     while i < argv.len() {
@@ -104,6 +117,21 @@ fn main() -> ExitCode {
                 }
             }
             i += 2;
+        } else if argv[i] == "--tls" {
+            tls = true;
+            i += 1;
+        } else if argv[i] == "--max-connections" && i + 1 < argv.len() {
+            match argv[i + 1].parse::<usize>() {
+                Ok(n) if n >= 1 => max_connections = n,
+                _ => {
+                    eprintln!(
+                        "error: --max-connections needs a number >= 1, got '{}'",
+                        argv[i + 1]
+                    );
+                    return ExitCode::FAILURE;
+                }
+            }
+            i += 2;
         } else {
             args.push(argv[i].clone());
             i += 1;
@@ -115,7 +143,7 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    match run(&data_dir, port, &args) {
+    match run(&data_dir, port, tls, max_connections, &args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
             eprintln!("error: {msg}");
@@ -131,15 +159,32 @@ fn need(args: &[String], n: usize, what: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn run(data_dir: &Path, port: u16, args: &[String]) -> Result<(), String> {
+fn run(
+    data_dir: &Path,
+    port: u16,
+    tls: bool,
+    max_connections: usize,
+    args: &[String],
+) -> Result<(), String> {
     let cmd = args[0].as_str();
 
     // `serve` opens the engine itself (once, shared by all client
     // threads) and never returns until killed — it must not go through
     // the one-shot open below.
     if cmd == "serve" {
-        return zeno::pgwire::serve(data_dir, port)
+        let opts = zeno::pgwire::ServeOptions {
+            tls,
+            max_connections,
+        };
+        return zeno::pgwire::serve(data_dir, port, &opts)
             .map_err(|e| format!("cannot serve on port {port}: {e}"));
+    }
+
+    // `cert` manages the TLS certificate files directly and must NOT
+    // open the engine: generating a cert while a server runs is
+    // fine (the server loads its cert once, at startup).
+    if cmd == "cert" {
+        return run_cert(data_dir, &args[1..]);
     }
 
     // `user` manages users.json directly and must NOT open the
@@ -302,6 +347,29 @@ fn run(data_dir: &Path, port: u16, args: &[String]) -> Result<(), String> {
         other => return Err(format!("unknown command '{other}'\n\n{}", usage())),
     }
     Ok(())
+}
+
+fn run_cert(data_dir: &Path, args: &[String]) -> Result<(), String> {
+    let sub = args.first().map(String::as_str).unwrap_or("");
+    match sub {
+        "generate" => {
+            zeno::tls::generate_cert(data_dir)?;
+            println!(
+                "OK  self-signed certificate created in {}",
+                data_dir.display()
+            );
+            println!("    cert: {} (mode 0600)", zeno::tls::CERT_FILE);
+            println!("    key:  {} (mode 0600)", zeno::tls::KEY_FILE);
+            println!("    SANs: localhost, 127.0.0.1 — valid 1 year from now.");
+            println!(
+                "    WARNING: SELF-SIGNED — prototype only. Clients will not trust it unless they are told to (pin the cert / sslmode=require with this cert as trust root). Production needs a real CA certificate. Start the server with `zeno serve --tls`."
+            );
+            Ok(())
+        }
+        other => Err(format!(
+            "unknown cert command '{other}' — see `zeno --help` (only `cert generate` exists)"
+        )),
+    }
 }
 
 /// Read a password line from stdin (the trailing newline is

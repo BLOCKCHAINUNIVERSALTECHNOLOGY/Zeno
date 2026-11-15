@@ -5,11 +5,14 @@
 //
 // What this implements:
 // - Startup handshake: StartupMessage (protocol 3.0), SSLRequest
-//   (answered 'N' — no SSL), CancelRequest (closed, no reply).
+//   (answered 'N' without `--tls`; with `--tls` answered 'S'
+//   followed by a real TLS handshake — see `tls.rs`),
+//   CancelRequest (closed, no reply).
 // - Auth: trust auth when no password is set (every client gets
 //   AuthenticationOk, no password — **local prototype only, see the
 //   BOLD warning in the README**); SCRAM-SHA-256 when users exist
-//   in `users.json` (see `auth.rs`).
+//   in `users.json` (see `auth.rs`), with rate limiting / lockout
+//   after 5 failed logins per user@IP (see `auth::LoginRateLimiter`).
 // - ParameterStatus (server_version, client_encoding,
 //   standard_conforming_strings), BackendKeyData, ReadyForQuery.
 // - Simple Query 'Q': CREATE TABLE / INSERT / SELECT (WHERE
@@ -31,7 +34,7 @@
 //   directory fails with the lock error).
 //
 // What it deliberately does NOT implement (see README, honest limits):
-// - SSL, COPY, LISTEN/NOTIFY, cursors.
+// - COPY, LISTEN/NOTIFY, cursors.
 // - MVCC/transactions: every statement sees the latest value.
 //
 // All values travel as text (type OID 25, `text`), because every
@@ -46,14 +49,16 @@
 // Zeno is NOT PostgreSQL — the README says so plainly.
 
 use crate::auth;
+use crate::auth::LoginRateLimiter;
 use crate::engine::Engine;
 use crate::extended::ExtendedState;
 use crate::table::TableStore;
-use std::io::{BufReader, Read, Write};
+use crate::tls;
+use std::io::{BufReader, Cursor, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 /// How long a connection may sit idle (or half-way through a
@@ -71,6 +76,9 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const PROTOCOL_V3: i32 = 196608; // 3 << 16
 /// First-message code asking for SSL; we always answer 'N'.
 const SSL_REQUEST_CODE: i32 = 80877103;
+/// First-message code asking for GSSAPI encryption (m3): like
+/// PostgreSQL, Zeno answers 'N' — there is no GSSAPI here.
+const GSSENC_REQUEST_CODE: i32 = 80877105;
 /// First-message code asking to cancel another backend; no reply.
 const CANCEL_REQUEST_CODE: i32 = 80877104;
 /// Largest single message we will accept (64 MiB); anything bigger is
@@ -89,6 +97,55 @@ pub(crate) struct Shared {
     /// on every connection (a password set with `zeno user` takes
     /// effect for new connections without restarting the server).
     data_dir: PathBuf,
+    /// The SCRAM login rate limiter, shared by all connections
+    /// (one limiter per server process — a restart resets it).
+    rate_limiter: Arc<LoginRateLimiter>,
+}
+
+/// Lock the shared engine, RECOVERING from poisoning instead of
+/// failing. A `Mutex` poisons when a thread panics while holding
+/// it — without this, one panicking statement would make every
+/// later statement fail with XX000 "server lock poisoned" and the
+/// server would be wedged until restart. `into_inner` recovers
+/// the guard and the data underneath (the engine itself is
+/// untouched by the panic — the panic happened in statement code,
+/// and the WAL + SSTables on disk are still consistent), so the
+/// server keeps serving. The poisoning is logged once, loudly,
+/// because a panic is still a bug worth fixing — recovery is not
+/// a substitute for finding it.
+pub(crate) fn recover_lock<'a, T>(lock: &'a Mutex<T>) -> MutexGuard<'a, T> {
+    lock.lock().unwrap_or_else(|poisoned| {
+        eprintln!(
+            "pgwire: WARNING: shared lock was poisoned by a panicked thread — recovering and continuing"
+        );
+        poisoned.into_inner()
+    })
+}
+
+/// Options for `serve`: TLS on/off and the connection cap.
+#[derive(Debug, Clone, Copy)]
+pub struct ServeOptions {
+    /// Serve over TLS (`--tls`): SSLRequest is answered 'S' and
+    /// the handshake runs before the startup message. Requires a
+    /// certificate in the data directory (`zeno cert generate`).
+    pub tls: bool,
+    /// Maximum simultaneous connections (default 20). Past the
+    /// limit a new connection gets ErrorResponse 53300
+    /// (too_many_connections) and is closed; the server keeps
+    /// running.
+    pub max_connections: usize,
+}
+
+/// Default connection limit for `serve` (also the CLI default).
+pub const DEFAULT_MAX_CONNECTIONS: usize = 20;
+
+impl Default for ServeOptions {
+    fn default() -> Self {
+        Self {
+            tls: false,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+        }
+    }
 }
 
 /// Start the server: open the engine (this takes the data-dir lock —
@@ -96,21 +153,30 @@ pub(crate) struct Shared {
 /// 127.0.0.1:port, and serve clients forever, one thread each.
 /// Binding loopback only is deliberate: trust auth (no password) is
 /// only acceptable on the local machine — see the README warning.
-pub fn serve(data_dir: &Path, port: u16) -> std::io::Result<()> {
+pub fn serve(data_dir: &Path, port: u16, opts: &ServeOptions) -> std::io::Result<()> {
     let engine = Engine::open(data_dir)?;
     let tables = TableStore::open(data_dir)?;
     // Fail closed: a corrupt users.json must never silently
     // become trust auth (that would switch password auth off). A
     // missing users.json simply means "no users yet" -> trust auth.
     let users = auth::load_users(data_dir)?;
+    // With --tls the certificate is loaded ONCE, up front: a
+    // missing cert fails the server start with a clear error
+    // instead of failing every connection mid-handshake.
+    let tls_config = if opts.tls {
+        Some(tls::load_server_config(data_dir)?)
+    } else {
+        None
+    };
     let shared = Arc::new(Mutex::new(Shared {
         engine,
         tables,
         data_dir: data_dir.to_path_buf(),
+        rate_limiter: Arc::new(LoginRateLimiter::new()),
     }));
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     println!(
-        "zeno 0.4.0 listening on 127.0.0.1:{} (data dir: {})",
+        "zeno 0.5.0 listening on 127.0.0.1:{} (data dir: {})",
         port,
         data_dir.display()
     );
@@ -118,10 +184,20 @@ pub fn serve(data_dir: &Path, port: u16) -> std::io::Result<()> {
         println!("trust auth: any local client may connect, no password — local prototype only");
     } else {
         println!(
-            "SCRAM-SHA-256 auth: {} user(s) configured, password required — local prototype only, no SSL",
-            users.len()
+            "SCRAM-SHA-256 auth: {} user(s) configured, password required (5 failures lock a user@IP for 5 minutes) — local prototype only{}",
+            users.len(),
+            if opts.tls { ", TLS on" } else { ", no TLS" }
         );
     }
+    if opts.tls {
+        println!("TLS enabled: SSLRequest is answered 'S' (self-signed cert — prototype only, see README)");
+    }
+    println!("max connections: {}", opts.max_connections);
+    // Live connection count. Incremented on accept (before the
+    // thread starts) and decremented when the thread ends, so a
+    // connection counts from the moment it is accepted — including
+    // while it is still handshaking or sitting idle.
+    let active = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
@@ -136,18 +212,233 @@ pub fn serve(data_dir: &Path, port: u16) -> std::io::Result<()> {
                 if let Err(e) = stream.set_write_timeout(Some(WRITE_TIMEOUT)) {
                     eprintln!("pgwire: could not set write timeout: {e}");
                 }
+                // Connection limit: increment FIRST, then check, so
+                // two accepts racing each other cannot both slip
+                // past the cap. Over the limit the connection is
+                // refused inline (no thread) — see
+                // `refuse_over_limit` (m6): an SSLRequest is
+                // answered 'N' first, then the 53300 ErrorResponse,
+                // so libpq reads a valid negotiation answer.
+                let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                if count > opts.max_connections {
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    refuse_over_limit(stream, opts.max_connections);
+                    continue;
+                }
+                let peer_ip = stream
+                    .peer_addr()
+                    .map(|a| a.ip().to_string())
+                    .unwrap_or_default();
                 let shared = Arc::clone(&shared);
+                let tls_config = tls_config.clone();
                 let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
-                std::thread::spawn(move || {
-                    if let Err(e) = handle_client(stream, shared, conn_id) {
+                // M2: the counted slot is owned by this RAII guard,
+                // which the connection thread takes with it. Its
+                // `Drop` runs when the thread returns AND when the
+                // thread panics (unwind), so a panicking connection
+                // can never leak its slot. If the spawn itself
+                // fails, the closure (and the guard it captured) is
+                // dropped, which frees the slot the same way.
+                let slot = ConnectionSlot::counted(Arc::clone(&active));
+                match std::thread::Builder::new().spawn(move || {
+                    let _slot = slot;
+                    let result = handle_connection(stream, shared, conn_id, tls_config, peer_ip);
+                    if let Err(e) = result {
                         eprintln!("pgwire conn {conn_id}: {e}");
                     }
-                });
+                }) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!("pgwire: could not spawn connection thread: {e}");
+                    }
+                }
             }
             Err(e) => eprintln!("pgwire accept error: {e}"),
         }
     }
     Ok(())
+}
+
+/// One counted connection slot (M2). The accept loop increments
+/// the live-connection counter before spawning the thread; the
+/// guard takes ownership of that counted slot, and its `Drop`
+/// decrements the counter when the connection thread ends — on a
+/// normal return AND when the thread panics (a `Drop` runs during
+/// an unwind, a `fetch_sub` after `handle_connection` returns
+/// does not). Without this, enough panicking connections would
+/// leak every slot and the server would refuse all new
+/// connections with 53300 until restart.
+pub(crate) struct ConnectionSlot {
+    active: Arc<AtomicUsize>,
+}
+
+impl ConnectionSlot {
+    /// Count a new connection immediately (used by the unit test).
+    #[cfg(test)]
+    pub(crate) fn new(active: &Arc<AtomicUsize>) -> Self {
+        active.fetch_add(1, Ordering::SeqCst);
+        Self::counted(Arc::clone(active))
+    }
+
+    /// Take ownership of a slot the accept loop already counted.
+    pub(crate) fn counted(active: Arc<AtomicUsize>) -> Self {
+        Self { active }
+    }
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Refuse an over-limit connection (m6), without spawning a
+/// thread. The first message is peeked at with a short timeout:
+/// an SSLRequest is answered 'N' first, then the 53300
+/// ErrorResponse — libpq (`sslmode=prefer`, the default) reads
+/// one byte expecting 'S'/'N' after its SSLRequest, so sending
+/// the ErrorResponse straight away would look like a broken
+/// negotiation instead of a clean "too many connections". Any
+/// other first message (a plain StartupMessage), a client that
+/// sends nothing, or a read timeout gets the 53300 directly.
+/// The peeked message is DRAINED before closing: with unread
+/// bytes still in the socket buffer, Linux resets the connection
+/// (RST) on close and the 53300 below may never reach the client.
+/// The drain is capped at 64 KiB — a huge claimed length is not
+/// read, the refusal is just sent (an abusive client gets RST,
+/// a normal one gets its 53300).
+fn refuse_over_limit(mut stream: TcpStream, max_connections: usize) {
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+    let mut first = [0u8; 8];
+    if stream.read_exact(&mut first).is_ok() {
+        let code = i32::from_be_bytes([first[4], first[5], first[6], first[7]]);
+        if code == SSL_REQUEST_CODE {
+            let _ = stream.write_all(b"N");
+            let _ = stream.flush();
+            // A StartupMessage pipelined behind the SSLRequest
+            // may already be on the wire — drain it too, so the
+            // close below is a clean FIN, not a RST.
+            let mut next = [0u8; 8];
+            if stream.read_exact(&mut next).is_ok() {
+                drain_first_message(&mut stream, &next);
+            }
+        } else {
+            drain_first_message(&mut stream, &first);
+        }
+    }
+    let _ = error_response(
+        &mut stream,
+        "53300",
+        &format!("too many connections (limit {max_connections}) — try again later"),
+    );
+    let _ = stream.flush();
+    eprintln!("pgwire: refused a connection: too many connections ({max_connections})");
+}
+
+/// Read the remainder of a first message whose 8-byte header
+/// (`length` + `code`) is in `header`, so the socket can be
+/// closed cleanly. Capped: see `refuse_over_limit`.
+fn drain_first_message(stream: &mut TcpStream, header: &[u8; 8]) {
+    let total_len = i32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+    if (8..=65536).contains(&total_len) {
+        let mut rest = vec![0u8; (total_len - 8) as usize];
+        let _ = stream.read_exact(&mut rest);
+    }
+}
+
+/// One accepted connection: read its first 8 bytes (length +
+/// code), decide plain vs TLS, then hand it to `handle_client`.
+///
+/// The 8 bytes are read HERE, not in the handshake, because the
+/// SSLRequest decision has to happen before any protocol bytes
+/// are interpreted: on a TLS connection those 8 bytes are the
+/// SSLRequest itself (consumed, then 'S' + TLS handshake), and on
+/// a plain connection they are the start of the StartupMessage
+/// (fed back to the handshake through a `Chain` so nothing is
+/// lost). A client that connects and sends nothing hits the
+/// read timeout and is closed quietly; a client that closes
+/// immediately is an Ok (not an error).
+fn handle_connection(
+    mut stream: TcpStream,
+    shared: Arc<Mutex<Shared>>,
+    conn_id: u32,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+    peer_ip: String,
+) -> std::io::Result<()> {
+    let mut first = [0u8; 8];
+    match stream.read_exact(&mut first) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut =>
+        {
+            eprintln!("pgwire conn {conn_id}: read timeout waiting for first message, closing");
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    }
+    let code = i32::from_be_bytes([first[4], first[5], first[6], first[7]]);
+    match code {
+        SSL_REQUEST_CODE => match tls_config {
+            Some(ref config) => {
+                stream.write_all(b"S")?;
+                stream.flush()?;
+                let (reader, writer) = tls::handshake_tls(stream, config)?;
+                return handle_client(reader, writer, shared, conn_id, peer_ip, false);
+            }
+            None => {
+                stream.write_all(b"N")?; // no TLS configured for this server
+                stream.flush()?;
+                // B1: the SSLRequest is CONSUMED here — the 8 bytes
+                // must NOT be chained back to the handshake. The
+                // old code chained them, so `startup_handshake`
+                // saw the same SSLRequest again and sent a second
+                // 'N' (clients saw `4e 4e 52 ...`). The next bytes
+                // on the socket are the StartupMessage itself.
+                let reader = BufReader::new(stream.try_clone()?);
+                return handle_client(reader, stream, shared, conn_id, peer_ip, false);
+            }
+        },
+        GSSENC_REQUEST_CODE => {
+            // m3: PostgreSQL answers GSSENC with 'N' (no GSSAPI
+            // here), and the request is consumed, like SSLRequest.
+            // On a --tls server the handshake below still refuses
+            // a plaintext StartupMessage (M1), so this 'N' can
+            // never smuggle a plaintext login past TLS.
+            stream.write_all(b"N")?;
+            stream.flush()?;
+            let reader = BufReader::new(stream.try_clone()?);
+            return handle_client(
+                reader,
+                stream,
+                shared,
+                conn_id,
+                peer_ip,
+                tls_config.is_some(),
+            );
+        }
+        _ => {
+            // M1: --tls means TLS is REQUIRED. A plain
+            // StartupMessage (or anything else that is not an
+            // SSLRequest) is refused with ErrorResponse 08P01
+            // instead of completing the handshake in plaintext.
+            if tls_config.is_some() {
+                let _ = error_response(
+                    &mut stream,
+                    "08P01",
+                    "TLS is required by this server (serve --tls): send an SSLRequest first",
+                );
+                let _ = stream.flush();
+                return Ok(());
+            }
+        }
+    }
+    // Plain connection: the 8 bytes already read are the start of
+    // the StartupMessage (or CancelRequest) — chain them back in
+    // front of the socket so the handshake sees the whole message.
+    let reader = Cursor::new(first.to_vec()).chain(BufReader::new(stream.try_clone()?));
+    handle_client(reader, stream, shared, conn_id, peer_ip, false)
 }
 
 // ---------------------------------------------------------------------
@@ -317,20 +608,32 @@ pub(crate) fn command_complete(writer: &mut impl Write, tag: &str) -> std::io::R
 // One connection: startup handshake, then the query loop.
 // ---------------------------------------------------------------------
 
-fn handle_client(
-    stream: TcpStream,
+fn handle_client<R: Read, W: Write>(
+    mut reader: R,
+    mut writer: W,
     shared: Arc<Mutex<Shared>>,
     conn_id: u32,
+    peer_ip: String,
+    // True only when this connection answered 'N' to GSSENC on a
+    // `--tls` server: the channel is still plaintext, so the
+    // startup below must refuse a plain login (M1).
+    tls_required: bool,
 ) -> std::io::Result<()> {
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut writer = stream;
-    let data_dir = shared
-        .lock()
-        .map(|g| g.data_dir.clone())
-        .unwrap_or_else(|e| e.into_inner().data_dir.clone());
+    let (data_dir, limiter) = {
+        let guard = recover_lock(&shared);
+        (guard.data_dir.clone(), Arc::clone(&guard.rate_limiter))
+    };
     // A read timeout during the handshake is a quiet client, not a
     // server error: close this connection cleanly, keep serving.
-    if let Err(e) = startup_handshake(&mut reader, &mut writer, &data_dir, conn_id) {
+    if let Err(e) = startup_handshake(
+        &mut reader,
+        &mut writer,
+        &data_dir,
+        conn_id,
+        &limiter,
+        &peer_ip,
+        tls_required,
+    ) {
         if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut {
             eprintln!("pgwire conn {conn_id}: read timeout during handshake, closing");
             return Ok(());
@@ -434,14 +737,27 @@ fn handle_client(
 }
 
 /// The startup handshake. Loops over SSLRequest (answer 'N', then
-/// read the real startup message); CancelRequest closes silently;
-/// anything else that is not protocol 3.0 gets an ErrorResponse and
-/// the connection is closed by the caller (returning Err).
+/// read the real startup message) and GSSENCRequest (answer 'N',
+/// same); CancelRequest closes silently; anything else that is
+/// not protocol 3.0 gets an ErrorResponse and the connection is
+/// closed by the caller (returning Err).
+///
+/// Note: with `--tls` the SSLRequest is already consumed by
+/// `handle_connection` before this runs (the TLS handshake runs
+/// first), so the SSLRequest arm below only ever fires on a plain
+/// connection — it is kept so a client that sends SSLRequest
+/// twice, or a future caller that skips `handle_connection`,
+/// still gets the documented 'N' instead of a protocol error.
+/// (B1: `handle_connection` must never feed an already-answered
+/// SSLRequest back in here — that sent a second 'N'.)
 fn startup_handshake(
     reader: &mut impl Read,
     writer: &mut impl Write,
     data_dir: &Path,
     conn_id: u32,
+    limiter: &LoginRateLimiter,
+    peer_ip: &str,
+    tls_required: bool,
 ) -> std::io::Result<()> {
     loop {
         let mut len_buf = [0u8; 4];
@@ -464,9 +780,16 @@ fn startup_handshake(
         let code = i32::from_be_bytes([body[0], body[1], body[2], body[3]]);
         match code {
             SSL_REQUEST_CODE => {
-                writer.write_all(b"N")?; // no SSL in this prototype
+                writer.write_all(b"N")?; // no TLS on this connection
                 writer.flush()?;
                 continue; // the real StartupMessage follows
+            }
+            GSSENC_REQUEST_CODE => {
+                // m3: like PostgreSQL, answer GSSENC with 'N'
+                // (no GSSAPI here) and read the real startup next.
+                writer.write_all(b"N")?;
+                writer.flush()?;
+                continue;
             }
             CANCEL_REQUEST_CODE => {
                 return Err(std::io::Error::new(
@@ -475,6 +798,21 @@ fn startup_handshake(
                 ));
             }
             PROTOCOL_V3 => {
+                // M1: a --tls server that reached here over a
+                // plaintext channel (GSSENC 'N' path) refuses the
+                // plain login with 08P01 — TLS is required.
+                if tls_required {
+                    let _ = error_response(
+                        writer,
+                        "08P01",
+                        "TLS is required by this server (serve --tls): send an SSLRequest first",
+                    );
+                    let _ = writer.flush();
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "plaintext startup on a TLS-required server",
+                    ));
+                }
                 // Parameters are NUL-separated name/value pairs after
                 // the version, ending with an empty string. We accept
                 // any user/database and ignore the rest.
@@ -496,7 +834,9 @@ fn startup_handshake(
                 if users.is_empty() {
                     auth_ok(writer)?;
                 } else {
-                    auth::scram_handshake(reader, writer, &user, &users, data_dir)?;
+                    auth::scram_handshake(
+                        reader, writer, &user, &users, data_dir, limiter, peer_ip,
+                    )?;
                     auth_ok(writer)?;
                 }
                 // server_version "18.0" = the PostgreSQL version whose
@@ -507,16 +847,23 @@ fn startup_handshake(
                 parameter_status(writer, "client_encoding", "UTF8")?;
                 parameter_status(writer, "standard_conforming_strings", "on")?;
                 let pid = std::process::id() as i32;
-                // Secret key: connection id mixed with the pid; only
-                // used to match a CancelRequest, which we do not
-                // implement — it just has to be stable per connection.
-                // m7: this secret is PREDICTABLE (pid ^ conn_id) and
-                // is only harmless because Cancel is unimplemented.
-                // The day CancelRequest is implemented, this MUST
-                // become a random per-connection secret (CSPRNG, e.g.
-                // from /dev/urandom) — a guessable secret would let
-                // anyone cancel anyone else's backend.
-                let secret = pid ^ (conn_id as i32).wrapping_mul(0x9E37_79B9u32 as i32);
+                // Secret key: a fresh random 32-bit value per
+                // connection (CSPRNG). It used to be `pid ^
+                // conn_id * constant` — predictable, which would
+                // let anyone cancel anyone else's backend the day
+                // CancelRequest is implemented. Cancel is still
+                // unimplemented, but the secret is random now, so
+                // that day needs no protocol change. (The pid ^
+                // conn_id value is only the fallback if the OS
+                // RNG is unavailable, which never happens on a
+                // supported platform.)
+                let secret = {
+                    let mut buf = [0u8; 4];
+                    match getrandom::getrandom(&mut buf) {
+                        Ok(()) => i32::from_be_bytes(buf),
+                        Err(_) => pid ^ (conn_id as i32).wrapping_mul(0x9E37_79B9u32 as i32),
+                    }
+                };
                 backend_key_data(writer, pid, secret)?;
                 ready_for_query(writer)?;
                 writer.flush()?;
@@ -789,7 +1136,7 @@ pub(crate) fn classify_statement(tokens: &[Token]) -> Result<StmtKind, SqlError>
         "UPDATE" | "DROP" | "ALTER" | "BEGIN" | "COMMIT" | "ROLLBACK" | "SET" | "SHOW"
         | "GRANT" | "REVOKE" | "TRUNCATE" | "COPY" | "VACUUM" | "EXPLAIN" => Err(sql_err(
             "0A000",
-            format!("{first} is not supported in Zeno 0.4.0 (only CREATE TABLE, INSERT, SELECT, DELETE)"),
+            format!("{first} is not supported in Zeno 0.5.0 (only CREATE TABLE, INSERT, SELECT, DELETE)"),
         )),
         "" => Ok(StmtKind::Empty),
         other => Err(sql_err(
@@ -1050,9 +1397,9 @@ fn exec_create(shared: &Arc<Mutex<Shared>>, tokens: &[Token]) -> Result<StmtOutc
     if columns.is_empty() {
         return Err(sql_err("42601", "a table needs at least one column"));
     }
-    let mut guard = shared
-        .lock()
-        .map_err(|_| sql_err("XX000", "server lock poisoned"))?;
+    // Poison recovery (V0.5): a thread that panicked while holding
+    // this lock must not wedge the server — see `recover_lock`.
+    let mut guard = recover_lock(shared);
     guard.tables.create_table(&name, columns).map_err(|e| {
         if e.contains("already exists") {
             sql_err("42P07", e)
@@ -1101,9 +1448,9 @@ fn exec_insert(shared: &Arc<Mutex<Shared>>, tokens: &[Token]) -> Result<StmtOutc
     if i != tokens.len() {
         return Err(sql_err("42601", "unexpected text after INSERT"));
     }
-    let mut guard = shared
-        .lock()
-        .map_err(|_| sql_err("XX000", "server lock poisoned"))?;
+    // Poison recovery (V0.5): a thread that panicked while holding
+    // this lock must not wedge the server — see `recover_lock`.
+    let mut guard = recover_lock(shared);
     let Shared { engine, tables, .. } = &mut *guard;
     tables.insert(engine, &name, values).map_err(|e| {
         if e.contains("no such table") {
@@ -1175,9 +1522,7 @@ pub(crate) fn parse_select(
         return Err(sql_err("42601", "unexpected text after SELECT"));
     }
 
-    let guard = shared
-        .lock()
-        .map_err(|_| sql_err("XX000", "server lock poisoned"))?;
+    let guard = recover_lock(shared);
     let all_columns = guard
         .tables
         .columns(&name)
@@ -1208,9 +1553,9 @@ pub(crate) fn parse_select(
 /// SELECT * | col1, col2 FROM name [WHERE col = value]
 fn exec_select(shared: &Arc<Mutex<Shared>>, tokens: &[Token]) -> Result<StmtOutcome, SqlError> {
     let plan = parse_select(shared, tokens)?;
-    let mut guard = shared
-        .lock()
-        .map_err(|_| sql_err("XX000", "server lock poisoned"))?;
+    // Poison recovery (V0.5): a thread that panicked while holding
+    // this lock must not wedge the server — see `recover_lock`.
+    let mut guard = recover_lock(shared);
     let Shared { engine, tables, .. } = &mut *guard;
     let rows = tables
         .select(
@@ -1257,9 +1602,9 @@ fn exec_delete(shared: &Arc<Mutex<Shared>>, tokens: &[Token]) -> Result<StmtOutc
     if i != tokens.len() {
         return Err(sql_err("42601", "unexpected text after DELETE"));
     }
-    let mut guard = shared
-        .lock()
-        .map_err(|_| sql_err("XX000", "server lock poisoned"))?;
+    // Poison recovery (V0.5): a thread that panicked while holding
+    // this lock must not wedge the server — see `recover_lock`.
+    let mut guard = recover_lock(shared);
     let Shared { engine, tables, .. } = &mut *guard;
     let deleted = tables
         .delete(
@@ -1422,6 +1767,7 @@ mod tests {
             engine,
             tables,
             data_dir: dir.clone(),
+            rate_limiter: Arc::new(LoginRateLimiter::new()),
         }));
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -1433,7 +1779,21 @@ mod tests {
             stream
                 .set_read_timeout(Some(Duration::from_millis(200)))
                 .unwrap();
-            let _ = tx.send(handle_client(stream, shared_clone, 1));
+            // handle_client now takes (reader, writer): the plain
+            // path is a BufReader over a clone + the stream itself.
+            // (In the real server `handle_connection` feeds the
+            // first 8 bytes back through a Chain first; this test
+            // speaks the startup message directly, so no prefix
+            // is needed here.)
+            let reader = BufReader::new(stream.try_clone().unwrap());
+            let _ = tx.send(handle_client(
+                reader,
+                stream,
+                shared_clone,
+                1,
+                "127.0.0.1".to_string(),
+                false,
+            ));
         });
 
         let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -1509,6 +1869,79 @@ mod tests {
                 ("user".to_string(), "zeno".to_string()),
                 ("database".to_string(), "zeno".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn poisoned_lock_recovers_and_keeps_serving() {
+        // V0.5: a thread that panics while holding a Mutex poisons
+        // it. `recover_lock` must hand the data back instead of
+        // failing every later statement with XX000 — this is the
+        // path every `exec_*` statement uses (via `recover_lock`).
+        let lock = Arc::new(Mutex::new("engine-data".to_string()));
+        let poisoner = Arc::clone(&lock);
+        let handle = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("injected panic while holding the lock");
+        });
+        assert!(handle.join().is_err(), "the thread must panic");
+        assert!(lock.is_poisoned(), "the mutex must be poisoned now");
+        // Recovery: the data underneath is intact, and the lock
+        // works again afterwards (a second recovery + mutation).
+        let guard = recover_lock(&lock);
+        assert_eq!(*guard, "engine-data", "poisoned data must survive");
+        drop(guard);
+        // The poison FLAG itself is sticky in std (only the
+        // unstable `clear_poison` would clear it) — but that does
+        // not matter here: every server path locks through
+        // `recover_lock`, which recovers on every call. Prove a
+        // second recovery works on the still-flagged mutex.
+        assert!(lock.is_poisoned(), "std keeps the poison flag set");
+        let mut guard = recover_lock(&lock);
+        guard.push_str("-still-works");
+        assert_eq!(*guard, "engine-data-still-works");
+    }
+
+    #[test]
+    fn connection_slot_freed_on_normal_return() {
+        // M2: dropping the guard (normal end of a connection)
+        // returns the slot to the pool.
+        let active = Arc::new(AtomicUsize::new(0));
+        {
+            let _slot = ConnectionSlot::new(&active);
+            assert_eq!(active.load(Ordering::SeqCst), 1, "slot must be counted");
+        }
+        assert_eq!(
+            active.load(Ordering::SeqCst),
+            0,
+            "dropping the guard must free the slot"
+        );
+    }
+
+    #[test]
+    fn connection_slot_freed_on_panic() {
+        // M2: the whole point of the RAII guard — a connection
+        // thread that PANICS must still free its slot, or enough
+        // panics would leak every slot and the server would
+        // refuse all new connections with 53300 until restart.
+        // (The old code did `fetch_sub` only after
+        // `handle_connection` returned, which a panic skips.)
+        let active = Arc::new(AtomicUsize::new(0));
+        let active_in_thread = Arc::clone(&active);
+        let panicked = std::panic::catch_unwind(move || {
+            let _slot = ConnectionSlot::new(&active_in_thread);
+            assert_eq!(
+                active_in_thread.load(Ordering::SeqCst),
+                1,
+                "slot must be counted while held"
+            );
+            panic!("injected connection-thread panic");
+        });
+        assert!(panicked.is_err(), "the closure must panic");
+        assert_eq!(
+            active.load(Ordering::SeqCst),
+            0,
+            "a panicking connection must still free its slot"
         );
     }
 }

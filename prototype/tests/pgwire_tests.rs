@@ -22,7 +22,12 @@ use std::io::{BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
+
+// `PemObject` brings `CertificateDer::pem_slice_iter` into scope
+// (used by the TLS test to trust the generated self-signed cert).
+use rustls::pki_types::pem::PemObject;
 
 // ---------------------------------------------------------------------
 // Server process management
@@ -56,7 +61,21 @@ struct Server {
 
 impl Server {
     fn start(name: &str) -> Server {
+        Self::start_with_args(name, &[])
+    }
+
+    /// Start with extra `serve` arguments (e.g. `["--tls"]` or
+    /// `["--max-connections", "2"]`).
+    fn start_with_args(name: &str, extra: &[&str]) -> Server {
         let dir = tmp_dir(name);
+        Self::start_with_args_on_dir(dir, extra)
+    }
+
+    /// Like `start_with_args`, but on an already-prepared directory
+    /// (the TLS test generates its certificate there first — the
+    /// `tmp_dir` helper wipes the directory, so the cert must be
+    /// made AFTER the wipe and BEFORE the server starts).
+    fn start_with_args_on_dir(dir: PathBuf, extra: &[&str]) -> Server {
         let bin = env!("CARGO_BIN_EXE_zeno");
         // `free_port` binds :0 and releases it, so two tests starting
         // at the same moment can be handed the SAME port — and the
@@ -65,14 +84,16 @@ impl Server {
         // to the other test's server by mistake.
         for _attempt in 0..5 {
             let port = free_port();
+            let mut argv: Vec<String> = vec![
+                "--data".to_string(),
+                dir.to_str().unwrap().to_string(),
+                "serve".to_string(),
+                "--port".to_string(),
+                port.to_string(),
+            ];
+            argv.extend(extra.iter().map(|s| s.to_string()));
             let mut child = Command::new(bin)
-                .args([
-                    "--data",
-                    dir.to_str().unwrap(),
-                    "serve",
-                    "--port",
-                    &port.to_string(),
-                ])
+                .args(&argv)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
@@ -614,25 +635,151 @@ fn startup_handshake_auth_ok_and_ready() {
 
 #[test]
 fn ssl_request_is_answered_n_then_handshake_works() {
-    // libpq sends SSLRequest first unless sslmode=disable; the server
-    // must answer 'N' (no SSL) and then accept a normal startup.
+    // B1 REGRESSION: the server used to answer SSLRequest with
+    // 'N' TWICE — once in `handle_connection`, once again in the
+    // handshake, which was fed the same 8 bytes back — so a
+    // client saw `4e 4e 52 ...` (two 'N's, then AuthOk) and
+    // libpq (sslmode=prefer, the default) could never connect to
+    // a plain server. The old test only read the FIRST 'N' and
+    // dropped the connection, so it never caught this. This test
+    // completes the handshake on the SAME connection and asserts
+    // exactly one 'N' followed by AuthenticationOk + ReadyForQuery.
     let server = Server::start("ssl");
-    let stream = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    let mut stream = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
-    let mut stream = stream;
-    stream.write_all(&8i32.to_be_bytes()).unwrap();
-    stream.write_all(&80877103i32.to_be_bytes()).unwrap();
+    stream.write_all(&ssl_request_bytes()).unwrap();
     stream.flush().unwrap();
     let mut answer = [0u8; 1];
     stream.read_exact(&mut answer).unwrap();
     assert_eq!(answer, [b'N'], "SSLRequest must be answered 'N' (no SSL)");
-    drop(stream);
-    // A fresh connection must still complete the normal handshake.
-    let (client, msgs) = Client::connect(server.port);
-    assert!(msgs.iter().any(|m| matches!(m, Msg::AuthOk)));
+    // The SAME connection now sends its StartupMessage — the next
+    // byte must start AuthenticationOk ('R'), not a second 'N'.
+    stream.write_all(&startup_frame("zeno")).unwrap();
+    stream.flush().unwrap();
+    let mut client = Client {
+        stream: stream.try_clone().unwrap(),
+        reader: BufReader::new(stream),
+    };
+    let msgs = client.read_until_ready();
+    assert!(
+        msgs.iter().any(|m| matches!(m, Msg::AuthOk)),
+        "handshake on the same connection must include AuthenticationOk: {msgs:?}"
+    );
+    assert!(
+        matches!(msgs.last(), Some(Msg::ReadyForQuery(b'I'))),
+        "handshake must end with ReadyForQuery 'I' (idle): {msgs:?}"
+    );
     client.terminate();
+}
+
+/// The 8-byte SSLRequest frame (length 8, code 80877103).
+fn ssl_request_bytes() -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&8i32.to_be_bytes());
+    b.extend_from_slice(&80877103i32.to_be_bytes());
+    b
+}
+
+#[test]
+fn ssl_request_and_startup_pipelined_sends_exactly_one_n() {
+    // B1, pipelined flavour: a client may send SSLRequest and the
+    // StartupMessage in a single flush. The server must still
+    // answer exactly one 'N', then run the handshake.
+    let server = Server::start("ssl-pipelined");
+    let mut stream = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut bytes = ssl_request_bytes();
+    bytes.extend_from_slice(&startup_frame("zeno"));
+    stream.write_all(&bytes).unwrap();
+    stream.flush().unwrap();
+    let mut answer = [0u8; 1];
+    stream.read_exact(&mut answer).unwrap();
+    assert_eq!(
+        answer,
+        [b'N'],
+        "pipelined SSLRequest must be answered with exactly one 'N'"
+    );
+    let mut client = Client {
+        stream: stream.try_clone().unwrap(),
+        reader: BufReader::new(stream),
+    };
+    let msgs = client.read_until_ready();
+    assert!(
+        msgs.iter().any(|m| matches!(m, Msg::AuthOk)),
+        "pipelined handshake must include AuthenticationOk: {msgs:?}"
+    );
+    assert!(
+        matches!(msgs.last(), Some(Msg::ReadyForQuery(b'I'))),
+        "pipelined handshake must end with ReadyForQuery: {msgs:?}"
+    );
+    client.terminate();
+}
+
+#[test]
+fn gssenc_request_is_answered_n_then_handshake_works() {
+    // m3: PostgreSQL answers GSSENCRequest (code 80877105) with
+    // 'N', just like SSLRequest — Zeno has no GSSAPI. The request
+    // is consumed, and the same connection then handshakes.
+    let server = Server::start("gssenc");
+    let mut stream = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut req = Vec::new();
+    req.extend_from_slice(&8i32.to_be_bytes());
+    req.extend_from_slice(&80877105i32.to_be_bytes());
+    stream.write_all(&req).unwrap();
+    stream.flush().unwrap();
+    let mut answer = [0u8; 1];
+    stream.read_exact(&mut answer).unwrap();
+    assert_eq!(
+        answer,
+        [b'N'],
+        "GSSENCRequest must be answered 'N' (no GSSAPI)"
+    );
+    stream.write_all(&startup_frame("zeno")).unwrap();
+    stream.flush().unwrap();
+    let mut client = Client {
+        stream: stream.try_clone().unwrap(),
+        reader: BufReader::new(stream),
+    };
+    let msgs = client.read_until_ready();
+    assert!(
+        msgs.iter().any(|m| matches!(m, Msg::AuthOk)),
+        "handshake after GSSENC must include AuthenticationOk: {msgs:?}"
+    );
+    assert!(
+        matches!(msgs.last(), Some(Msg::ReadyForQuery(b'I'))),
+        "handshake after GSSENC must end with ReadyForQuery: {msgs:?}"
+    );
+    client.terminate();
+}
+
+#[test]
+fn backend_key_data_secret_is_random_per_connection() {
+    // Pre-existing fix (bonus): the BackendKeyData secret used to
+    // be `pid ^ conn_id * constant` — predictable, which would let
+    // anyone cancel anyone else's backend the day CancelRequest is
+    // implemented. Two connections must now get different secrets.
+    let server = Server::start("keydata");
+    let (_, msgs1) = Client::connect(server.port);
+    let (_, msgs2) = Client::connect(server.port);
+    let secret = |msgs: &[Msg]| {
+        msgs.iter().find_map(|m| match m {
+            Msg::BackendKeyData(_, s) => Some(*s),
+            _ => None,
+        })
+    };
+    let s1 = secret(&msgs1).expect("first handshake must include BackendKeyData");
+    let s2 = secret(&msgs2).expect("second handshake must include BackendKeyData");
+    assert_ne!(
+        s1, s2,
+        "two connections must get different BackendKeyData secrets"
+    );
 }
 
 #[test]
@@ -2306,4 +2453,528 @@ fn set_password_on_missing_data_dir_succeeds() {
         "users.json must exist after set-password"
     );
     let _ = std::fs::remove_dir_all(std::env::temp_dir().join("zeno-pgwire-test-missing-dir"));
+}
+
+// ---------------------------------------------------------------------
+// V0.5 tests: TLS, SCRAM rate limiting / lockout, connection limit.
+// ---------------------------------------------------------------------
+
+/// Run `zeno cert generate` in `dir` (asserts success).
+fn generate_cert(dir: &std::path::Path) {
+    let bin = env!("CARGO_BIN_EXE_zeno");
+    let output = Command::new(bin)
+        .args(["--data", dir.to_str().unwrap(), "cert", "generate"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run zeno cert generate");
+    assert!(
+        output.status.success(),
+        "cert generate failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Read one backend message from any `Read` (used for the TLS
+/// stream, where the test-file `Client`'s TcpStream framing does
+/// not apply).
+fn read_msg_from(stream: &mut impl Read) -> Msg {
+    let mut tag = [0u8; 1];
+    stream.read_exact(&mut tag).expect("read message tag");
+    let mut len_buf = [0u8; 4];
+    stream
+        .read_exact(&mut len_buf)
+        .expect("read message length");
+    let len = i32::from_be_bytes(len_buf);
+    assert!(len >= 4, "message length {len} is too small");
+    let mut body = vec![0u8; (len - 4) as usize];
+    stream.read_exact(&mut body).expect("read message body");
+    parse_message(tag[0], &body)
+}
+
+/// Read backend messages until ReadyForQuery (inclusive).
+fn read_until_ready_from(stream: &mut impl Read) -> Vec<Msg> {
+    let mut msgs = Vec::new();
+    loop {
+        let msg = read_msg_from(stream);
+        let ready = matches!(msg, Msg::ReadyForQuery(_));
+        msgs.push(msg);
+        if ready {
+            return msgs;
+        }
+    }
+}
+
+/// Drive a SCRAM login and return the message that follows the
+/// client-final: AuthSaslFinal on success, ErrorResponse (28P01)
+/// on failure. Unlike `scram_login` this does NOT panic on
+/// failure, so the rate-limit tests can assert on it.
+fn scram_login_outcome(client: &mut Client, user: &str, password: &str) -> Msg {
+    client.stream.write_all(&startup_frame(user)).unwrap();
+    client.stream.flush().unwrap();
+    let first = client.read_one();
+    assert!(
+        matches!(first, Msg::AuthSasl(_)),
+        "expected a SASL offer, got: {first:?}"
+    );
+    let client_nonce = "test-client-nonce-123";
+    let client_first_bare = format!("n={user},r={client_nonce}");
+    client
+        .stream
+        .write_all(&sasl_initial_response(
+            "SCRAM-SHA-256",
+            format!("n,,{client_first_bare}").as_bytes(),
+        ))
+        .unwrap();
+    client.stream.flush().unwrap();
+    let second = client.read_one();
+    let Msg::AuthSaslContinue(server_first) = second else {
+        panic!("expected AuthenticationSASLContinue, got: {second:?}");
+    };
+    let (client_final, _) =
+        zeno::auth::scram_client_response(password, &client_first_bare, &server_first).unwrap();
+    client
+        .stream
+        .write_all(&sasl_response(client_final.as_bytes()))
+        .unwrap();
+    client.stream.flush().unwrap();
+    client.read_one()
+}
+
+#[test]
+fn tls_handshake_then_query_works() {
+    // A real TLS client (rustls, trusting exactly the generated
+    // self-signed cert) speaks the whole protocol inside the
+    // encrypted stream: SSLRequest -> 'S' -> TLS handshake ->
+    // startup -> CREATE / INSERT / SELECT.
+    let dir = tmp_dir("tls-ok");
+    generate_cert(&dir);
+    let server = Server::start_with_args_on_dir(dir.clone(), &["--tls"]);
+
+    let mut sock = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    sock.set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    sock.write_all(&8i32.to_be_bytes()).unwrap();
+    sock.write_all(&80877103i32.to_be_bytes()).unwrap();
+    sock.flush().unwrap();
+    let mut answer = [0u8; 1];
+    sock.read_exact(&mut answer).unwrap();
+    assert_eq!(
+        answer,
+        [b'S'],
+        "with --tls the server must answer SSLRequest with 'S'"
+    );
+
+    let cert_pem = std::fs::read(dir.join("server-cert.pem")).unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls::pki_types::CertificateDer::pem_slice_iter(&cert_pem) {
+        roots.add(cert.unwrap()).unwrap();
+    }
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let conn = rustls::ClientConnection::new(Arc::new(config), server_name).unwrap();
+    let mut tls = rustls::StreamOwned::new(conn, sock);
+
+    tls.write_all(&startup_frame("zeno")).unwrap();
+    tls.flush().unwrap();
+    let msgs = read_until_ready_from(&mut tls);
+    assert!(
+        msgs.iter().any(|m| matches!(m, Msg::AuthOk)),
+        "TLS handshake must end with AuthenticationOk: {msgs:?}"
+    );
+
+    let mut frame = Vec::new();
+    let sql = "CREATE TABLE t (a)";
+    frame.push(b'Q');
+    frame.extend_from_slice(&((sql.len() + 1 + 4) as i32).to_be_bytes());
+    frame.extend_from_slice(sql.as_bytes());
+    frame.push(0);
+    tls.write_all(&frame).unwrap();
+    tls.flush().unwrap();
+    let msgs = read_until_ready_from(&mut tls);
+    assert_eq!(
+        msgs.iter()
+            .find_map(|m| match m {
+                Msg::CommandComplete(t) => Some(t.clone()),
+                _ => None,
+            })
+            .as_deref(),
+        Some("CREATE TABLE"),
+        "query over TLS must work: {msgs:?}"
+    );
+    let mut frame = Vec::new();
+    let sql = "INSERT INTO t VALUES ('tls-works')";
+    frame.push(b'Q');
+    frame.extend_from_slice(&((sql.len() + 1 + 4) as i32).to_be_bytes());
+    frame.extend_from_slice(sql.as_bytes());
+    frame.push(0);
+    tls.write_all(&frame).unwrap();
+    tls.flush().unwrap();
+    let msgs = read_until_ready_from(&mut tls);
+    assert!(
+        msgs.iter()
+            .any(|m| matches!(m, Msg::CommandComplete(t) if t == "INSERT 0 1")),
+        "insert over TLS must work: {msgs:?}"
+    );
+    // m7: after Terminate the server must close TLS cleanly with
+    // `close_notify`, so the client reads a clean EOF (0 bytes)
+    // instead of a truncated connection.
+    tls.write_all(&[b'X', 0, 0, 0, 4]).unwrap();
+    tls.flush().unwrap();
+    let mut buf = [0u8; 1];
+    assert_eq!(
+        tls.read(&mut buf).unwrap(),
+        0,
+        "the server must end the TLS session with close_notify (clean EOF)"
+    );
+}
+
+#[test]
+fn tls_server_rejects_plaintext_startup_with_08p01() {
+    // M1: `--tls` means TLS is REQUIRED. A plain StartupMessage
+    // (no SSLRequest first) must be refused with ErrorResponse
+    // 08P01 — the old code completed the whole handshake in
+    // plaintext even on a --tls server.
+    let dir = tmp_dir("tls-plain-reject");
+    generate_cert(&dir);
+    let server = Server::start_with_args_on_dir(dir, &["--tls"]);
+    let mut client = Client::connect_socket(server.port);
+    client.stream.write_all(&startup_frame("zeno")).unwrap();
+    client.stream.flush().unwrap();
+    match client.try_read_one() {
+        Some(Msg::ErrorResponse(code, _)) => assert_eq!(
+            code, "08P01",
+            "a plaintext startup on a --tls server must be refused with 08P01"
+        ),
+        other => panic!("expected an 08P01 ErrorResponse, got: {other:?}"),
+    }
+    assert!(
+        client.try_read_one().is_none(),
+        "the server must close the connection after refusing a plaintext startup"
+    );
+}
+
+#[test]
+fn tls_server_without_cert_refuses_to_start() {
+    let dir = tmp_dir("tls-nocert");
+    let bin = env!("CARGO_BIN_EXE_zeno");
+    let output = Command::new(bin)
+        .args([
+            "--data",
+            dir.to_str().unwrap(),
+            "serve",
+            "--port",
+            &free_port().to_string(),
+            "--tls",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run server");
+    assert!(
+        !output.status.success(),
+        "serve --tls without a certificate must fail to start"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cert generate"),
+        "the error must point at `cert generate`, got: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn scram_rate_limit_locks_after_five_failures() {
+    let server = Server::start("scram-ratelimit");
+    set_password(&server.dir, "sanjay", "correct horse battery staple");
+    set_password(&server.dir, "asha", "another password here");
+
+    // 5 wrong passwords for sanjay: each is a full SCRAM exchange
+    // ending in 28P01 (each waits the constant 2 s failure delay
+    // server-side — see `scram_failure_delay_is_constant_*`).
+    for attempt in 1..=5 {
+        let mut client = Client::connect_socket(server.port);
+        let outcome = scram_login_outcome(&mut client, "sanjay", "wrong password");
+        match &outcome {
+            Msg::ErrorResponse(code, _) => assert_eq!(
+                code, "28P01",
+                "attempt {attempt} must be 28P01, got: {outcome:?}"
+            ),
+            other => panic!("attempt {attempt}: expected 28P01, got: {other:?}"),
+        }
+        assert!(
+            client.try_read_one().is_none(),
+            "the server must close the connection after a failed login"
+        );
+    }
+    // 6th attempt, now with the CORRECT password: still 28P01 —
+    // the account is locked out for 5 minutes.
+    let mut client = Client::connect_socket(server.port);
+    let outcome = scram_login_outcome(&mut client, "sanjay", "correct horse battery staple");
+    match &outcome {
+        Msg::ErrorResponse(code, _) => assert_eq!(
+            code, "28P01",
+            "a locked-out login must still be 28P01, got: {outcome:?}"
+        ),
+        other => panic!("locked-out login with the right password must fail, got: {other:?}"),
+    }
+    // A different user is NOT locked: asha logs in fine.
+    let mut client = Client::connect_socket(server.port);
+    let msgs = scram_login(&mut client, "asha", "another password here");
+    assert!(
+        msgs.iter().any(|m| matches!(m, Msg::AuthOk)),
+        "another user must still log in: {msgs:?}"
+    );
+    client.terminate();
+}
+
+#[test]
+fn scram_rate_limit_unknown_user_gets_same_response() {
+    // An unknown user gets the same response shape before AND
+    // after the lockout trips: full server-first (fake salt),
+    // then 28P01 — so the lockout leaks nothing about whether
+    // the username exists.
+    let server = Server::start("scram-ratelimit-ghost");
+    set_password(&server.dir, "sanjay", "correct horse battery staple");
+    for attempt in 1..=6 {
+        let mut client = Client::connect_socket(server.port);
+        let outcome = scram_login_outcome(&mut client, "ghost", "whatever");
+        match &outcome {
+            Msg::ErrorResponse(code, _) => assert_eq!(
+                code, "28P01",
+                "attempt {attempt} for an unknown user must be 28P01, got: {outcome:?}"
+            ),
+            other => panic!("attempt {attempt}: expected 28P01, got: {other:?}"),
+        }
+        assert!(client.try_read_one().is_none());
+    }
+}
+
+#[test]
+fn scram_failure_delay_is_constant_for_fresh_and_locked_logins() {
+    // M3: a FRESH wrong password and a LOCKED-OUT correct password
+    // must take the SAME time (the constant 2 s failure delay).
+    // The old progressive delay made the 1st failure take 0.1 s
+    // and a locked login 2.0 s — measurable, so the timing alone
+    // revealed whether an account was locked. The bounds below
+    // are loose (parallel tests load the machine), but the old
+    // 0.1 s fresh failure cannot pass the 1.5 s lower bound.
+    let server = Server::start("scram-timing");
+    set_password(&server.dir, "victim", "correct horse battery staple");
+    set_password(&server.dir, "fresh", "another password here");
+
+    // A FRESH wrong password (1st failure for this user@IP).
+    let mut client = Client::connect_socket(server.port);
+    let start = std::time::Instant::now();
+    let outcome = scram_login_outcome(&mut client, "fresh", "wrong password");
+    let fresh_elapsed = start.elapsed();
+    match &outcome {
+        Msg::ErrorResponse(code, _) => assert_eq!(
+            code, "28P01",
+            "a fresh wrong password must be 28P01, got: {outcome:?}"
+        ),
+        other => panic!("a fresh wrong password must be 28P01, got: {other:?}"),
+    }
+    assert!(client.try_read_one().is_none());
+
+    // Lock "victim" with 5 wrong passwords.
+    for attempt in 1..=5 {
+        let mut client = Client::connect_socket(server.port);
+        let outcome = scram_login_outcome(&mut client, "victim", "wrong password");
+        match &outcome {
+            Msg::ErrorResponse(code, _) => assert_eq!(
+                code, "28P01",
+                "attempt {attempt} must be 28P01, got: {outcome:?}"
+            ),
+            other => panic!("attempt {attempt}: expected 28P01, got: {other:?}"),
+        }
+        assert!(client.try_read_one().is_none());
+    }
+    // The LOCKED login, with the CORRECT password: still 28P01.
+    let mut client = Client::connect_socket(server.port);
+    let start = std::time::Instant::now();
+    let outcome = scram_login_outcome(&mut client, "victim", "correct horse battery staple");
+    let locked_elapsed = start.elapsed();
+    match &outcome {
+        Msg::ErrorResponse(code, _) => assert_eq!(
+            code, "28P01",
+            "a locked-out login must still be 28P01, got: {outcome:?}"
+        ),
+        other => panic!("a locked-out login with the right password must fail, got: {other:?}"),
+    }
+    assert!(client.try_read_one().is_none());
+
+    assert!(
+        fresh_elapsed >= Duration::from_millis(1500),
+        "a fresh failure must wait the constant delay, took {fresh_elapsed:?}"
+    );
+    assert!(
+        locked_elapsed >= Duration::from_millis(1500),
+        "a locked-out login must wait the constant delay, took {locked_elapsed:?}"
+    );
+    assert!(
+        fresh_elapsed < Duration::from_secs(6),
+        "a fresh failure took suspiciously long: {fresh_elapsed:?}"
+    );
+    assert!(
+        locked_elapsed < Duration::from_secs(6),
+        "a locked-out login took suspiciously long: {locked_elapsed:?}"
+    );
+    let diff = fresh_elapsed.abs_diff(locked_elapsed);
+    assert!(
+        diff < Duration::from_secs(2),
+        "fresh ({fresh_elapsed:?}) and locked ({locked_elapsed:?}) logins must take about the same time, diff {diff:?}"
+    );
+}
+
+/// Try a plain startup handshake; true only if it ends in
+/// ReadyForQuery (i.e. the server had a free connection slot).
+fn try_connect(port: u16) -> bool {
+    let Ok(mut sock) = TcpStream::connect(("127.0.0.1", port)) else {
+        return false;
+    };
+    let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
+    if sock.write_all(&startup_frame("zeno")).is_err() {
+        return false;
+    }
+    let _ = sock.flush();
+    let mut reader = BufReader::new(sock.try_clone().unwrap());
+    loop {
+        let mut tag = [0u8; 1];
+        if reader.read_exact(&mut tag).is_err() {
+            return false;
+        }
+        let mut len_buf = [0u8; 4];
+        if reader.read_exact(&mut len_buf).is_err() {
+            return false;
+        }
+        let len = i32::from_be_bytes(len_buf);
+        if len < 4 {
+            return false;
+        }
+        let mut body = vec![0u8; (len - 4) as usize];
+        if reader.read_exact(&mut body).is_err() {
+            return false;
+        }
+        match tag[0] {
+            b'Z' => return true,
+            b'E' => return false,
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn connection_limit_rejects_over_limit_with_53300() {
+    let server = Server::start_with_args("connlimit", &["--max-connections", "2"]);
+    // Give the start-up probe connection a moment to be reaped,
+    // so it cannot steal one of the two slots below.
+    std::thread::sleep(Duration::from_millis(300));
+    // Two IDLE connections (handshake done, no queries) hold both slots.
+    let (mut c1, _) = Client::connect(server.port);
+    let (c2, _) = Client::connect(server.port);
+    // A third connection gets ErrorResponse 53300 instead of a handshake.
+    let mut sock = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut tag = [0u8; 1];
+    sock.read_exact(&mut tag).unwrap();
+    assert_eq!(
+        tag,
+        [b'E'],
+        "an over-limit connection must get ErrorResponse, not a handshake"
+    );
+    let mut len_buf = [0u8; 4];
+    sock.read_exact(&mut len_buf).unwrap();
+    let len = i32::from_be_bytes(len_buf);
+    let mut body = vec![0u8; (len - 4) as usize];
+    sock.read_exact(&mut body).unwrap();
+    match parse_message(b'E', &body) {
+        Msg::ErrorResponse(code, _) => assert_eq!(code, "53300", "must be 53300"),
+        other => panic!("expected a 53300 ErrorResponse, got: {other:?}"),
+    }
+    drop(sock);
+    // The server is still alive and serving the idle connections.
+    let msgs = c1.query("CREATE TABLE t (a)");
+    assert_eq!(
+        Client::tag(&msgs).as_deref(),
+        Some("CREATE TABLE"),
+        "{msgs:?}"
+    );
+    // Free a slot: closing c2 lets a new connection in.
+    c2.terminate();
+    let mut connected = false;
+    for _ in 0..20 {
+        if try_connect(server.port) {
+            connected = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        connected,
+        "a new connection must succeed after a slot frees up"
+    );
+    c1.terminate();
+}
+
+#[test]
+fn connection_limit_ssl_request_gets_n_then_53300() {
+    // m6: an over-limit client that starts with SSLRequest (what
+    // libpq sends by default) must first get a valid 'N'
+    // negotiation answer, THEN the 53300 ErrorResponse. The old
+    // code sent the ErrorResponse straight away, so libpq read
+    // 'E' where it expected 'S'/'N' — a broken negotiation
+    // instead of a clean "too many connections".
+    let server = Server::start_with_args("connlimit-ssl", &["--max-connections", "2"]);
+    // Give the start-up probe connection a moment to be reaped,
+    // so it cannot steal one of the two slots below.
+    std::thread::sleep(Duration::from_millis(300));
+    // Two IDLE connections (handshake done, no queries) hold both slots.
+    let (mut c1, _) = Client::connect(server.port);
+    let (c2, _) = Client::connect(server.port);
+    // A third connection, starting with SSLRequest.
+    let mut stream = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream.write_all(&ssl_request_bytes()).unwrap();
+    stream.flush().unwrap();
+    let mut answer = [0u8; 1];
+    stream.read_exact(&mut answer).unwrap();
+    assert_eq!(
+        answer,
+        [b'N'],
+        "an over-limit SSLRequest must still be answered 'N' first"
+    );
+    let mut client = Client {
+        stream: stream.try_clone().unwrap(),
+        reader: BufReader::new(stream),
+    };
+    match client.try_read_one() {
+        Some(Msg::ErrorResponse(code, _)) => assert_eq!(
+            code, "53300",
+            "the over-limit connection must then get ErrorResponse 53300"
+        ),
+        other => panic!("expected a 53300 ErrorResponse after 'N', got: {other:?}"),
+    }
+    assert!(
+        client.try_read_one().is_none(),
+        "the server must close the refused connection"
+    );
+    // The server is still alive and serving the idle connections.
+    let msgs = c1.query("CREATE TABLE t (a)");
+    assert_eq!(
+        Client::tag(&msgs).as_deref(),
+        Some("CREATE TABLE"),
+        "{msgs:?}"
+    );
+    c2.terminate();
+    c1.terminate();
 }

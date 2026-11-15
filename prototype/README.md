@@ -1,29 +1,144 @@
-# Zeno — One Engine, All Data (V0.4 prototype)
+# Zeno — One Engine, All Data (V0.5 prototype)
 
 > **Zeno is a hybrid SQL + JSON database in Rust — not ZenoDB (Lantern, Go
 > time-series) and not ZenDB.** The name was chosen knowing those exist.
 
-Zeno V0.4 is a small, working, single-node database prototype. One engine
+Zeno V0.5 is a small, working, single-node database prototype. One engine
 stores three kinds of data: **key-value**, **tables**, and **JSON
 documents**. It is written in Rust using `std` + `serde` +
 `serde_json` + small RustCrypto crates (`sha2`, `hmac`, `pbkdf2`,
-`base64`, `getrandom`, `subtle`) for SCRAM-SHA-256 auth — no heavy
-dependencies, no external database engine. V0.4 adds the **extended
-query protocol** (Parse/Bind/Describe/Execute/Sync, prepared
-statements with `$1` parameters) and **SCRAM-SHA-256 password auth**
-to the PostgreSQL wire protocol server (`zeno serve`), so `psql`,
-DBeaver, Python `psycopg` and any libpq client can connect with
-prepared statements as well as Simple Query.
+`base64`, `getrandom`, `subtle`) for SCRAM-SHA-256 auth, plus
+`rustls` (TLS 1.2/1.3, `ring` provider) + `rcgen` (self-signed
+certificate generation) for `serve --tls` — no heavy dependencies,
+no external database engine. V0.5 hardens the V0.4 server: **TLS**,
+**SCRAM rate limiting / lockout**, a **connection limit**,
+**Mutex-poisoning recovery**, and a **lock around concurrent
+`user set-password`** (see "What is new in V0.5").
 
 > **⚠️ LOCAL PROTOTYPE ONLY. With no users configured, `zeno serve`
 > accepts EVERY local client with NO password (trust auth) and
 > listens only on 127.0.0.1. With users configured (`zeno user
-> set-password`), SCRAM-SHA-256 password auth is required — but
-> there is still no SSL and no encryption, so the SCRAM exchange
-> itself travels in plaintext over loopback. Never expose this port
-> to a network, never run it on a shared machine, and never use it
-> in production. Anyone on the same machine can read and change all
-> your data. See "Password auth (SCRAM-SHA-256)" below.**
+> set-password`), SCRAM-SHA-256 password auth is required — and
+> with `--tls` the exchange runs inside TLS 1.2/1.3, but the
+> certificate is SELF-SIGNED (see "TLS" below): it proves the
+> channel is encrypted, not that the server is who it claims to
+> be. Never expose this port to a network, never run it on a
+> shared machine, and never use it in production. Anyone on the
+> same machine can read and change all your data. See "Password
+> auth (SCRAM-SHA-256)" and "TLS" below.**
+
+## What is new in V0.5
+
+- **TLS — PostgreSQL SSLRequest answered 'S' (`src/tls.rs`).**
+  `zeno cert generate` creates a self-signed certificate + private
+  key in the data directory (`server-cert.pem` / `server-key.pem`,
+  both mode 0600, ECDSA P-256, SANs `localhost` + `127.0.0.1`,
+  server-auth usage, valid 1 year from one day before creation —
+  backdated so slightly-behind client clocks never see "not yet
+  valid") and refuses to overwrite an
+  existing one. `zeno serve --tls` loads it once at startup (a
+  missing cert fails the start with a clear "run `zeno cert
+  generate` first"; so does an expired / not-yet-valid cert, and
+  a key readable by group/other is refused until `chmod 600`),
+  answers SSLRequest with 'S', runs a real
+  TLS 1.2/1.3 handshake (rustls 0.23.46, `ring` provider — pure
+  Rust, no OpenSSL), and then runs the normal protocol inside the
+  encrypted stream. `--tls` means TLS is REQUIRED: a plain
+  StartupMessage without an SSLRequest is refused with 08P01,
+  never answered in plaintext. Without `--tls` the behaviour is unchanged
+  (SSLRequest -> 'N', plaintext). GSSENCRequest is answered 'N'
+  like PostgreSQL, and a clean shutdown sends TLS `close_notify`. Crates, all reviewed: `rustls
+  0.23`, `rcgen 0.14`, `time 0.3` (certificate dates); PEM
+  parsing uses rustls's own `pki_types` — the unmaintained
+  `rustls-pemfile` (RUSTSEC-2025-0134) is deliberately not used.
+  Verified by a real rustls client test (trusting exactly the
+  generated cert): SSLRequest -> 'S' -> TLS 1.3 handshake ->
+  SCRAM login -> CREATE/INSERT over the encrypted stream, plus a
+  test that `serve --tls` without a cert refuses to start.
+  **BOLD, honest warning: the certificate is SELF-SIGNED.**
+  It encrypts the channel, but any client that trusts it blindly
+  can be talking to ANY server that minted a cert for
+  `localhost` — a self-signed cert is not an identity. Clients
+  must pin this exact cert (or use it as their only trust root)
+  and production needs a certificate from a real CA. A second
+  honest limit found while building this: rustls's
+  `Connection::reader().read()` returns `Err(WouldBlock)` — NOT
+  `Ok(0)` — when no decrypted bytes are buffered yet, so the
+  read loop treats exactly that as "pull more TLS records"
+  (the first version of the code waited on `Ok(0)` and hung —
+  fixed and covered by the TLS test above).
+- **SCRAM rate limiting / lockout (`src/auth.rs`,
+  `LoginRateLimiter`).** 5 failed logins for one `user@IP` lock
+  that key for 5 minutes; EVERY failure — the 1st wrong password
+  and a locked-out login alike — waits the same constant 2 s
+  delay before its 28P01, so the timing can never reveal whether
+  an account is locked (a progressive delay used to leak exactly
+  that: 0.1 s fresh vs 2.0 s locked). A correct password during
+  lockout still fails — the lockout cannot be guessed around. A
+  locked-out login runs the EXACT same handshake as an unknown
+  user (same server-first, same 28P01, same closed connection),
+  so the lockout leaks nothing about whether the username exists;
+  and attempts during a lockout do NOT extend it (otherwise an
+  attacker could keep an account locked forever by knocking once
+  a minute). A successful login forgets the key's failures, and
+  the next failure after an expired lockout starts a fresh
+  allowance. The tracker holds at most 10,000 `user@IP` keys
+  (stale unlocked entries are purged at the cap; active lockouts
+  are never dropped by the purge). **In-memory only: a server
+  restart resets every counter and lockout** — there is no
+  persistent lockout store yet. **Known trade-off (account-DoS):
+  anyone who knows a username can lock that user out for 5
+  minutes by failing 5 logins from one IP — the lockout is
+  per-`user@IP`, so the same user from another IP still logs in,
+  and a restart clears every lockout; there is no allowlist or
+  CAPTCHA in this prototype.** Verified by 8 unit tests (lock at
+  5, expiry + fresh allowance, success resets, per-user/per-IP
+  isolation, constant failure delay, entry cap eviction, cap
+  never drops a lockout, concurrent fake credentials agree) and 3
+  raw-TCP integration tests (5 wrong -> the right password still
+  28P01, another user unaffected; unknown user gets the identical
+  response 6 times in a row; fresh and locked logins take the
+  same time).
+- **Connection limit (`zeno serve --max-connections <n>`,
+  default 20).** The count is incremented on accept (before the
+  thread starts, so handshaking and idle connections count too)
+  and decremented when the connection's thread ends; two accepts
+  racing each other cannot slip past the cap. Past the limit a
+  new connection is refused inline — no thread — with a proper
+  PostgreSQL ErrorResponse **53300 (too_many_connections)** and
+  the socket is closed; the server keeps running and serving the
+  existing connections. Verified by an integration test: with
+  `--max-connections 2`, two idle connections hold both slots,
+  the 3rd gets 53300, the server still answers a query on the
+  first connection, and closing one idle connection lets a new
+  one in.
+- **Mutex-poisoning recovery (`src/pgwire.rs`,
+  `recover_lock`).** Every place that locks the shared engine
+  used to fail with XX000 "server lock poisoned" if any thread
+  had panicked while holding the lock — one panicking statement
+  wedged the server until restart. Now the lock is recovered
+  with `into_inner` (and the poisoning is logged loudly — a
+  panic is still a bug worth fixing, recovery is not a
+  substitute). Honest std detail, found by the test: the poison
+  FLAG itself is sticky (only the unstable `clear_poison` would
+  clear it), so `is_poisoned()` stays true — but every server
+  path locks through `recover_lock`, which recovers on every
+  call, so the server keeps serving. Verified by a unit test
+  that injects a real panic while holding a lock, then recovers
+  twice and mutates the data.
+- **`user set-password` race lock (`src/auth.rs`,
+  `src/lock.rs`).** Two `zeno user set-password` processes could
+  both load the same `users.json`, each add their own user, and
+  the second save silently dropped the first user's entry. Now
+  `set-password` and `remove` take a `users.lock` file lock
+  (same PID + `create_new` + stale-takeover rules as the
+  data-dir `LOCK`, via a generalized `DirLock::acquire_named`)
+  and WAIT for it (up to 10 s) instead of failing, holding it
+  across the whole load-modify-save; the save itself was already
+  atomic (tmp + fsync + rename + 0600). Verified by an
+  integration test: 8 concurrent `set-password` processes for
+  8 different users, all 8 survive in `user list`.
+- Version is now **0.5.0** (Cargo.toml, CLI, README).
 
 ## What is new in V0.4
 
@@ -272,7 +387,7 @@ prepared statements as well as Simple Query.
   demonstrated and tested (used by `demo.sh` and the lock tests).
 - Version is now **0.2.0** (Cargo.toml, CLI, README).
 
-## What works in V0.4
+## What works in V0.5
 
 - **PostgreSQL wire protocol** — `zeno serve` (see "What is new in
   V0.4" above). `psql` / libpq clients connect over TCP on
@@ -290,8 +405,27 @@ prepared statements as well as Simple Query.
   while the server runs applies at once. Unknown users get a fake
   exchange and still fail with 28P01; a corrupt `users.json`
   fails connections instead of silently falling back to trust
-  auth. No SSL — the exchange travels in plaintext over loopback;
-  a captured proof cannot be replayed (fresh nonce every time).
+  auth. **Rate limiting (V0.5):** 5 failed logins lock a
+  `user@IP` for 5 minutes (in-memory only — a restart resets
+  it), with a constant 2 s delay before each 28P01; a locked-out
+  login is indistinguishable from a wrong password, including in
+  timing. **TLS
+  (V0.5):** with `serve --tls` the exchange runs inside TLS
+  1.2/1.3 (self-signed cert — prototype only, see "TLS" in
+  "What is new in V0.5"); without it the exchange still travels
+  in plaintext over loopback; a captured proof cannot be
+  replayed (fresh nonce every time).
+- **TLS (V0.5)** — `zeno cert generate` + `zeno serve --tls`
+  (see "What is new in V0.5"): SSLRequest answered 'S', real
+  TLS 1.2/1.3 handshake, the whole protocol inside the encrypted
+  stream. **The certificate is SELF-SIGNED — prototype only**;
+  clients must pin it (or trust exactly it) and production needs
+  a real CA certificate. Without `--tls` the server still answers
+  'N' and speaks plaintext.
+- **Connection limit (V0.5)** — `serve --max-connections <n>`
+  (default 20): past the limit a new connection gets
+  ErrorResponse 53300 and is closed; the server keeps running.
+  Idle and handshaking connections count toward the limit.
 - **Key-Value** — `put` / `get` / `del`. Deletes are tombstones: the key
   disappears from reads immediately and is physically removed by
   compaction.
@@ -350,11 +484,23 @@ prepared statements as well as Simple Query.
 
 ## What does NOT work yet (honest limits)
 
-- **No SSL.** The server answers SSLRequest with 'N'. SCRAM
-  password auth exists (see above), but without TLS the SCRAM
-  exchange itself is plaintext on loopback, and there is no
-  channel binding. Still local-prototype-only — see the warning
-  at the top.
+- **TLS certificate is self-signed, and there is no channel
+  binding.** `serve --tls` encrypts the channel, but the cert
+  proves nothing about the server's identity — a client must pin
+  this exact cert (or trust exactly it) and production needs a
+  real CA certificate. A client that demands SCRAM channel
+  binding (`p=tls-server-end-point`) is still rejected, and the
+  certificate is loaded once at server startup (regenerating it
+  needs a server restart). Without `--tls` there is no
+  encryption at all (SSLRequest answered 'N').
+- **The login lockout is in-memory only.** A server restart
+  resets all failure counts and lockouts; there is no persistent
+  lockout store, and no per-IP (as opposed to per-user@IP)
+  block. The failure delay is a constant 2 s — it slows guessing,
+  it does not stop a distributed attack. And the lockout itself
+  is an account-DoS trade-off (see "SCRAM rate limiting" above):
+  anyone who knows a username can lock that user out for 5
+  minutes from one IP; a restart clears it.
 - **Bound NULL becomes the empty string.** Zeno has no NULLs: a
   parameter bound as SQL NULL is stored as `""`, and a missing
   column reads back as `""` (never NULL) — same as V0.3's
@@ -363,8 +509,7 @@ prepared statements as well as Simple Query.
   V0.4"):** Execute repeats the RowDescription (PostgreSQL
   sends it only on Describe); Parse checks syntax and parameter
   types only, table/column existence is checked at
-  Bind/Describe/Execute; a failed Parse leaves a previously
-  stored statement untouched.
+  Bind/Describe/Execute; a bound SQL NULL becomes the empty string (Zeno has no NULLs).
 - **No MVCC snapshots / transactions.** Reads see the latest value;
   there is no `BEGIN`/`COMMIT`/`ROLLBACK`, no snapshot isolation.
 - **No real SQL parser.** No `JOIN`, no `WHERE` beyond one
@@ -386,15 +531,14 @@ prepared statements as well as Simple Query.
 - **Lock file is single-machine only.** It does not protect a data
   directory shared over NFS, and a reused PID could in theory make a
   stale lock look live briefly (see `src/lock.rs`).
-- **Remaining risks, deferred to V0.5 (review findings, not
-  fixed here):** no rate-limiting or account lockout on failed
-  SCRAM logins (an attacker can guess passwords without delay);
-  no connection limit (threads are unbounded — 200 idle
-  connections already grow the server); a poisoned engine Mutex
-  fails every statement with XX000 instead of recovering; and
-  concurrent `zeno user set-password` processes can race and
-  lose each other's users (no file lock around the
-  read-modify-write of `users.json`).
+- **Remaining risks, fixed in V0.5 (were review findings):** the
+  four items listed above — no rate-limiting, no connection
+  limit, poisoned-Mutex XX000, and the `set-password` race — are
+  all fixed in V0.5 (see "What is new in V0.5"). What remains:
+  the lockout is in-memory only (restart resets it), the TLS
+  cert is self-signed with no channel binding, and there is
+  still no MVCC, no real SQL parser, and no multi-node support
+  (see the other bullets in this section).
 - **Not production-ready.** No independent audit, no benchmark against
   other databases. No speed claims are made anywhere in this repo.
 
@@ -433,13 +577,25 @@ cargo build --release
 ./target/release/zeno --data ./my-data stats
 ./target/release/zeno --data ./my-data hold 5   # diagnostic: hold the lock 5s
 
-# PostgreSQL wire protocol (V0.4) — server keeps running until killed
+# PostgreSQL wire protocol (V0.5) — server keeps running until killed
 ./target/release/zeno --data ./my-data serve --port 5433
+# With TLS (needs a certificate first — see below) and a smaller
+# connection cap than the default 20:
+./target/release/zeno --data ./my-data serve --port 5433 --tls --max-connections 10
+
+# TLS (V0.5): generate a SELF-SIGNED certificate (prototype only —
+# production needs a real CA certificate; clients must pin this
+# exact cert or trust exactly it). Refuses to overwrite an
+# existing cert; the files are mode 0600.
+./target/release/zeno --data ./my-data cert generate
+# -> server-cert.pem + server-key.pem in ./my-data
+# (SANs localhost + 127.0.0.1, valid 1 year, ECDSA P-256).
 
 # Password auth (SCRAM-SHA-256): set a password, then the server
 # requires it on every new connection (no restart needed).
 # The password is asked twice on stdin and echoes as you type —
 # use a private terminal. The password itself is never stored.
+# 5 wrong logins lock a user@IP for 5 minutes (in-memory only).
 ./target/release/zeno --data ./my-data user set-password sanjay
 ./target/release/zeno --data ./my-data user list
 ./target/release/zeno --data ./my-data user remove sanjay
@@ -451,6 +607,9 @@ raw TCP instead and parse the reply bytes):
 
 ```bash
 psql -h 127.0.0.1 -p 5433 -U zeno -d zeno   # no password: trust auth, LOCAL ONLY
+# With --tls, psql needs sslmode=require and the self-signed cert as
+# its trust root (otherwise it will not trust the server):
+psql "host=127.0.0.1 port=5433 user=sanjay dbname=zeno sslmode=require sslrootcert=./my-data/server-cert.pem"
 ```
 
 ```sql
@@ -521,7 +680,13 @@ Parse+Describe+Bind+Describe+Execute+Sync with a `$1` parameter,
 fetches rows one at a time (PortalSuspended), then sets a password
 with `zeno user set-password` and logs in with a full SCRAM-SHA-256
 handshake (Python `hashlib` client), plus a wrong-password
-rejection (28P01, connection closed).
+rejection (28P01, connection closed) — and the V0.5 addition:
+`zeno cert generate` (self-signed cert, 0600) + `serve --tls`
+(SSLRequest answered 'S', TLS 1.3 handshake, SCRAM login +
+query inside the encrypted stream), then 5 wrong SCRAM logins
+lock the 'ratelimit' user and even the right password is still
+28P01, and a `--max-connections 2` server refuses its 3rd (idle)
+connection with 53300, then lets a new one in once a slot frees up.
 
 ## Tests
 
@@ -531,27 +696,25 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-- 60 unit tests (the 50 from V0.4, plus: SASLprep mapping +
-  NFKC + prohibited characters, the 8-character minimum
-  password, `users.json` mode 0600, `set-password` creating a
-  missing data directory, deterministic fake salt per username,
-  strict client-first parsing incl. duplicate `n=`/`r=` and the
-  8-character minimum nonce, and the 32767 parameter cap)
-- 22 integration tests in `tests/engine_tests.rs` (the 18 from V0.2,
-  plus: second tables.json corruption keeps the first quarantine,
-  second meta.json corruption keeps the first quarantine, second
-  SSTable corruption keeps the first quarantine, corrupt WAL `del`
-  line resurrects the old value)
-- 37 integration tests in `tests/pgwire_tests.rs` (the 27 from
-  V0.4, plus 10 review-fix regressions: failed Parse drops the
-  old statement, failed Bind drops the old portal, Describe(S)
-  on a missing table sends only the ErrorResponse, block
-  comments in Parse/Simple Query, INSERT of a literal `')'`
-  value + `CREATE TABLE "a""b"`, the 32767 parameter cap,
-  deterministic fake salt for unknown users, NBSP-password login
-  via the SASLprep'd form, strict client-first parsing, and
-  `set-password` on a missing data directory)
-- 119 tests total, all passing.
+- 70 unit tests (the 60 from V0.4, plus 10 V0.5 ones: 5 rate-limiter
+  tests — lock at 5 failures, expiry + fresh allowance, success
+  resets the count, per-user/per-IP isolation, delay growth + cap
+  — 4 TLS tests — cert generation writes PEM files + loads,
+  cert/key files are mode 0600, generate refuses to overwrite,
+  load without a cert fails with a "cert generate" hint — and
+  the poisoned-lock recovery test, which injects a real panic
+  while holding a lock and recovers twice)
+- 23 integration tests in `tests/engine_tests.rs` (the 22 from
+  V0.4, plus: 8 concurrent `set-password` processes keep all 8 users)
+- 42 integration tests in `tests/pgwire_tests.rs` (the 37 from
+  V0.4, plus 5 V0.5 ones: a real rustls client does the TLS
+  handshake then CREATE/INSERT over the encrypted stream,
+  `serve --tls` without a cert refuses to start, 5 wrong SCRAM
+  logins lock the account (the right password still 28P01,
+  another user unaffected), an unknown user gets the identical
+  response 6 times in a row, and `--max-connections 2` refuses
+  the 3rd idle connection with 53300 then lets a new one in)
+- 135 tests total, all passing.
 
 **How the wire protocol is verified without `psql`:** `psql` is not
 installed in this sandbox, so `tests/pgwire_tests.rs` builds the
@@ -566,14 +729,15 @@ sees. On a machine with `psql`, use the commands in "How to run".
 
 ```
 src/
-  main.rs      CLI (subcommands incl. `serve` and `user`; the engine lives in the library)
+  main.rs      CLI (subcommands incl. `serve`, `cert` and `user`; the engine lives in the library)
   lib.rs       library root
   engine.rs    WAL + memtable + SSTables + compaction + read path
-  pgwire.rs    PostgreSQL wire protocol 3.0, Simple Query + handshake (std TcpListener)
+  pgwire.rs    PostgreSQL wire protocol 3.0, Simple Query + handshake (std TcpListener) + connection limit + poison recovery
   extended.rs  extended query protocol: Parse/Bind/Describe/Execute/Close/Sync
-  auth.rs      SCRAM-SHA-256 auth + users.json store (sha2/hmac/pbkdf2/base64)
+  auth.rs      SCRAM-SHA-256 auth + users.json store (sha2/hmac/pbkdf2/base64) + login rate limiter + users.lock
+  tls.rs       TLS for `serve --tls`: cert generate (rcgen, self-signed) + rustls handshake + TLS reader/writer halves
   quarantine.rs  numbered quarantine names (.corrupt.1, .corrupt.2, never overwritten)
-  lock.rs      LOCK file: one process per data dir, stale-PID takeover
+  lock.rs      LOCK file: one process per data dir, stale-PID takeover (+ `acquire_named` for users.lock)
   wal.rs       append + fsync + replay (one JSON record per line, corrupt lines counted)
   memtable.rs  in-memory BTreeMap, tombstones, 64-entry flush threshold
   sstable.rs   immutable sorted files, Bloom filter stored alongside
@@ -582,8 +746,8 @@ src/
   doc.rs       JSON documents + linear-scan find
 tests/
   engine_tests.rs   integration tests (each in its own temp directory)
-  pgwire_tests.rs   wire-protocol tests: raw-TCP client vs a real `zeno serve`
-demo.sh        end-to-end demo incl. restart / crash-recovery proof + V0.2 lock/WAL demos + V0.3 serve demo + V0.4 extended-protocol + SCRAM demo
+  pgwire_tests.rs   wire-protocol tests: raw-TCP client vs a real `zeno serve` (+ a real rustls TLS client)
+demo.sh        end-to-end demo incl. restart / crash-recovery proof + V0.2 lock/WAL demos + V0.3 serve demo + V0.4 extended-protocol + SCRAM demo + V0.5 TLS + rate-limit + connection-limit demo
 ```
 
 ## License

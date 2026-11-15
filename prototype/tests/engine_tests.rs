@@ -1,4 +1,4 @@
-// Integration tests for the Zeno V0.1 engine.
+// Integration tests for the Zeno V0.3 engine.
 //
 // Each test uses its own temp directory so tests never touch each
 // other's data and never touch the user's real data directory.
@@ -244,8 +244,8 @@ fn truncated_sstable_is_quarantined_and_wal_key_recovers() {
     assert_eq!(e2.get("wal-key"), Some("wal-value".to_string()));
     assert_eq!(e2.get("flushed-key"), None, "corrupt SSTable data is gone");
     assert!(
-        dir.join("sst-000001.sst.corrupt").exists(),
-        "corrupt SSTable should be quarantined as .corrupt"
+        dir.join("sst-000001.sst.corrupt.1").exists(),
+        "corrupt SSTable should be quarantined as .corrupt.1"
     );
     assert!(
         !dir.join("sst-000002.sst.tmp").exists(),
@@ -467,8 +467,8 @@ fn corrupt_tables_json_fails_open_and_quarantines() {
         "error must say tables.json is corrupt: {err}"
     );
     assert!(
-        dir.join("tables.json.corrupt").exists(),
-        "corrupt tables.json must be quarantined as tables.json.corrupt"
+        dir.join("tables.json.corrupt.1").exists(),
+        "corrupt tables.json must be quarantined as tables.json.corrupt.1"
     );
     assert!(
         !dir.join("tables.json").exists(),
@@ -618,8 +618,8 @@ fn corrupt_meta_json_opens_and_data_safe() {
     let mut e2 = Engine::open(&dir).expect("engine must open despite corrupt meta.json");
     assert_eq!(e2.get("meta-key"), Some("meta-value".to_string()));
     assert!(
-        dir.join("meta.json.corrupt").exists(),
-        "corrupt meta.json should be quarantined as .corrupt"
+        dir.join("meta.json.corrupt.1").exists(),
+        "corrupt meta.json should be quarantined as .corrupt.1"
     );
     // The recovered engine is still usable, and a later reopen works
     // (meta.json was rewritten atomically on drop).
@@ -689,5 +689,172 @@ fn bloom_scales_on_large_sstable() {
             "false negative after SSTable round-trip for {key}"
         );
     }
+    cleanup(&dir);
+}
+
+// ---------------------------------------------------------------------
+// V0.3: numbered quarantine (never overwrite the first corrupt file)
+// and WAL `del` strictness (a corrupt `del` resurrects the old value).
+// ---------------------------------------------------------------------
+
+#[test]
+fn quarantine_second_tables_corruption_keeps_first() {
+    // V0.2 overwrote tables.json.corrupt on the next corruption. V0.3
+    // numbers quarantines: .corrupt.1, .corrupt.2, ... — the first
+    // corrupt file must still be there, byte for byte, after the second.
+    let dir = tmp_dir("quar-tables");
+    {
+        let mut e = Engine::open(&dir).unwrap();
+        let mut tables = TableStore::open(&dir).unwrap();
+        tables
+            .create_table("users", vec!["id".into(), "name".into()])
+            .unwrap();
+        tables
+            .insert(&mut e, "users", vec!["1".into(), "Sanjay".into()])
+            .unwrap();
+        e.flush().unwrap();
+    }
+    std::fs::write(dir.join("tables.json"), "corrupt-one").unwrap();
+    let err = TableStore::open(&dir).expect_err("first corrupt tables.json must fail open");
+    assert!(err.to_string().contains("tables.json.corrupt.1"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("tables.json.corrupt.1")).unwrap(),
+        "corrupt-one"
+    );
+
+    // Corrupt it a second time: the first quarantine must survive.
+    std::fs::write(dir.join("tables.json"), "corrupt-two").unwrap();
+    let err = TableStore::open(&dir).expect_err("second corrupt tables.json must fail open");
+    assert!(err.to_string().contains("tables.json.corrupt.2"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("tables.json.corrupt.1")).unwrap(),
+        "corrupt-one",
+        "first quarantine must not be overwritten by the second"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("tables.json.corrupt.2")).unwrap(),
+        "corrupt-two"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn quarantine_second_meta_corruption_keeps_first() {
+    let dir = tmp_dir("quar-meta");
+    {
+        let mut e = Engine::open(&dir).unwrap();
+        e.put("k", "v").unwrap();
+    }
+    std::fs::write(dir.join("meta.json"), "corrupt-one").unwrap();
+    let mut e = Engine::open(&dir).expect("engine must open despite corrupt meta.json");
+    assert_eq!(
+        e.get("k"),
+        Some("v".to_string()),
+        "data must survive corrupt meta.json"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("meta.json.corrupt.1")).unwrap(),
+        "corrupt-one"
+    );
+    drop(e);
+
+    std::fs::write(dir.join("meta.json"), "corrupt-two").unwrap();
+    let mut e = Engine::open(&dir).expect("engine must open despite second corrupt meta.json");
+    assert_eq!(e.get("k"), Some("v".to_string()));
+    assert_eq!(
+        std::fs::read_to_string(dir.join("meta.json.corrupt.1")).unwrap(),
+        "corrupt-one",
+        "first quarantine must not be overwritten by the second"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("meta.json.corrupt.2")).unwrap(),
+        "corrupt-two"
+    );
+    drop(e);
+    cleanup(&dir);
+}
+
+#[test]
+fn quarantine_second_sstable_corruption_keeps_first() {
+    let dir = tmp_dir("quar-sst");
+    {
+        let mut e = Engine::open(&dir).unwrap();
+        e.put("flushed-key", "flushed-value").unwrap();
+        e.flush().unwrap();
+    }
+    std::fs::write(dir.join("sst-000001.sst"), b"torn-one").unwrap();
+    let mut e = Engine::open(&dir).expect("engine must open despite corrupt SSTable");
+    assert_eq!(
+        std::fs::read(dir.join("sst-000001.sst.corrupt.1")).unwrap(),
+        b"torn-one"
+    );
+    // Flush a fresh SSTable: the quarantined id is free again, so the
+    // new table takes sst-000001.sst — and corrupting THAT must go to
+    // .corrupt.2, not overwrite .corrupt.1.
+    e.put("flushed-key", "flushed-value").unwrap();
+    e.flush().unwrap();
+    drop(e);
+
+    std::fs::write(dir.join("sst-000001.sst"), b"torn-two").unwrap();
+    let _e = Engine::open(&dir).expect("engine must open despite second corrupt SSTable");
+    assert_eq!(
+        std::fs::read(dir.join("sst-000001.sst.corrupt.1")).unwrap(),
+        b"torn-one",
+        "first quarantine must not be overwritten by the second"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("sst-000001.sst.corrupt.2")).unwrap(),
+        b"torn-two"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn corrupt_wal_del_line_resurrects_old_value() {
+    // Policy (wal.rs, and now the README too): a corrupt WAL line is
+    // skipped, ONLY that line. If the lost line was a `del`, the
+    // delete itself is lost, so the key's older value — still sitting
+    // in an SSTable — comes back alive on replay. This test proves
+    // that behaviour instead of leaving it as a comment: it is a
+    // deliberate trade-off (later valid lines are never thrown away
+    // with the corrupt one), not a bug, but callers must know it.
+    let dir = tmp_dir("wal-del-corrupt");
+    {
+        let mut e = Engine::open(&dir).unwrap();
+        e.put("res-key", "old-value").unwrap();
+        e.flush().unwrap(); // old value now lives only in an SSTable
+        e.delete("res-key").unwrap(); // the `del` lives only in the WAL
+        assert_eq!(e.get("res-key"), None, "delete must hide the key");
+    }
+    // Corrupt exactly the `del` line, leaving the rest of the WAL intact.
+    let wal_path = dir.join("wal.log");
+    let text = std::fs::read_to_string(&wal_path).unwrap();
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let del_line = lines
+        .iter()
+        .position(|l| l.contains("\"op\":\"del\""))
+        .expect("WAL must contain the del line");
+    lines[del_line] = "garbage-not-json".to_string();
+    std::fs::write(&wal_path, lines.join("\n") + "\n").unwrap();
+
+    let mut e2 = Engine::open(&dir).unwrap();
+    assert_eq!(
+        e2.stats().wal_corrupt_lines,
+        1,
+        "the corrupt del line must be counted"
+    );
+    assert_eq!(
+        e2.stats().wal_corrupt_line_numbers,
+        vec![del_line as u64 + 1],
+        "the corrupt line number must be reported"
+    );
+    assert_eq!(
+        e2.get("res-key"),
+        Some("old-value".to_string()),
+        "a corrupt `del` line means the delete is lost and the old value comes back alive"
+    );
+    // The reopened engine is still usable: a fresh delete works.
+    e2.delete("res-key").unwrap();
+    assert_eq!(e2.get("res-key"), None);
     cleanup(&dir);
 }

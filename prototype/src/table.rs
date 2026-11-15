@@ -50,7 +50,6 @@ pub struct TableStore {
 impl TableStore {
     pub fn open(dir: &Path) -> std::io::Result<Self> {
         let registry_path = dir.join("tables.json");
-        let quarantine_path = dir.join("tables.json.corrupt");
         let registry = match fs::read_to_string(&registry_path) {
             Ok(text) => match serde_json::from_str(&text) {
                 Ok(registry) => registry,
@@ -60,29 +59,28 @@ impl TableStore {
                     // `create_table` would happily re-register a table
                     // and `insert` would restart next_row_id at 1 and
                     // OVERWRITE the old rows still stored in the KV
-                    // engine. Quarantine the corrupt file (kept for
-                    // inspection, never deleted) and refuse to open so
-                    // no create/insert can touch the old rows until an
-                    // operator has looked at the quarantine. (This is
-                    // deliberately stricter than meta.json: corrupt
-                    // meta.json only loses stats counters, which the
-                    // disk scan rebuilds — corrupt tables.json loses
-                    // next_row_id, which nothing can rebuild.)
-                    let _ = fs::remove_file(&quarantine_path);
-                    let quarantined = fs::rename(&registry_path, &quarantine_path).is_ok();
+                    // engine. Quarantine the corrupt file (numbered,
+                    // never overwritten — see quarantine.rs) and refuse
+                    // to open so no create/insert can touch the old
+                    // rows until an operator has looked at the
+                    // quarantine. (This is deliberately stricter than
+                    // meta.json: corrupt meta.json only loses stats
+                    // counters, which the disk scan rebuilds — corrupt
+                    // tables.json loses next_row_id, which nothing can
+                    // rebuild.)
+                    let quarantined = crate::quarantine::quarantine_file(dir, &registry_path);
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!(
                             "corrupt tables.json ({e}); {} — refusing to open so \
-                             existing rows cannot be overwritten; inspect {} and \
-                             restore it as tables.json, or delete it only if you \
-                             accept losing the table registry",
-                            if quarantined {
-                                format!("quarantined to {}", quarantine_path.display())
-                            } else {
-                                "could not quarantine it".to_string()
+                             existing rows cannot be overwritten; inspect the \
+                             quarantine and restore it as tables.json, or delete \
+                             it only if you accept losing the table registry",
+                            match quarantined {
+                                Ok(q) => format!("quarantined to {}", q.display()),
+                                Err(rename_err) =>
+                                    format!("could not quarantine it ({rename_err})"),
                             },
-                            quarantine_path.display()
                         ),
                     ));
                 }
@@ -95,7 +93,7 @@ impl TableStore {
                 // next create/insert overwrite the old rows, exactly
                 // the failure the quarantine is meant to stop. Refuse
                 // until an operator removes or restores the quarantine.
-                if quarantine_path.exists() {
+                if let Some(quarantine) = crate::quarantine::any_quarantine(dir, "tables.json") {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!(
@@ -105,7 +103,7 @@ impl TableStore {
                              be overwritten; inspect the quarantine and restore \
                              it as tables.json, or delete it only if you accept \
                              losing the table registry",
-                            quarantine_path.display()
+                            quarantine.display()
                         ),
                     ));
                 }
@@ -211,6 +209,36 @@ impl TableStore {
         let value = serde_json::to_string(&Value::Object(row)).expect("row is valid JSON");
         engine.put(&key, &value).map_err(|e| e.to_string())?;
         Ok(row_id)
+    }
+
+    /// Delete rows of a table, optionally keeping only rows where one
+    /// column equals one value. Returns how many rows were deleted.
+    /// Each row key is tombstoned through the engine, so the row
+    /// disappears from reads immediately and is physically removed by
+    /// compaction — the same delete path as the KV `del` command.
+    ///
+    /// m8 note: this delete is NOT atomic across rows — it tombstones
+    /// one row key at a time, so a crash mid-delete leaves some rows
+    /// deleted and some still there. That is safe in V0.3 only
+    /// because every caller holds the single server Mutex (or the
+    /// one-shot CLI process) for the whole call, so no other thread
+    /// can observe a half-deleted table; a future multi-threaded
+    /// delete must make this one WAL transaction first.
+    pub fn delete(
+        &mut self,
+        engine: &mut Engine,
+        name: &str,
+        filter: Option<(&str, &str)>,
+    ) -> Result<usize, String> {
+        let rows = self.select(engine, name, filter)?;
+        let mut deleted = 0;
+        for (row_id, _) in rows {
+            engine
+                .delete(&row_key(name, row_id))
+                .map_err(|e| e.to_string())?;
+            deleted += 1;
+        }
+        Ok(deleted)
     }
 
     /// Scan all rows of a table. If `filter` is `Some((column, value))`,

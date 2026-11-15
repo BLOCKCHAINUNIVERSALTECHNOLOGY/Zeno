@@ -30,11 +30,11 @@ use zeno::doc;
 use zeno::engine::Engine;
 use zeno::table::TableStore;
 
-const VERSION: &str = "0.2.0";
+const VERSION: &str = "0.3.0";
 
 fn usage() -> String {
     format!(
-        "Zeno {VERSION} — One Engine, All Data (V0.2 prototype)\n\
+        "Zeno {VERSION} — One Engine, All Data (V0.3 prototype)\n\
         \n\
         Usage: zeno [--data <dir>] <command> [args]   (default data dir: ./zeno-data)\n\
         \n\
@@ -49,7 +49,7 @@ fn usage() -> String {
         \x20 table select <name> [column=value]\n\
         \x20 table list\n\
         \n\
-        JSON document (find is a linear scan in V0.1):\n\
+        JSON document (find is a linear scan in V0.3):\n\
         \x20 doc put <collection> <id> <json>\n\
         \x20 doc get <collection> <id>\n\
         \x20 doc find <collection> <field>=<value>\n\
@@ -59,18 +59,37 @@ fn usage() -> String {
         \x20 compact                  merge SSTables, drop old versions + tombstones\n\
         \x20 stats                    show engine stats\n\
         \x20 hold <seconds>           open the engine and hold its lock for N seconds\n\
-        \x20                          (diagnostic for the lock demo / tests only)"
+        \x20                          (diagnostic for the lock demo / tests only)\n\
+        \n\
+        PostgreSQL wire protocol (V0.3, Simple Query only, trust auth):\n\
+        \x20 serve [--port <port>]    listen on 127.0.0.1:<port> (default 5432) and\n\
+        \x20                          answer psql / libpq clients. LOCAL PROTOTYPE\n\
+        \x20                          ONLY: any local client may connect, no password.\n\
+        \x20                          Example: zeno --data ./my-data serve --port 5433"
     )
 }
 
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut data_dir = PathBuf::from("zeno-data");
+    let mut port: u16 = 5432;
     let mut args: Vec<String> = Vec::new();
     let mut i = 0;
     while i < argv.len() {
         if argv[i] == "--data" && i + 1 < argv.len() {
             data_dir = PathBuf::from(&argv[i + 1]);
+            i += 2;
+        } else if argv[i] == "--port" && i + 1 < argv.len() {
+            match argv[i + 1].parse::<u16>() {
+                Ok(p) => port = p,
+                Err(_) => {
+                    eprintln!(
+                        "error: --port needs a number 0-65535, got '{}'",
+                        argv[i + 1]
+                    );
+                    return ExitCode::FAILURE;
+                }
+            }
             i += 2;
         } else {
             args.push(argv[i].clone());
@@ -83,7 +102,7 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    match run(&data_dir, &args) {
+    match run(&data_dir, port, &args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
             eprintln!("error: {msg}");
@@ -99,8 +118,17 @@ fn need(args: &[String], n: usize, what: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn run(data_dir: &Path, args: &[String]) -> Result<(), String> {
+fn run(data_dir: &Path, port: u16, args: &[String]) -> Result<(), String> {
     let cmd = args[0].as_str();
+
+    // `serve` opens the engine itself (once, shared by all client
+    // threads) and never returns until killed — it must not go through
+    // the one-shot open below.
+    if cmd == "serve" {
+        return zeno::pgwire::serve(data_dir, port)
+            .map_err(|e| format!("cannot serve on port {port}: {e}"));
+    }
+
     let mut engine = Engine::open(data_dir).map_err(|e| format!("cannot open data dir: {e}"))?;
     let mut tables = TableStore::open(data_dir).map_err(|e| format!("cannot open tables: {e}"))?;
 

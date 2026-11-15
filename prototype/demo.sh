@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# demo.sh — Zeno V0.2 end-to-end demo.
+# demo.sh — Zeno V0.3 end-to-end demo.
 #
 # Runs a full scenario against one data directory:
 #   1. Key-value put / get / delete
@@ -15,6 +15,11 @@
 #      (stale lock, dead PID, taken over).
 #   8. WAL STRICTNESS — a torn line is appended to wal.log: the next
 #      open warns about it, `stats` counts it, and the data is safe.
+#   9. POSTGRESQL WIRE PROTOCOL (V0.3) — `zeno serve` listens on
+#      127.0.0.1:5433; a small Python client speaks raw TCP (startup
+#      handshake + Simple Query) because psql is NOT installed in this
+#      sandbox, and prints the decoded messages. A second server on
+#      the same data dir is refused (LOCK).
 #
 # No fake numbers: everything printed below is real output of the binary.
 set -euo pipefail
@@ -53,7 +58,7 @@ $ZENO --data "$DATA" table insert users 3,Ravi,Delhi
 $ZENO --data "$DATA" table select users
 $ZENO --data "$DATA" table select users city=Delhi
 
-say "3. JSON DOCUMENT — put / get / find (linear scan in V0.2)"
+say "3. JSON DOCUMENT — put / get / find (linear scan in V0.3)"
 $ZENO --data "$DATA" doc put profiles u1 '{"name":"Sanjay","city":"Delhi","role":"builder"}'
 $ZENO --data "$DATA" doc put profiles u2 '{"name":"Asha","city":"Mumbai","role":"designer"}'
 $ZENO --data "$DATA" doc put profiles u3 '{"name":"Ravi","city":"Delhi","role":"tester"}'
@@ -109,6 +114,114 @@ echo "-- next open warns (stderr) but the data is still there:"
 $ZENO --data "$DATA" get wal-demo-key
 echo "-- stats counts the corrupt line:"
 $ZENO --data "$DATA" stats
+
+say "9. POSTGRESQL WIRE PROTOCOL (V0.3) — serve + raw TCP client"
+echo "(psql is NOT installed in this sandbox, so the demo speaks the"
+echo " protocol directly with a small Python client — the same bytes"
+echo " psql/libpq would send. See README for the psql commands.)"
+$ZENO --data "$DATA" serve --port 5433 &
+SERVER=$!
+sleep 1
+python3 - <<'PYEOF'
+import socket, struct
+
+def recvn(s, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = s.recv(n - len(buf))
+        if not chunk:
+            raise EOFError("connection closed")
+        buf += chunk
+    return buf
+
+def read_msg(s):
+    tag = recvn(s, 1)
+    (ln,) = struct.unpack("!I", recvn(s, 4))
+    return tag, recvn(s, ln - 4)
+
+def read_until_ready(s, label):
+    print(f"-- {label}:")
+    while True:
+        tag, body = read_msg(s)
+        if tag == b'R':
+            print("   AuthenticationOk")
+        elif tag == b'S':
+            name, _, rest = body.partition(b"\0")
+            print(f"   ParameterStatus {name.decode()}={rest.split(bytes([0]))[0].decode()}")
+        elif tag == b'K':
+            print("   BackendKeyData")
+        elif tag == b'T':
+            n = struct.unpack("!H", body[:2])[0]
+            cols, p = [], 2
+            for _ in range(n):
+                end = body.index(b"\0", p)
+                cols.append(body[p:end].decode())
+                p = end + 1 + 18  # 4+2+4+2+4+2 bytes of field metadata
+            print(f"   RowDescription {cols}")
+        elif tag == b'D':
+            n = struct.unpack("!H", body[:2])[0]
+            vals, p = [], 2
+            for _ in range(n):
+                (ln,) = struct.unpack("!i", body[p:p + 4]); p += 4
+                vals.append(body[p:p + ln].decode()); p += ln
+            print(f"   DataRow {vals}")
+        elif tag == b'C':
+            print(f"   CommandComplete {body.split(bytes([0]))[0].decode()}")
+        elif tag == b'E':
+            code, msg, p = "", "", 0
+            while p < len(body) and body[p] != 0:
+                f = chr(body[p]); p += 1
+                end = body.index(b"\0", p)
+                v = body[p:end].decode(); p = end + 1
+                if f == 'C': code = v
+                if f == 'M': msg = v
+            print(f"   ErrorResponse [{code}] {msg}")
+        elif tag == b'I':
+            print("   EmptyQueryResponse")
+        elif tag == b'Z':
+            print(f"   ReadyForQuery '{body.decode()}'")
+            return
+        else:
+            print(f"   (other message {tag!r})")
+
+s = socket.create_connection(("127.0.0.1", 5433))
+params = b"user\0zeno\0database\0zeno\0\0"
+body = struct.pack("!I", 196608) + params  # protocol 3.0
+s.sendall(struct.pack("!I", len(body) + 4) + body)
+read_until_ready(s, "startup handshake")
+
+def query(sql):
+    body = sql.encode() + b"\0"
+    s.sendall(b"Q" + struct.pack("!I", len(body) + 4) + body)
+    read_until_ready(s, f"QUERY: {sql}")
+
+query("CREATE TABLE demo_users (id, name, city)")
+query("INSERT INTO demo_users VALUES (1, 'Sanjay', 'Delhi')")
+query("INSERT INTO demo_users VALUES (2, 'Asha', 'Mumbai')")
+query("SELECT * FROM demo_users WHERE city = 'Delhi'")
+query("UPDATE demo_users SET name = 'X'")
+query("SELECT * FROM demo_users")
+s.sendall(b"X" + struct.pack("!I", 4))  # Terminate
+s.close()
+print("demo client done — connection closed cleanly, server still running")
+PYEOF
+echo "-- stopping the server, then proving a second server is refused (LOCK):"
+kill $SERVER || true
+wait $SERVER 2>/dev/null || true
+$ZENO --data "$DATA" serve --port 5433 &
+SERVER2=$!
+sleep 1
+if $ZENO --data "$DATA" serve --port 5434 2>&1; then
+  echo "ERROR: second server should have been refused!"
+else
+  echo "(expected: the second server was refused — data dir locked)"
+fi
+kill $SERVER2 || true
+wait $SERVER2 2>/dev/null || true
+echo
+echo "PostgreSQL demo done. Try it yourself with psql (on a machine that has it):"
+echo "  ./target/release/zeno --data $DATA serve --port 5433"
+echo "  psql -h 127.0.0.1 -p 5433 -U zeno -d zeno   # no password (trust auth, local only)"
 echo
 echo "Demo done. Data directory kept at: $DATA"
 echo "Note: the torn line stays in $DATA/wal.log, so later opens will"

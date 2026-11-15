@@ -7,7 +7,8 @@
 //
 // What V0.1 does NOT do (honest limits, see README):
 // - No MVCC snapshots / transactions yet. Reads see the latest value.
-// - No PostgreSQL wire protocol yet. The CLI is the only interface.
+// - The PostgreSQL wire protocol lives in pgwire.rs (Simple Query
+//   only); the CLI is still the other interface.
 // - No background compaction thread; compaction runs only on command.
 
 use crate::lock::DirLock;
@@ -120,18 +121,17 @@ impl Engine {
         let _ = fs::remove_file(dir.join("meta.json.tmp"));
 
         // Load cumulative counters (missing file = first run). A corrupt
-        // meta.json is quarantined to `meta.json.corrupt` (kept for
-        // inspection, never deleted) and counters restart from zero —
-        // the DATA is unaffected: it lives in the WAL and SSTables, not
-        // in meta.json. Only the lifetime `stats` counters are lost.
+        // meta.json is quarantined to `meta.json.corrupt.1` (numbered,
+        // never overwritten — see quarantine.rs) and counters restart
+        // from zero — the DATA is unaffected: it lives in the WAL and
+        // SSTables, not in meta.json. Only the lifetime `stats`
+        // counters are lost.
         let mut meta = match fs::read_to_string(&meta_path) {
             Ok(text) => match serde_json::from_str::<EngineMeta>(&text) {
                 Ok(meta) => meta,
                 Err(e) => {
-                    let quarantine = dir.join("meta.json.corrupt");
-                    let _ = fs::remove_file(&quarantine);
-                    match fs::rename(&meta_path, &quarantine) {
-                        Ok(()) => eprintln!(
+                    match crate::quarantine::quarantine_file(dir, &meta_path) {
+                        Ok(quarantine) => eprintln!(
                             "warning: corrupt meta.json quarantined to {} ({e}); \
                              stats counters reset to zero, data is unaffected",
                             quarantine.display()
@@ -179,27 +179,26 @@ impl Engine {
             match SsTable::open(&path, *id) {
                 Ok(table) => sstables.push(table),
                 // A corrupt SSTable must not make the whole database
-                // unopenable. Quarantine it (rename to `.corrupt`, so
-                // it is never re-parsed as a live table and its id is
-                // never reused) and keep going: the WAL and the other
-                // SSTables are still recoverable. The quarantined
-                // file is kept on disk for inspection, not deleted.
-                Err(e) => {
-                    let quarantine = dir.join(format!("sst-{id:06}.sst.corrupt"));
-                    let _ = fs::remove_file(&quarantine);
-                    match fs::rename(&path, &quarantine) {
-                        Ok(()) => eprintln!(
-                            "warning: quarantined corrupt SSTable {} ({e}); \
+                // unopenable. Quarantine it (rename to a numbered
+                // `.corrupt.N`, so it is never re-parsed as a live
+                // table, its id is never reused, and an earlier
+                // quarantine is never overwritten) and keep going: the
+                // WAL and the other SSTables are still recoverable.
+                // The quarantined file is kept on disk for inspection,
+                // not deleted.
+                Err(e) => match crate::quarantine::quarantine_file(dir, &path) {
+                    Ok(quarantine) => eprintln!(
+                        "warning: quarantined corrupt SSTable {} to {} ({e}); \
                              data in it is unavailable, other data recovered",
-                            path.display()
-                        ),
-                        Err(rename_err) => eprintln!(
-                            "warning: corrupt SSTable {} could not be quarantined \
+                        path.display(),
+                        quarantine.display()
+                    ),
+                    Err(rename_err) => eprintln!(
+                        "warning: corrupt SSTable {} could not be quarantined \
                              ({e}; rename failed: {rename_err}); skipping it",
-                            path.display()
-                        ),
-                    }
-                }
+                        path.display()
+                    ),
+                },
             }
         }
 

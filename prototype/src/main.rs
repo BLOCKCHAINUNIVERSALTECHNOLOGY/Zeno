@@ -30,11 +30,11 @@ use zeno::doc;
 use zeno::engine::Engine;
 use zeno::table::TableStore;
 
-const VERSION: &str = "0.5.0";
+const VERSION: &str = "0.6.0";
 
 fn usage() -> String {
     format!(
-        "Zeno {VERSION} — One Engine, All Data (V0.5 prototype)\n\
+        "Zeno {VERSION} — One Engine, All Data (V0.6 prototype)\n\
         \n\
         Usage: zeno [--data <dir>] <command> [args]   (default data dir: ./zeno-data)\n\
         \n\
@@ -57,15 +57,20 @@ fn usage() -> String {
         Maintenance:\n\
         \x20 flush                    force memtable flush to an SSTable\n\
         \x20 compact                  merge SSTables, drop old versions + tombstones\n\
+        \x20 vacuum                   online vacuum: prune old row versions + the\n\
+        \x20                          committed-transaction set (safe while a server\n\
+        \x20                          runs — use the VACUUM SQL statement there)\n\
         \x20 stats                    show engine stats\n\
         \x20 hold <seconds>           open the engine and hold its lock for N seconds\n\
         \x20                          (diagnostic for the lock demo / tests only)\n\
         \n\
-        PostgreSQL wire protocol (V0.5, Simple + extended query, trust or SCRAM auth):\n\
+        PostgreSQL wire protocol (V0.6, Simple + extended query, trust or SCRAM auth):\n\
         \x20 serve [--port <port>] [--tls] [--max-connections <n>]\n\
         \x20                          listen on 127.0.0.1:<port> (default 5432) and\n\
         \x20                          answer psql / libpq clients (prepared statements\n\
-        \x20                          work now). LOCAL PROTOTYPE ONLY: with no users\n\
+        \x20                          work now; MVCC transactions too: BEGIN /\n\
+        \x20                          COMMIT / ROLLBACK, UPDATE, snapshot isolation).\n\
+        \x20                          LOCAL PROTOTYPE ONLY: with no users\n\
         \x20                          configured any local client may connect, no\n\
         \x20                          password. Example: zeno --data ./my-data serve\n\
         \x20                          --port 5433\n\
@@ -224,6 +229,13 @@ fn run(
             let count = engine.compact().map_err(|e| e.to_string())?;
             println!("OK  compacted — {count} SSTable(s) remain");
         }
+        "vacuum" => {
+            let report = engine.vacuum().map_err(|e| e.to_string())?;
+            println!(
+                "OK  vacuumed — {} old version(s) pruned, {} committed txn id(s) pruned, {} SSTable(s) remain",
+                report.pruned_versions, report.committed_pruned, report.sstables
+            );
+        }
         "hold" => {
             // Diagnostic only (used by demo.sh and the lock tests):
             // open the engine — which takes the data-dir lock — and
@@ -268,6 +280,11 @@ fn run(
                 );
             }
             println!("  next SSTable id  : {}", s.next_sst_id);
+            println!("  next txn id      : {}", s.next_txn_id);
+            println!("  active txns      : {}", s.active_txns);
+            println!("  committed txns   : {}", s.committed_txns);
+            println!("  vacuums          : {}", s.vacuums);
+            println!("  wal discarded txns: {}", s.wal_discarded_txns);
             println!("  tables           : {}", tables.list_tables().join(", "));
         }
         "table" => {

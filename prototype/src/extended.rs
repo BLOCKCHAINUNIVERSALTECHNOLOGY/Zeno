@@ -27,6 +27,10 @@
 //   Execute — Zeno repeats it on Execute as well, so a client that
 //   skips Describe still learns the column names (this is the
 //   "same messages as Simple Query" behaviour of this prototype).
+//   Portals bound inside a transaction die when it ends
+//   (COMMIT/ROLLBACK/idle-timeout): a later Execute of one fails
+//   with 26000 instead of serving its cached rows (B2 — the cache
+//   could hold rows that never committed).
 // - Close 'C' ('S' statement / 'P' portal) -> CloseComplete '3'.
 //   Closing a nonexistent name is NOT an error. Closing a statement
 //   also closes every portal built from it.
@@ -76,7 +80,7 @@
 use crate::pgwire::{
     classify_statement, command_complete, data_row, empty_query_response, execute_tokens,
     parse_select, put_i16, put_i32, row_description, split_statements, sql_err, tokenize,
-    write_message, Shared, SqlError, StmtKind, StmtOutcome, Token,
+    write_message, Session, Shared, SqlError, StmtKind, StmtOutcome, Token,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
@@ -132,6 +136,26 @@ struct Portal {
     cached: Option<CachedRows>,
     /// Rows already sent from `cached` (for PortalSuspended resume).
     rows_sent: usize,
+    /// B2: the transaction (if any) this portal was bound in,
+    /// and the session generation at Bind time. A portal bound
+    /// inside a transaction dies when that transaction ends
+    /// (PostgreSQL closes portals at transaction end): its
+    /// cached rows — which may include the transaction's own,
+    /// never-committed writes — must never be served again.
+    /// `None` means bound outside a transaction; such a portal
+    /// survives transaction ends (its cache is a snapshot from
+    /// its own first Execute, not a transaction's writes).
+    txn_at_bind: Option<u64>,
+    gen_at_bind: u64,
+}
+
+impl Portal {
+    /// Is this portal dead — bound inside a transaction that has
+    /// since ended? (B2: serving its cached rows after a
+    /// ROLLBACK returned rows that never committed.)
+    fn is_dead(&self, session: &Session) -> bool {
+        self.txn_at_bind.is_some() && self.gen_at_bind != session.generation
+    }
 }
 
 /// Per-connection extended-protocol state. Statements and portals
@@ -161,6 +185,16 @@ impl ExtendedState {
     /// (protocol docs, 54.2.3 note).
     pub(crate) fn clear_unnamed(&mut self) {
         self.unnamed_statement = None;
+        self.unnamed_portal = None;
+    }
+
+    /// Close every portal (B2): PostgreSQL closes all portals
+    /// at transaction end. Prepared statements are NOT closed —
+    /// only portals. Called after a Simple Query COMMIT/ROLLBACK
+    /// (see `pgwire.rs`) and after an extended COMMIT/ROLLBACK
+    /// Execute (see `handle_execute`).
+    pub(crate) fn close_all_portals(&mut self) {
+        self.portals.clear();
         self.unnamed_portal = None;
     }
 
@@ -572,6 +606,7 @@ pub(crate) fn handle_bind(
     writer: &mut impl Write,
     shared: &Arc<Mutex<Shared>>,
     state: &mut ExtendedState,
+    session: &Session,
     body: &[u8],
 ) -> Result<(), SqlError> {
     let mut r = MsgReader::new(body);
@@ -621,6 +656,7 @@ pub(crate) fn handle_bind(
     match bind_portal(
         shared,
         state,
+        session,
         &portal_name,
         &stmt_name,
         &fmt_codes,
@@ -650,9 +686,13 @@ pub(crate) fn handle_bind(
 /// validated against the real column count — in that order, so a
 /// bad value (22P02) is reported before a duplicate portal
 /// (42P03), matching the previous behaviour.
+/// (8 arguments: the message's fields plus the shared state and
+/// the session — a struct would only hide them; allowed.)
+#[allow(clippy::too_many_arguments)]
 fn bind_portal(
     shared: &Arc<Mutex<Shared>>,
     state: &ExtendedState,
+    session: &Session,
     portal_name: &str,
     stmt_name: &str,
     fmt_codes: &[i16],
@@ -707,6 +747,10 @@ fn bind_portal(
         result_formats,
         cached: None,
         rows_sent: 0,
+        // B2: remember the transaction (if any) this portal was
+        // bound in, so a later Execute can tell it is dead.
+        txn_at_bind: session.txn,
+        gen_at_bind: session.generation,
     })
 }
 
@@ -813,6 +857,7 @@ pub(crate) fn handle_execute(
     writer: &mut impl Write,
     shared: &Arc<Mutex<Shared>>,
     state: &mut ExtendedState,
+    session: &mut Session,
     body: &[u8],
 ) -> Result<(), SqlError> {
     let mut r = MsgReader::new(body);
@@ -823,10 +868,37 @@ pub(crate) fn handle_execute(
         return Err(sql_err("08P01", "Execute max rows must not be negative"));
     }
 
-    let portal = state
-        .portal_mut(&portal_name)
-        .ok_or_else(|| sql_err("26000", format!("portal \"{portal_name}\" does not exist")))?;
-    if portal.statement.kind == StmtKind::Empty {
+    // B2: a portal bound inside a transaction that has since
+    // ended (COMMIT/ROLLBACK, or an idle-timeout rollback) is
+    // DEAD — PostgreSQL closes portals at transaction end. Its
+    // cached rows (which may include that transaction's own,
+    // never-committed writes) must never be served again, so
+    // Execute fails with 26000 ("does not exist") instead of
+    // resuming the stale cache.
+    let (kind, tokens, params, result_formats, cached, rows_sent) = {
+        let portal = state
+            .portal(&portal_name)
+            .ok_or_else(|| sql_err("26000", format!("portal \"{portal_name}\" does not exist")))?;
+        if portal.is_dead(session) {
+            return Err(sql_err(
+                "26000",
+                format!(
+                    "portal \"{portal_name}\" does not exist (it was closed at the end of \
+                     the transaction it was bound in — re-Bind it to run the query again)"
+                ),
+            ));
+        }
+        (
+            portal.statement.kind,
+            portal.statement.tokens.clone(),
+            portal.params.clone(),
+            portal.result_formats.clone(),
+            portal.cached.clone(),
+            portal.rows_sent,
+        )
+    };
+    let generation_before = session.generation;
+    if kind == StmtKind::Empty {
         empty_query_response(writer).map_err(|e| sql_err("XX000", e.to_string()))?;
         return Ok(());
     }
@@ -834,12 +906,32 @@ pub(crate) fn handle_execute(
     // First Execute of this portal: run the statement once and
     // cache a SELECT's rows. A non-SELECT statement runs fresh on
     // every Execute (an INSERT re-inserts, like PostgreSQL); its
-    // CommandComplete is the whole reply.
-    if portal.cached.is_none() {
-        let tokens = substitute(&portal.statement.tokens, &portal.params);
-        match execute_tokens(shared, &tokens)? {
+    // CommandComplete is the whole reply. The session is passed
+    // through so BEGIN/COMMIT/ROLLBACK and statements inside a
+    // transaction work over the extended protocol exactly like
+    // they do over Simple Query (V0.6). No portal borrow is held
+    // across the execution (the statement may end the
+    // transaction — and close the portals — itself).
+    let mut cached = cached;
+    if cached.is_none() {
+        let tokens = substitute(&tokens, &params);
+        let outcome = execute_tokens(shared, &tokens, session);
+        // A COMMIT/ROLLBACK executed through this portal ended
+        // the transaction: close every portal (B2), whether the
+        // COMMIT succeeded or failed with 40001.
+        if session.generation != generation_before {
+            state.close_all_portals();
+        }
+        match outcome? {
             StmtOutcome::Rows { columns, rows } => {
-                portal.cached = Some(CachedRows { columns, rows });
+                let fresh = CachedRows { columns, rows };
+                cached = Some(fresh.clone());
+                // Store the cache back in the portal (it may have
+                // been closed above only when a transaction ended
+                // — a SELECT never ends one, so it is still here).
+                if let Some(portal) = state.portal_mut(&portal_name) {
+                    portal.cached = Some(fresh);
+                }
             }
             StmtOutcome::Command(tag) => {
                 command_complete(writer, &tag).map_err(|e| sql_err("XX000", e.to_string()))?;
@@ -852,35 +944,31 @@ pub(crate) fn handle_execute(
         }
     }
 
-    // Stream the next slice of the cached rows. The cached borrow
-    // ends before the portal's resume offset is updated below.
-    let (total, end, done) = {
-        let cached = portal
-            .cached
-            .as_ref()
-            .expect("cached rows were just filled");
-        let total = cached.rows.len();
-        let start = portal.rows_sent;
-        let end = if max_rows == 0 {
-            total
-        } else {
-            (start + max_rows as usize).min(total)
-        };
-        // Execute repeats the RowDescription (see module docs): a
-        // client that skipped Describe still learns the columns.
-        row_description(writer, &cached.columns, &portal.result_formats)
-            .map_err(|e| sql_err("XX000", e.to_string()))?;
-        for row in &cached.rows[start..end] {
-            data_row(writer, row).map_err(|e| sql_err("XX000", e.to_string()))?;
-        }
-        (total, end, end >= total)
+    // Stream the next slice of the cached rows.
+    let cached = cached.expect("cached rows were just filled");
+    let total = cached.rows.len();
+    let start = rows_sent;
+    let end = if max_rows == 0 {
+        total
+    } else {
+        (start + max_rows as usize).min(total)
     };
-    portal.rows_sent = end;
-    if done {
-        // Completed: clear the cache so the next Execute of this
-        // portal re-runs the statement fresh.
-        portal.cached = None;
-        portal.rows_sent = 0;
+    let done = end >= total;
+    // Execute repeats the RowDescription (see module docs): a
+    // client that skipped Describe still learns the columns.
+    row_description(writer, &cached.columns, &result_formats)
+        .map_err(|e| sql_err("XX000", e.to_string()))?;
+    for row in &cached.rows[start..end] {
+        data_row(writer, row).map_err(|e| sql_err("XX000", e.to_string()))?;
+    }
+    if let Some(portal) = state.portal_mut(&portal_name) {
+        portal.rows_sent = end;
+        if done {
+            // Completed: clear the cache so the next Execute of
+            // this portal re-runs the statement fresh.
+            portal.cached = None;
+            portal.rows_sent = 0;
+        }
     }
     if done {
         command_complete(writer, &format!("SELECT {total}"))

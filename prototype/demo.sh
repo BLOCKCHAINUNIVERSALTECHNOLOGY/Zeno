@@ -34,6 +34,12 @@
 #      password is still 28P01 — and a --max-connections 2 server
 #      refuses its 3rd (idle) connection with 53300, then lets a
 #      new one in once a slot frees up.
+#  12. MVCC TRANSACTIONS (V0.6) — two connections on a fresh data
+#      dir: BEGIN + INSERT is invisible to the other connection
+#      until COMMIT (snapshot isolation), ROLLBACK undoes an
+#      UPDATE, a write-write conflict on the same row fails the
+#      second COMMIT with 40001, and kill -9 mid-transaction loses
+#      only the uncommitted row on restart.
 #
 # No fake numbers: everything printed below is real output of the binary.
 set -euo pipefail
@@ -678,6 +684,172 @@ PYEOF
 kill $SERVER3 || true
 wait $SERVER3 2>/dev/null || true
 rm -rf ./demo-data-limit
+
+say "12. MVCC TRANSACTIONS (V0.6) — snapshot isolation, two connections"
+echo "(fresh data dir, trust auth: connection A BEGINs and writes,"
+echo " connection B must not see it until A COMMITs; then a ROLLBACK,"
+echo " a 40001 write-write conflict, and a kill -9 mid-transaction)"
+rm -rf ./demo-data-txn
+$ZENO --data ./demo-data-txn serve --port 5435 &
+SERVER4=$!
+sleep 1
+# If anything below fails (set -e), do not leave this server
+# orphaned on port 5435: it is killed when the demo exits
+# (the variable is read when the trap fires, so it also covers
+# the restarted server below, which reuses $SERVER4).
+trap 'kill $SERVER4 2>/dev/null || true' EXIT
+SERVER_PID=$SERVER4 python3 - <<'PYEOF'
+import socket, struct, time, os, signal
+
+def recvn(s, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = s.recv(n - len(buf))
+        if not chunk:
+            raise EOFError("connection closed")
+        buf += chunk
+    return buf
+
+def read_msg(s):
+    tag = recvn(s, 1)
+    (ln,) = struct.unpack("!I", recvn(s, 4))
+    return tag, recvn(s, ln - 4)
+
+def connect(label):
+    s = socket.create_connection(("127.0.0.1", 5435))
+    params = b"user\0zeno\0database\0zeno\0\0"
+    body = struct.pack("!I", 196608) + params
+    s.sendall(struct.pack("!I", len(body) + 4) + body)
+    while True:
+        tag, body = read_msg(s)
+        if tag == b'Z':
+            break
+    print(f"-- {label}: connected (trust auth)")
+    return s
+
+def q(s, sql, label):
+    """Send one Simple Query, print its outcome, return the rows."""
+    body = sql.encode() + b"\0"
+    s.sendall(b"Q" + struct.pack("!I", len(body) + 4) + body)
+    rows = []
+    while True:
+        tag, body = read_msg(s)
+        if tag == b'T':
+            pass  # RowDescription
+        elif tag == b'D':
+            n = struct.unpack("!H", body[:2])[0]
+            vals, pos = [], 2
+            for _ in range(n):
+                (ln,) = struct.unpack("!I", body[pos:pos + 4]); pos += 4
+                vals.append(body[pos:pos + ln].decode() if ln >= 0 else None)
+                pos += max(ln, 0)
+            rows.append(vals)
+        elif tag == b'C':
+            print(f"   [{label}] {sql} -> {body.split(bytes([0]))[0].decode()}")
+        elif tag == b'E':
+            code = ""
+            p = 0
+            while p < len(body) and body[p] != 0:
+                f = chr(body[p]); p += 1
+                end = body.index(b"\0", p)
+                if f == 'C': code = body[p:end].decode()
+                p = end + 1
+            print(f"   [{label}] {sql} -> ErrorResponse {code}")
+        elif tag == b'Z':
+            print(f"   [{label}] ReadyForQuery '{body.decode()}' ({len(rows)} row(s): {rows})")
+            return rows
+        else:
+            print(f"   [{label}] (other message {tag!r})")
+
+a = connect("connection A")
+b = connect("connection B")
+q(a, "CREATE TABLE txn_demo (id, city)", "A")
+q(a, "INSERT INTO txn_demo VALUES (1, 'Delhi')", "A")
+print("-- A BEGINs and inserts a row B must NOT see yet:")
+q(a, "BEGIN", "A")
+q(a, "INSERT INTO txn_demo VALUES (2, 'Mumbai')", "A")
+q(a, "SELECT * FROM txn_demo", "A")
+q(b, "SELECT * FROM txn_demo", "B")
+print("-- A COMMITs: now B sees both rows:")
+q(a, "COMMIT", "A")
+q(b, "SELECT * FROM txn_demo", "B")
+print("-- A BEGINs, UPDATEs, then ROLLBACKs: B never sees Jaipur:")
+q(a, "BEGIN", "A")
+q(a, "UPDATE txn_demo SET city = 'Jaipur' WHERE id = 1", "A")
+q(b, "SELECT * FROM txn_demo", "B")
+q(a, "ROLLBACK", "A")
+q(b, "SELECT * FROM txn_demo", "B")
+print("-- write-write conflict: A and B UPDATE the same row, A commits first:")
+q(a, "BEGIN", "A")
+q(b, "BEGIN", "B")
+q(a, "UPDATE txn_demo SET city = 'Agra' WHERE id = 1", "A")
+q(b, "UPDATE txn_demo SET city = 'Pune' WHERE id = 1", "B")
+q(a, "COMMIT", "A")
+q(b, "COMMIT", "B")
+q(b, "SELECT * FROM txn_demo", "B")
+print("-- crash mid-transaction: A BEGINs + INSERTs, then the server is killed -9:")
+q(a, "BEGIN", "A")
+q(a, "INSERT INTO txn_demo VALUES (3, 'Goa')", "A")
+print("-- killing the server -9 NOW, with A's transaction still open (no COMMIT, no clean shutdown):")
+os.kill(int(os.environ["SERVER_PID"]), signal.SIGKILL)
+time.sleep(0.5)
+print("   server killed mid-transaction")
+PYEOF
+wait $SERVER4 2>/dev/null || true
+echo "-- server killed -9 with an open transaction; restarting on the same data dir:"
+$ZENO --data ./demo-data-txn serve --port 5435 &
+SERVER4=$!
+sleep 1
+python3 - <<'PYEOF'
+import socket, struct
+
+def recvn(s, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = s.recv(n - len(buf))
+        if not chunk:
+            raise EOFError("connection closed")
+        buf += chunk
+    return buf
+
+def read_msg(s):
+    tag = recvn(s, 1)
+    (ln,) = struct.unpack("!I", recvn(s, 4))
+    return tag, recvn(s, ln - 4)
+
+s = socket.create_connection(("127.0.0.1", 5435))
+params = b"user\0zeno\0database\0zeno\0\0"
+body = struct.pack("!I", 196608) + params
+s.sendall(struct.pack("!I", len(body) + 4) + body)
+while True:
+    tag, body = read_msg(s)
+    if tag == b'Z':
+        break
+body = b"SELECT * FROM txn_demo\0"
+s.sendall(b"Q" + struct.pack("!I", len(body) + 4) + body)
+rows = []
+while True:
+    tag, body = read_msg(s)
+    if tag == b'D':
+        n = struct.unpack("!H", body[:2])[0]
+        vals, pos = [], 2
+        for _ in range(n):
+            (ln,) = struct.unpack("!I", body[pos:pos + 4]); pos += 4
+            vals.append(body[pos:pos + ln].decode() if ln >= 0 else None)
+            pos += max(ln, 0)
+        rows.append(vals)
+    elif tag == b'Z':
+        break
+print(f"-- after restart: SELECT * FROM txn_demo -> {rows}")
+print("   (row 3 'Goa' is gone — its transaction never committed;")
+print("    rows 1 'Agra' and 2 'Mumbai' survived, exactly as committed)")
+s.sendall(b"X" + struct.pack("!I", 4))
+s.close()
+print("MVCC demo done")
+PYEOF
+kill $SERVER4 || true
+wait $SERVER4 2>/dev/null || true
+rm -rf ./demo-data-txn
 
 echo
 echo "PostgreSQL demo done. Try it yourself with psql (on a machine that has it):"

@@ -41,10 +41,24 @@ fn row_key(table: &str, row_id: u64) -> String {
     format!("table:{table}:{row_id:020}")
 }
 
+fn row_to_json(row: BTreeMap<String, String>) -> String {
+    let obj: Map<String, Value> = row
+        .into_iter()
+        .map(|(k, v)| (k, Value::String(v)))
+        .collect();
+    serde_json::to_string(&Value::Object(obj)).expect("row is valid JSON")
+}
+
 #[derive(Debug)]
 pub struct TableStore {
     registry_path: PathBuf,
     registry: TableRegistry,
+    /// Rows skipped by the last `select` because their stored
+    /// value was corrupt or not a JSON object (m6): previously
+    /// they vanished silently. The count is cumulative across
+    /// selects; each skipped row is also warned about on stderr
+    /// with its key, so a corrupt row is visible, not hidden.
+    skipped_rows: u64,
 }
 
 impl TableStore {
@@ -114,7 +128,13 @@ impl TableStore {
         Ok(Self {
             registry_path,
             registry,
+            skipped_rows: 0,
         })
+    }
+
+    /// Rows skipped as corrupt/non-object by `select` so far (m6).
+    pub fn skipped_rows(&self) -> u64 {
+        self.skipped_rows
     }
 
     fn save(&self) -> std::io::Result<()> {
@@ -176,6 +196,32 @@ impl TableStore {
         name: &str,
         values: Vec<String>,
     ) -> Result<u64, String> {
+        self.insert_inner(engine, None, name, values)
+    }
+
+    /// Insert one row inside transaction `txn` (V0.6): the row is
+    /// buffered in the transaction and becomes visible to others
+    /// only at COMMIT. The row id is still reserved (and the
+    /// registry saved) at statement time, exactly like the
+    /// autocommit path — so a ROLLBACK leaves a gap in the row
+    /// ids, never a reuse (see README).
+    pub fn insert_txn(
+        &mut self,
+        engine: &mut Engine,
+        txn: u64,
+        name: &str,
+        values: Vec<String>,
+    ) -> Result<u64, String> {
+        self.insert_inner(engine, Some(txn), name, values)
+    }
+
+    fn insert_inner(
+        &mut self,
+        engine: &mut Engine,
+        txn: Option<u64>,
+        name: &str,
+        values: Vec<String>,
+    ) -> Result<u64, String> {
         let columns = self
             .registry
             .tables
@@ -207,7 +253,12 @@ impl TableStore {
         self.save().map_err(|e| e.to_string())?;
         let key = row_key(name, row_id);
         let value = serde_json::to_string(&Value::Object(row)).expect("row is valid JSON");
-        engine.put(&key, &value).map_err(|e| e.to_string())?;
+        match txn {
+            Some(txn) => engine.txn_put(txn, &key, &value)?,
+            None => engine
+                .put_internal(&key, &value)
+                .map_err(|e| e.to_string())?,
+        }
         Ok(row_id)
     }
 
@@ -217,28 +268,156 @@ impl TableStore {
     /// disappears from reads immediately and is physically removed by
     /// compaction — the same delete path as the KV `del` command.
     ///
-    /// m8 note: this delete is NOT atomic across rows — it tombstones
-    /// one row key at a time, so a crash mid-delete leaves some rows
-    /// deleted and some still there. That is safe in V0.3 only
-    /// because every caller holds the single server Mutex (or the
-    /// one-shot CLI process) for the whole call, so no other thread
-    /// can observe a half-deleted table; a future multi-threaded
-    /// delete must make this one WAL transaction first.
+    /// V0.6-fix (M6): the autocommit path is atomic across rows —
+    /// all deletes go through ONE autocommit transaction (one txn
+    /// id, one commit marker in the WAL), so a crash mid-delete
+    /// replays either all of them or none of them. Inside a
+    /// transaction the deletes were already atomic (they sit in
+    /// the transaction's buffer until COMMIT).
     pub fn delete(
         &mut self,
         engine: &mut Engine,
         name: &str,
         filter: Option<(&str, &str)>,
     ) -> Result<usize, String> {
-        let rows = self.select(engine, name, filter)?;
-        let mut deleted = 0;
-        for (row_id, _) in rows {
-            engine
-                .delete(&row_key(name, row_id))
-                .map_err(|e| e.to_string())?;
-            deleted += 1;
+        self.delete_inner(engine, None, name, filter)
+    }
+
+    /// Delete rows inside transaction `txn` (V0.6): the rows
+    /// disappear for this transaction at once, and for everyone
+    /// else only at COMMIT; on ROLLBACK nothing is deleted.
+    pub fn delete_txn(
+        &mut self,
+        engine: &mut Engine,
+        txn: u64,
+        name: &str,
+        filter: Option<(&str, &str)>,
+    ) -> Result<usize, String> {
+        self.delete_inner(engine, Some(txn), name, filter)
+    }
+
+    fn delete_inner(
+        &mut self,
+        engine: &mut Engine,
+        txn: Option<u64>,
+        name: &str,
+        filter: Option<(&str, &str)>,
+    ) -> Result<usize, String> {
+        let rows = match txn {
+            Some(txn) => self.select_txn(engine, txn, name, filter)?,
+            None => self.select(engine, name, filter)?,
+        };
+        match txn {
+            Some(txn) => {
+                let mut deleted = 0;
+                for (row_id, _) in rows {
+                    engine.txn_delete(txn, &row_key(name, row_id))?;
+                    deleted += 1;
+                }
+                Ok(deleted)
+            }
+            // M6: one autocommit transaction for all rows.
+            None => {
+                let writes: Vec<(String, Option<String>)> = rows
+                    .iter()
+                    .map(|(row_id, _)| (row_key(name, *row_id), None))
+                    .collect();
+                let deleted = writes.len();
+                engine
+                    .autocommit_writes(&writes)
+                    .map_err(|e| e.to_string())?;
+                Ok(deleted)
+            }
         }
-        Ok(deleted)
+    }
+
+    /// UPDATE one column of every row matching the filter (V0.6):
+    /// `UPDATE name SET set_col = set_val [WHERE col = value]`.
+    /// Each matching row is rewritten as a new version (the old
+    /// version gets `xmax` — see txn.rs). Returns how many rows
+    /// were updated. The SET column must exist (42703-style
+    /// error otherwise); a WHERE on an unknown column matches no
+    /// rows, like SELECT. V0.6-fix (M6): autocommit UPDATE is
+    /// atomic across rows — all rewrites go through ONE
+    /// autocommit transaction (one txn id, one commit marker);
+    /// inside a transaction it commits atomically with the rest
+    /// of the transaction, as before.
+    pub fn update(
+        &mut self,
+        engine: &mut Engine,
+        name: &str,
+        set_col: &str,
+        set_val: &str,
+        filter: Option<(&str, &str)>,
+    ) -> Result<usize, String> {
+        self.update_inner(engine, None, name, set_col, set_val, filter)
+    }
+
+    /// UPDATE inside transaction `txn` (V0.6).
+    pub fn update_txn(
+        &mut self,
+        engine: &mut Engine,
+        txn: u64,
+        name: &str,
+        set_col: &str,
+        set_val: &str,
+        filter: Option<(&str, &str)>,
+    ) -> Result<usize, String> {
+        self.update_inner(engine, Some(txn), name, set_col, set_val, filter)
+    }
+
+    fn update_inner(
+        &mut self,
+        engine: &mut Engine,
+        txn: Option<u64>,
+        name: &str,
+        set_col: &str,
+        set_val: &str,
+        filter: Option<(&str, &str)>,
+    ) -> Result<usize, String> {
+        let columns = self
+            .registry
+            .tables
+            .get(name)
+            .ok_or_else(|| format!("no such table '{name}'"))?
+            .columns
+            .clone();
+        if !columns.iter().any(|c| c == set_col) {
+            return Err(format!(
+                "column '{set_col}' does not exist in table '{name}'"
+            ));
+        }
+        let rows = match txn {
+            Some(txn) => self.select_txn(engine, txn, name, filter)?,
+            None => self.select(engine, name, filter)?,
+        };
+        match txn {
+            Some(txn) => {
+                let mut updated = 0;
+                for (row_id, mut row) in rows {
+                    row.insert(set_col.to_string(), set_val.to_string());
+                    let value = row_to_json(row);
+                    engine.txn_put(txn, &row_key(name, row_id), &value)?;
+                    updated += 1;
+                }
+                Ok(updated)
+            }
+            // M6: one autocommit transaction for all rows.
+            None => {
+                let writes: Vec<(String, Option<String>)> = rows
+                    .into_iter()
+                    .map(|(row_id, mut row)| {
+                        row.insert(set_col.to_string(), set_val.to_string());
+                        (row_key(name, row_id), Some(row_to_json(row)))
+                    })
+                    .collect();
+                let updated = writes.len();
+                engine
+                    .autocommit_writes(&writes)
+                    .map_err(|e| e.to_string())?;
+                Ok(updated)
+            }
+        }
     }
 
     /// Scan all rows of a table. If `filter` is `Some((column, value))`,
@@ -250,18 +429,58 @@ impl TableStore {
         name: &str,
         filter: Option<(&str, &str)>,
     ) -> Result<Vec<TableRow>, String> {
+        self.select_inner(engine, None, name, filter)
+    }
+
+    /// Scan all rows of a table as transaction `txn` sees them
+    /// (V0.6): its BEGIN snapshot plus its own writes.
+    pub fn select_txn(
+        &mut self,
+        engine: &mut Engine,
+        txn: u64,
+        name: &str,
+        filter: Option<(&str, &str)>,
+    ) -> Result<Vec<TableRow>, String> {
+        self.select_inner(engine, Some(txn), name, filter)
+    }
+
+    fn select_inner(
+        &mut self,
+        engine: &mut Engine,
+        txn: Option<u64>,
+        name: &str,
+        filter: Option<(&str, &str)>,
+    ) -> Result<Vec<TableRow>, String> {
         if !self.registry.tables.contains_key(name) {
             return Err(format!("no such table '{name}'"));
         }
+        let scanned = match txn {
+            Some(txn) => engine.txn_scan_prefix(txn, &key_prefix(name))?,
+            None => engine.scan_prefix(&key_prefix(name)),
+        };
         let mut rows = Vec::new();
-        for (key, value) in engine.scan_prefix(&key_prefix(name)) {
+        for (key, value) in scanned {
             let Some(id_part) = key.strip_prefix(&key_prefix(name)) else {
                 continue;
             };
             let Ok(row_id) = id_part.parse::<u64>() else {
+                // A key under the table prefix that is not a row
+                // id (e.g. a forged key from before the `table:`
+                // prefix was reserved): warn and skip, do not
+                // silently drop it (m6).
+                self.skipped_rows += 1;
+                eprintln!("warning: table '{name}': skipping key '{key}' — not a row id");
                 continue;
             };
             let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(&value) else {
+                // Corrupt or non-object row value: warn and skip,
+                // and count it (m6) — the old code skipped it in
+                // silence, so a corrupt row just vanished.
+                self.skipped_rows += 1;
+                eprintln!(
+                    "warning: table '{name}': skipping row {row_id} (key '{key}') — \
+                     stored value is not a JSON object: {value:?}"
+                );
                 continue;
             };
             let mut row = BTreeMap::new();
@@ -278,5 +497,52 @@ impl TableStore {
             rows.push((row_id, row));
         }
         Ok(rows)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_dir(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("zeno-table-test-{name}"));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn corrupt_row_values_are_warned_and_counted_not_silently_dropped() {
+        // m6: a corrupt / non-object row value used to vanish
+        // from SELECT with no trace at all.
+        let dir = tmp_dir("corrupt-row");
+        let mut engine = Engine::open(&dir).unwrap();
+        let mut tables = TableStore::open(&dir).unwrap();
+        tables
+            .create_table("t", vec!["id".into(), "city".into()])
+            .unwrap();
+        tables
+            .insert(&mut engine, "t", vec!["1".into(), "Delhi".into()])
+            .unwrap();
+        // Forge two bad rows straight into the engine (the
+        // internal path — the public `put` now refuses `table:`
+        // keys, m2): one not JSON at all, one valid JSON but not
+        // an object.
+        engine
+            .put_internal("table:t:00000000000000000099", "not-json-at-all")
+            .unwrap();
+        engine
+            .put_internal("table:t:00000000000000000100", "[1, 2, 3]")
+            .unwrap();
+        let rows = tables.select(&mut engine, "t", None).unwrap();
+        assert_eq!(rows.len(), 1, "only the good row must come back");
+        assert_eq!(rows[0].1.get("city").unwrap(), "Delhi");
+        assert_eq!(
+            tables.skipped_rows(),
+            2,
+            "both corrupt rows must be counted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

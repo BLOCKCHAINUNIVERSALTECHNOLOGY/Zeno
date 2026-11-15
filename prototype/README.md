@@ -1,19 +1,18 @@
-# Zeno — One Engine, All Data (V0.5 prototype)
+# Zeno — One Engine, All Data (V0.6 prototype)
 
 > **Zeno is a hybrid SQL + JSON database in Rust — not ZenoDB (Lantern, Go
 > time-series) and not ZenDB.** The name was chosen knowing those exist.
 
-Zeno V0.5 is a small, working, single-node database prototype. One engine
+Zeno V0.6 is a small, working, single-node database prototype. One engine
 stores three kinds of data: **key-value**, **tables**, and **JSON
 documents**. It is written in Rust using `std` + `serde` +
 `serde_json` + small RustCrypto crates (`sha2`, `hmac`, `pbkdf2`,
 `base64`, `getrandom`, `subtle`) for SCRAM-SHA-256 auth, plus
 `rustls` (TLS 1.2/1.3, `ring` provider) + `rcgen` (self-signed
 certificate generation) for `serve --tls` — no heavy dependencies,
-no external database engine. V0.5 hardens the V0.4 server: **TLS**,
-**SCRAM rate limiting / lockout**, a **connection limit**,
-**Mutex-poisoning recovery**, and a **lock around concurrent
-`user set-password`** (see "What is new in V0.5").
+no external database engine. V0.6 adds **MVCC transactions**
+(snapshot isolation: BEGIN / COMMIT / ROLLBACK, UPDATE) on top of
+the V0.5 server (see "What is new in V0.6").
 
 > **⚠️ LOCAL PROTOTYPE ONLY. With no users configured, `zeno serve`
 > accepts EVERY local client with NO password (trust auth) and
@@ -26,6 +25,201 @@ no external database engine. V0.5 hardens the V0.4 server: **TLS**,
 > shared machine, and never use it in production. Anyone on the
 > same machine can read and change all your data. See "Password
 > auth (SCRAM-SHA-256)" and "TLS" below.**
+
+## What is new in V0.6
+
+- **MVCC transactions — snapshot isolation (`src/txn.rs`,
+  `src/engine.rs`, `src/pgwire.rs`, `src/extended.rs`,
+  `src/table.rs`).** `BEGIN` / `COMMIT` / `ROLLBACK` (plus
+  `START TRANSACTION`, `END`, `ABORT`) over Simple Query AND the
+  extended protocol, one transaction per connection. Every row
+  version carries `xmin` (creator txn) and `xmax` (deleter txn);
+  a transaction reads the world as of its BEGIN snapshot — data
+  committed by others afterwards is invisible to it, its own
+  writes are visible to itself, and other transactions'
+  uncommitted writes are visible to nobody. COMMIT makes all of
+  the transaction's writes visible at once; ROLLBACK drops them
+  (they never reached the WAL or the memtable). A connection
+  that disconnects with a transaction open rolls it back, and
+  ReadyForQuery reports 'T' while a transaction is open, 'E'
+  while it is aborted (see below), 'I' otherwise. **Aborted
+  transaction (PostgreSQL 25P02):** if a statement inside a
+  transaction fails (INSERT/SELECT/UPDATE/DELETE — not DDL,
+  not a nested BEGIN, not a Parse/Bind/Describe error), the
+  transaction is aborted: every further statement except
+  ROLLBACK fails with 25P02, including COMMIT, until ROLLBACK.
+  A multi-statement Simple Query that fails mid-batch aborts
+  the same way, so a later COMMIT in the same batch cannot land
+  the earlier writes. **Isolation level: snapshot isolation ONLY — this
+  is NOT PostgreSQL's READ COMMITTED.** In READ COMMITTED each
+  statement would see the newest committed data; here each
+  statement inside a transaction sees the BEGIN snapshot, even
+  if another transaction commits newer data mid-transaction.
+  Verified by two-connection tests (uncommitted INSERT invisible,
+  later commits invisible to an open snapshot, ROLLBACK, and
+  disconnect-rollback).
+- **UPDATE (`UPDATE name SET col = val [WHERE col = val]`,
+  one SET assignment).** An UPDATE rewrites each matching row
+  as a new version (old version gets `xmax`). Autocommit UPDATE
+  works too; `UPDATE 0` when nothing matches; unknown SET column
+  is 42703. (UPDATE used to be 0A000 — two old tests asserted
+  that and were updated, see "Tests".)
+- **Write-write conflict — first-committer-wins.** If two
+  concurrent transactions change the same row, the second
+  COMMIT fails with **40001 (serialization failure)** and that
+  transaction is aborted (its writes are gone); the winner's
+  data stands. The check runs at COMMIT, not at the UPDATE —
+  the losing transaction reads and writes normally until its
+  COMMIT. After a 40001 the transaction is over and the
+  connection is idle again — a commit conflict ends the
+  transaction, it does not leave it aborted (contrast the
+  25P02 aborted state above, which a failed DML statement
+  leaves behind). Verified by
+  a two-connection test.
+- **Transactional WAL + crash recovery.** WAL records now carry
+  an optional transaction id, and a transaction's writes are
+  followed by ONE `commit` record:
+  `{"op":"put","txn":5,"key":"...","value":"..."}` …
+  `{"op":"commit","txn":5,"count":1}`. The commit record
+  carries the transaction's write count (`count`); on replay,
+  if the buffered write count for a transaction does not match
+  its commit record's count, the whole transaction is discarded
+  (a torn WAL line can no longer silently half-commit a
+  transaction) and the discard is counted in stats. Replay
+  applies a transaction's records ONLY when its commit record
+  appears later in the file; records of a transaction with no
+  commit record (crash before commit, or abort) are discarded
+  with a warning naming the discarded transaction ids. Records
+  WITHOUT a txn id are V0.5 records and still apply
+  immediately. **Migration: V0.5 data opens fine** — old values
+  decode as a single version with `xmin = 0` (committed before
+  the beginning of time), old tombstones as a single delete
+  version. **Envelope collision (fixed, see "V0.6 review
+  fixes"):** a V0.5 value that merely *looks* like an MVCC
+  envelope is no longer trusted as one — new envelopes carry
+  an unambiguous `ZENO-MVCC2:` prefix, and an old-style
+  envelope is trusted only if every id in it is below the
+  bound the engine computes at open (from `meta.json` / the
+  WAL) and the chain is well-formed; anything else reads back
+  as the plain value it always was. **Format note: this
+  is a prototype format change, not a stable on-disk promise —
+  old data reads, but V0.6 does not promise V0.7 will read V0.6
+  files.** Transaction ids are allocated monotonically and
+  persisted in `meta.json`, and are also recovered from the
+  WAL/SSTables on open, so a restart never reuses an id that a
+  stored version already carries. Verified by a kill -9 test:
+  the server is killed mid-transaction and after restart only
+  committed rows are there.
+- **Version storage: chains in the value slot.** Each key's
+  versions live as a JSON envelope in its value
+  (`ZENO-MVCC2:{"__zeno_mvcc":1,"versions":[{"xmin":..,"xmax":..,"v":..}]}`),
+  so the memtable, SSTables, Bloom filter, flush and compaction
+  needed no new on-disk structures — the envelope travels with
+  the key. Flush writes only the versions that are new since
+  the last flush (a version is stored exactly once, however
+  many flushes happen), and the read path dedupes overlapping
+  chains by `xmin` (newest copy wins), so chains no longer grow
+  with every flush. Compaction merges chains and prunes each to
+  its newest version (and drops keys whose newest version is a
+  delete); it refuses to run while a transaction is active,
+  because pruning is only safe with no live snapshot. The
+  committed-transaction set is kept in memory and is pruned by
+  VACUUM / compaction to the oldest live snapshot's watermark
+  (see "V0.6 review fixes"); a restart rebuilds it from a
+  watermark (every id below `next_txn_id` at open counts as
+  committed, because replay only applies committed
+  transactions). Aborted ids are tracked separately, so a
+  below-watermark id is never mistaken for committed.
+- **Honest costs and limits of this design (read before
+  relying on it):** an autocommit `put`/`del` now writes TWO
+  WAL records (write + commit marker) and fsyncs twice, not
+  once. A transaction that INSERTs reserves its row ids at
+  statement time, so a ROLLBACK leaves gaps in the row ids
+  (never a reuse). A multi-row autocommit UPDATE/DELETE is one
+  implicit transaction (one txn id, one commit marker — see
+  "V0.6 review fixes"); inside a transaction it commits
+  atomically, as before. DDL inside a transaction fails with
+  0A000 (the table registry is not versioned), and a table
+  created by another connection after BEGIN is invisible inside
+  the transaction (42P01) — the transaction only sees the
+  tables that existed at BEGIN. A flush failure after a commit
+  is logged, not reported as a failed commit (the commit was
+  already durable in the WAL). COMMIT/ROLLBACK with no
+  transaction open fail with 25P01 and
+  a nested BEGIN fails with 25001 — PostgreSQL would warn and
+  carry on; Zeno reports the mistake instead. No savepoints, no
+  two-phase commit, no SERIALIZABLE, no READ COMMITTED.
+
+## V0.6 review fixes (post-review hardening)
+
+A review of V0.6 found 2 blockers, 6 must-fix items and 7
+minors; all are fixed except the documented residuals below.
+Each has a regression test (see "Tests").
+
+- **B1 — flush no longer duplicates version chains.** Flush
+  writes only the versions that are new since the last flush,
+  and the read path dedupes overlapping chains by `xmin`
+  (newest copy wins). A key with 5 versions keeps a chain of
+  5 across any number of flushes.
+- **B2 — portals die with the transaction.** Every COMMIT /
+  ROLLBACK (and a disconnect-rollback) closes all of that
+  connection's portals, so a suspended portal can no longer
+  serve rows from a rolled-back transaction; resuming one
+  fails with 26000. Portals bound outside a transaction
+  survive transaction ends (documented deviation).
+- **M1 — envelope collision.** New envelopes carry the
+  `ZENO-MVCC2:` prefix; old-style envelopes are trusted only
+  below the open-time id bound and only when well-formed.
+- **M2 — aborted-transaction state (25P02).** See "What is new
+  in V0.6" above.
+- **M3 — COMMIT no longer reports a flush failure as a failed
+  commit.** Flush errors after commit (and after autocommit
+  writes) are logged, not returned.
+- **M4 — WAL per-transaction integrity.** The commit record
+  carries the write count; a mismatch on replay discards the
+  whole transaction. This covers torn puts and torn deletes
+  (a corrupt delete can no longer resurrect an old value).
+- **M5 — online VACUUM.** `VACUUM` is now a SQL statement
+  (and a `vacuum` CLI command): it prunes, per key, every
+  version invisible to all live snapshots, keeps the newest
+  version overall plus the newest version each live snapshot
+  can see, drops a key only when its newest kept version is a
+  delete and no live snapshot exists, and prunes the
+  committed/aborted transaction sets to the oldest live
+  snapshot's watermark. There is no background or periodic
+  vacuum thread — an operator or client runs `VACUUM`
+  explicitly. A transaction that executes no statement for 5
+  minutes (default; `ZENO_TXN_IDLE_TIMEOUT_SECS` overrides it)
+  is rolled back automatically, so an abandoned transaction
+  cannot pin its snapshot forever. The offline CLI `compact`
+  still refuses to run while the server holds the lock.
+- **M6 — autocommit multi-row UPDATE/DELETE is atomic.** All
+  rows of one statement go in a single implicit transaction
+  with one commit marker.
+- **Minors (m1–m7), all fixed:** m1 DDL snapshot isolation
+  (42P01 for tables created after BEGIN; Describe/Bind do not
+  enforce it — only Execute does); m2 raw KV `put`/`delete`
+  reject keys starting with `table:` / `doc:` (tables and
+  documents use internal paths); m3 a Drop guard rolls back
+  an abandoned transaction even if the connection handler
+  panics; m4 aborted ids are tracked separately from the
+  committed watermark; m5 idle-transaction timeout (see M5);
+  m6 skipped corrupt rows in `SELECT` are warned about and
+  counted (`skipped_rows` in stats); m7 a `del` WAL record
+  with a value is now corrupt, as is a `commit` record without
+  a txn id or with a value.
+- **Known residuals (V0.7 candidates):** a V0.5 value that is
+  byte-identical to an old-style envelope whose ids are all
+  below the open-time bound cannot be distinguished from a
+  real old envelope (the new prefixed format removes the
+  problem going forward); `meta.json` is only saved on a
+  graceful shutdown, so a `kill -9` after a flush with a stale
+  meta file can misread an old envelope (accepted — see
+  `src/engine.rs`); Describe/Bind do not enforce the DDL
+  snapshot (only Execute does); portals bound outside a
+  transaction survive transaction ends; there is no background
+  vacuum and no automatic snapshot-pinning bound beyond the
+  idle timeout.
 
 ## What is new in V0.5
 
@@ -387,13 +581,23 @@ no external database engine. V0.5 hardens the V0.4 server: **TLS**,
   demonstrated and tested (used by `demo.sh` and the lock tests).
 - Version is now **0.2.0** (Cargo.toml, CLI, README).
 
-## What works in V0.5
+## What works in V0.6
 
+- **MVCC transactions (snapshot isolation)** — `BEGIN` /
+  `COMMIT` / `ROLLBACK` (+ `START TRANSACTION`, `END`,
+  `ABORT`) over Simple Query and the extended protocol, one
+  transaction per connection; `UPDATE` (one SET assignment);
+  write-write conflict aborts the second committer with 40001
+  (first-committer-wins); WAL + crash recovery keeps only
+  committed transactions (see "What is new in V0.6" for the
+  isolation level, the WAL format, and the honest limits).
+  ReadyForQuery is 'T' inside a transaction, 'I' otherwise.
 - **PostgreSQL wire protocol** — `zeno serve` (see "What is new in
   V0.4" above). `psql` / libpq clients connect over TCP on
-  127.0.0.1 and run CREATE TABLE / INSERT / SELECT (one
-  `column=value` WHERE filter) / DELETE, over Simple Query AND the
-  extended protocol (prepared statements, `$1` params, named +
+  127.0.0.1 and run CREATE TABLE / INSERT / UPDATE / SELECT (one
+  `column=value` WHERE filter) / DELETE / BEGIN / COMMIT /
+  ROLLBACK, over Simple Query AND the extended protocol
+  (prepared statements, `$1` params, named +
   unnamed statements/portals, PortalSuspended resume). **Auth:
   trust auth (no password) while no users are configured, SCRAM-
   SHA-256 password auth once a user exists — local prototype only
@@ -433,7 +637,11 @@ no external database engine. V0.5 hardens the V0.4 server: **TLS**,
   fsynced *before* it touches the memtable. On open, the WAL is replayed,
   so data written before a crash comes back. Format: one JSON record per
   line, `{"op":"put","key":"...","value":"..."}` or
-  `{"op":"del","key":"..."}`. A torn/corrupt line is counted and
+  `{"op":"del","key":"..."}` for V0.5 records; V0.6 adds an optional
+  `"txn":<id>` to write records and a `{"op":"commit","txn":<id>}`
+  marker — only transactions with a commit marker are replayed
+  (see "What is new in V0.6"). An autocommit write is two records
+  (write + commit), i.e. two fsyncs. A torn/corrupt line is counted and
   reported (see "What was new in V0.2"), not silently hidden: the
   warning names its line number(s), and the count is cumulative
   across opens (persisted in `meta.json`, counted once per line).
@@ -453,7 +661,8 @@ no external database engine. V0.5 hardens the V0.4 server: **TLS**,
   tombstone in a newer layer hides the same key in older layers.
 - **Tables** — `CREATE TABLE`-like registration (column names stored in
   `tables.json`), `INSERT` rows, `SELECT` with an optional
-  `column=value` filter. Rows are stored as keys
+  `column=value` filter, `UPDATE` (one SET assignment, V0.6),
+  `DELETE`. Rows are stored as keys
   `table:<name>:<row-id>`. **There is no real SQL parser** — SELECT is a
   simple scan filter. `INSERT` persists the next row id (atomically
   written `tables.json`) before writing the row, so a crash cannot
@@ -467,7 +676,9 @@ no external database engine. V0.5 hardens the V0.4 server: **TLS**,
   value. `find` is a **linear scan** over the collection in V0.4 — no
   index yet.
 - **Compaction** — merges all SSTables into one, dropping overwritten
-  versions and tombstoned keys.
+  versions and tombstoned keys. V0.6: the merge is over version
+  chains — each key's chain is pruned to its newest version — and
+  compaction refuses to run while a transaction is active.
 - **Crash recovery (process crash / restart only)** — proven by the
   demo: stop the process, reopen the same data directory, and the
   data is still there. WAL, SSTable, `tables.json` and `meta.json`
@@ -510,17 +721,23 @@ no external database engine. V0.5 hardens the V0.4 server: **TLS**,
   sends it only on Describe); Parse checks syntax and parameter
   types only, table/column existence is checked at
   Bind/Describe/Execute; a bound SQL NULL becomes the empty string (Zeno has no NULLs).
-- **No MVCC snapshots / transactions.** Reads see the latest value;
-  there is no `BEGIN`/`COMMIT`/`ROLLBACK`, no snapshot isolation.
+- **No MVCC beyond snapshot isolation.** Transactions are snapshot
+  isolation only: no savepoints, no two-phase commit, no DDL
+  inside a transaction, no SERIALIZABLE, no READ COMMITTED (see
+  "What is new in V0.6"). Old versions are vacuumed only by an
+  explicit `VACUUM` statement (or the `vacuum` / `compact` CLI
+  commands when the server is stopped) — there is no background
+  or periodic vacuum thread, and the committed-transaction set
+  is pruned only by VACUUM / compaction.
 - **No real SQL parser.** No `JOIN`, no `WHERE` beyond one
-  `column=value`, no `UPDATE`/`DELETE` on tables via the CLI (SQL
-  DELETE exists over the wire protocol), no `ORDER BY` / `LIMIT`.
-  Everyday DDL/SQL that real tools emit is NOT accepted yet and
-  returns a 42601 syntax error, so psql/DBeaver users should keep
-  to the subset in "How to run": `VARCHAR(10)` or `SERIAL PRIMARY
-  KEY` in a column definition, a column list in `INSERT INTO t (a,
-  b) VALUES (...)`, `WHERE id > 1` (only `=` is supported), and
-  `ORDER BY` / `LIMIT` are all unsupported.
+  `column=value`, no `UPDATE` with more than one SET assignment,
+  no `ORDER BY` / `LIMIT`. Everyday DDL/SQL that real tools emit
+  is NOT accepted yet and returns a 42601 syntax error, so
+  psql/DBeaver users should keep to the subset in "How to run":
+  `VARCHAR(10)` or `SERIAL PRIMARY KEY` in a column definition,
+  a column list in `INSERT INTO t (a, b) VALUES (...)`,
+  `WHERE id > 1` (only `=` is supported), and `ORDER BY` /
+  `LIMIT` are all unsupported.
 - **No secondary index on documents.** `doc find` scans the whole
   collection linearly.
 - **No multi-node / replication / clustering.** Single node only.
@@ -537,8 +754,9 @@ no external database engine. V0.5 hardens the V0.4 server: **TLS**,
   all fixed in V0.5 (see "What is new in V0.5"). What remains:
   the lockout is in-memory only (restart resets it), the TLS
   cert is self-signed with no channel binding, and there is
-  still no MVCC, no real SQL parser, and no multi-node support
-  (see the other bullets in this section).
+  still no real SQL parser, no savepoints / 2PC /
+  SERIALIZABLE, and no multi-node support (see the other
+  bullets in this section).
 - **Not production-ready.** No independent audit, no benchmark against
   other databases. No speed claims are made anywhere in this repo.
 
@@ -573,11 +791,12 @@ cargo build --release
 
 # Maintenance
 ./target/release/zeno --data ./my-data flush
+./target/release/zeno --data ./my-data vacuum    # snapshot-safe prune (also as SQL: VACUUM)
 ./target/release/zeno --data ./my-data compact
 ./target/release/zeno --data ./my-data stats
 ./target/release/zeno --data ./my-data hold 5   # diagnostic: hold the lock 5s
 
-# PostgreSQL wire protocol (V0.5) — server keeps running until killed
+# PostgreSQL wire protocol (V0.6) — server keeps running until killed
 ./target/release/zeno --data ./my-data serve --port 5433
 # With TLS (needs a certificate first — see below) and a smaller
 # connection cap than the default 20:
@@ -618,8 +837,21 @@ INSERT INTO users VALUES (1, 'Sanjay', 'Delhi');
 INSERT INTO users VALUES (2, 'Asha', 'Mumbai');
 SELECT * FROM users WHERE city = 'Delhi';
 SELECT id, name FROM users;
+UPDATE users SET city = 'Pune' WHERE id = 2;
 DELETE FROM users WHERE id = 2;
 SELECT * FROM users;
+```
+
+```sql
+-- Transactions (V0.6, snapshot isolation — see "What is new in V0.6"):
+-- inside the transaction, other connections see neither the INSERT
+-- nor the UPDATE until COMMIT; a concurrent COMMIT to the same row
+-- first makes this COMMIT fail with 40001.
+BEGIN;
+INSERT INTO users VALUES (3, 'Ravi', 'Jaipur');
+UPDATE users SET city = 'Agra' WHERE id = 1;
+SELECT * FROM users;   -- this connection sees its own writes
+COMMIT;                -- or ROLLBACK to drop both writes
 ```
 
 Notes for real clients: with no users configured, any
@@ -673,9 +905,8 @@ successful reopen (stale-lock takeover), and a torn WAL line that is
 warned about and counted in `stats` while the data stays safe — and
 the V0.3 addition: `zeno serve` on 127.0.0.1:5433 with a raw-TCP
 Python client (no `psql` in this sandbox) running CREATE / INSERT /
-SELECT / an unsupported UPDATE (ErrorResponse, connection survives),
-then a second server on the same data directory refused by the lock —
-and the V0.4 addition: the same client pipelines
+SELECT / UPDATE, then a second server on the same data directory
+refused by the lock — and the V0.4 addition: the same client pipelines
 Parse+Describe+Bind+Describe+Execute+Sync with a `$1` parameter,
 fetches rows one at a time (PortalSuspended), then sets a password
 with `zeno user set-password` and logs in with a full SCRAM-SHA-256
@@ -686,7 +917,12 @@ rejection (28P01, connection closed) — and the V0.5 addition:
 query inside the encrypted stream), then 5 wrong SCRAM logins
 lock the 'ratelimit' user and even the right password is still
 28P01, and a `--max-connections 2` server refuses its 3rd (idle)
-connection with 53300, then lets a new one in once a slot frees up.
+connection with 53300, then lets a new one in once a slot frees up —
+and the V0.6 addition (section 12, fresh data dir, two connections):
+BEGIN + INSERT invisible to the other connection until COMMIT
+(snapshot isolation), ROLLBACK undoes an UPDATE, a write-write
+conflict on the same row fails the second COMMIT with 40001, and
+kill -9 mid-transaction loses only the uncommitted row on restart.
 
 ## Tests
 
@@ -696,25 +932,57 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-- 70 unit tests (the 60 from V0.4, plus 10 V0.5 ones: 5 rate-limiter
-  tests — lock at 5 failures, expiry + fresh allowance, success
-  resets the count, per-user/per-IP isolation, delay growth + cap
-  — 4 TLS tests — cert generation writes PEM files + loads,
-  cert/key files are mode 0600, generate refuses to overwrite,
-  load without a cert fails with a "cert generate" hint — and
-  the poisoned-lock recovery test, which injects a real panic
-  while holding a lock and recovers twice)
-- 23 integration tests in `tests/engine_tests.rs` (the 22 from
-  V0.4, plus: 8 concurrent `set-password` processes keep all 8 users)
-- 42 integration tests in `tests/pgwire_tests.rs` (the 37 from
-  V0.4, plus 5 V0.5 ones: a real rustls client does the TLS
-  handshake then CREATE/INSERT over the encrypted stream,
-  `serve --tls` without a cert refuses to start, 5 wrong SCRAM
-  logins lock the account (the right password still 28P01,
-  another user unaffected), an unknown user gets the identical
-  response 6 times in a row, and `--max-connections 2` refuses
-  the 3rd idle connection with 53300 then lets a new one in)
-- 135 tests total, all passing.
+- 99 unit tests (the 80 from V0.5, plus 9 V0.6 ones: 7 MVCC
+  visibility tests — snapshot hides later commits, active-at-BEGIN
+  txns stay invisible, deletes before/after BEGIN, uncommitted
+  and aborted writes invisible, envelope round-trip, legacy value
+  decodes to one visible version — and 2 WAL tests — txn records
+  + commit marker replay in order, a commit without a txn id is
+  corrupt and old V0.5 lines still parse — plus 10 review-fix
+  ones: prefixed envelope round-trip, forged huge-xmin envelope
+  rejected, xid-above-bound envelope rejected, malformed chains
+  are plain data, duplicate `xmin = 0` is a legal legacy chain,
+  chain dedupe (newest copy wins, insertion order kept),
+  `del` with a value is corrupt, `commit` needs a txn id and no
+  value, skipped corrupt rows are counted, abandoned
+  transactions roll back on Drop)
+- 40 integration tests in `tests/engine_tests.rs` (the 23 from
+  V0.5, plus 7 V0.6 ones: commit makes writes visible /
+  rollback hides them, snapshot isolation hides later commits,
+  write-write conflict aborts the second committer, table
+  UPDATE + DELETE inside a transaction with rollback, WAL
+  replay recovers only committed transactions, legacy WAL
+  records without a txn id replay as committed, txn ids survive
+  flush + restart — plus 10 review-fix ones: flush does not
+  duplicate the version chain, envelope-shaped legacy values
+  are plain data, a plausible old envelope is still trusted
+  (migration), commit succeeds when the flush fails, WAL replay
+  discards a transaction with a torn put / a torn delete,
+  VACUUM prunes old versions but keeps live snapshots, VACUUM
+  drops a deleted key with no snapshot needing it, autocommit
+  UPDATE/DELETE is one WAL transaction, reserved `table:` /
+  `doc:` prefixes are rejected for raw puts). Two V0.5 tests changed line numbers only:
+  an autocommit `put` now writes two WAL records (write +
+  commit marker), so the corrupt lines the tests append land
+  on lines 3 and 5 instead of 2 and 3.
+- 62 integration tests in `tests/pgwire_tests.rs` (the 48 from
+  V0.5, plus 9 V0.6 ones: snapshot isolation across two
+  connections, rollback hides writes, UPDATE visible only after
+  commit, write-write conflict returns 40001, transaction
+  errors (25P01 / 25001 / DDL-in-txn 0A000), multi-statement
+  BEGIN/INSERT/COMMIT in one Simple Query, BEGIN/COMMIT over the
+  extended protocol with a bound parameter, disconnect rolls
+  back, kill -9 crash recovery keeps only committed data — plus
+  5 review-fix ones: aborted-transaction state returns 25P02
+  until ROLLBACK, portal cache dies with the transaction,
+  DDL created after BEGIN is invisible in the transaction,
+  idle-transaction timeout rolls back, VACUUM prunes versions
+  and keeps a live snapshot). One
+  V0.5 test changed deliberately: UPDATE is supported now, so
+  the "unsupported SQL" test asserts UPDATE succeeds (UPDATE 1)
+  and uses DROP TABLE for the 0A000 case instead; one extended
+  Parse test does the same.
+- 201 tests total, all passing.
 
 **How the wire protocol is verified without `psql`:** `psql` is not
 installed in this sandbox, so `tests/pgwire_tests.rs` builds the
@@ -747,7 +1015,7 @@ src/
 tests/
   engine_tests.rs   integration tests (each in its own temp directory)
   pgwire_tests.rs   wire-protocol tests: raw-TCP client vs a real `zeno serve` (+ a real rustls TLS client)
-demo.sh        end-to-end demo incl. restart / crash-recovery proof + V0.2 lock/WAL demos + V0.3 serve demo + V0.4 extended-protocol + SCRAM demo + V0.5 TLS + rate-limit + connection-limit demo
+demo.sh        end-to-end demo incl. restart / crash-recovery proof + V0.2 lock/WAL demos + V0.3 serve demo + V0.4 extended-protocol + SCRAM demo + V0.5 TLS + rate-limit + connection-limit demo + V0.6 MVCC transactions demo
 ```
 
 ## License

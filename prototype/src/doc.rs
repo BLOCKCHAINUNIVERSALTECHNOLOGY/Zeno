@@ -31,7 +31,7 @@ impl DocStore {
             return Err("a document must be a JSON object".to_string());
         }
         engine
-            .put(&doc_key(collection, id), json)
+            .put_internal(&doc_key(collection, id), json)
             .map_err(|e| e.to_string())
     }
 

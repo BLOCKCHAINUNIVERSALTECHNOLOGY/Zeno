@@ -3,12 +3,14 @@
 // Each test uses its own temp directory so tests never touch each
 // other's data and never touch the user's real data directory.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use zeno::bloom::BloomFilter;
 use zeno::doc::DocStore;
 use zeno::engine::Engine;
 use zeno::sstable::{sstable_path, SsTable};
 use zeno::table::TableStore;
+use zeno::txn::decode_chain;
+use zeno::wal::WalRecord;
 
 fn tmp_dir(name: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
@@ -507,7 +509,10 @@ fn wal_corrupt_lines_cumulative_across_flush_and_reopen() {
         let mut e = Engine::open(&dir).unwrap();
         e.put("good-1", "v1").unwrap();
     }
-    // Corrupt line 2, then a valid record on line 3.
+    // Corrupt line 3, then a valid record on line 4. (V0.6: one
+    // autocommit `put` writes TWO WAL records — the write plus a
+    // commit marker — so the first put occupies lines 1-2, not
+    // just line 1.)
     use std::io::Write as _;
     {
         let mut f = std::fs::OpenOptions::new()
@@ -526,7 +531,7 @@ fn wal_corrupt_lines_cumulative_across_flush_and_reopen() {
     assert_eq!(e2.get("good-1"), Some("v1".to_string()));
     assert_eq!(e2.get("good-2"), Some("v2".to_string()));
     assert_eq!(e2.stats().wal_corrupt_lines, 1);
-    assert_eq!(e2.stats().wal_corrupt_line_numbers, vec![2]);
+    assert_eq!(e2.stats().wal_corrupt_line_numbers, vec![3]);
     drop(e2);
 
     // Reopening the SAME WAL again must NOT count the same corrupt
@@ -537,7 +542,7 @@ fn wal_corrupt_lines_cumulative_across_flush_and_reopen() {
         1,
         "replaying the same WAL must not double-count its corrupt lines"
     );
-    assert_eq!(e2b.stats().wal_corrupt_line_numbers, vec![2]);
+    assert_eq!(e2b.stats().wal_corrupt_line_numbers, vec![3]);
     drop(e2b);
 
     // Now flush (clears the WAL file) and reopen.
@@ -573,6 +578,8 @@ fn wal_corrupt_middle_line_is_counted_and_data_safe() {
         e.put("good-2", "v2").unwrap();
     }
     // Append a corrupt line in the MIDDLE, then a valid record after it.
+    // (V0.6: two autocommit puts occupy lines 1-4 — write + commit
+    // marker each — so the garbage lands on line 5, not line 3.)
     use std::io::Write as _;
     {
         let mut f = std::fs::OpenOptions::new()
@@ -599,8 +606,8 @@ fn wal_corrupt_middle_line_is_counted_and_data_safe() {
     );
     assert_eq!(
         e2.stats().wal_corrupt_line_numbers,
-        vec![3],
-        "the corrupt line was line 3 of wal.log"
+        vec![5],
+        "the corrupt line was line 5 of wal.log"
     );
     cleanup(&dir);
 }
@@ -914,5 +921,704 @@ fn concurrent_set_password_keeps_all_users() {
         );
     }
     assert_eq!(users.len(), 8, "all eight users must survive: {users:?}");
+    cleanup(&dir);
+}
+
+// ---------------------------------------------------------------------
+// V0.6 tests: MVCC transactions (snapshot isolation).
+// ---------------------------------------------------------------------
+
+#[test]
+fn txn_commit_makes_writes_visible_and_rollback_hides_them() {
+    let dir = tmp_dir("txn-basic");
+    let mut e = Engine::open(&dir).unwrap();
+    // Begin: own writes are visible to the transaction itself...
+    let txn = e.begin();
+    e.txn_put(txn, "k1", "v1").unwrap();
+    assert_eq!(e.txn_get(txn, "k1").unwrap(), Some("v1".to_string()));
+    // ...but invisible to everyone else (an autocommit read).
+    assert_eq!(e.get("k1"), None, "uncommitted data must be invisible");
+    // Commit: now everyone sees it.
+    e.commit(txn).unwrap();
+    assert_eq!(e.get("k1"), Some("v1".to_string()));
+
+    // Rollback: nothing survives.
+    let txn2 = e.begin();
+    e.txn_put(txn2, "k2", "v2").unwrap();
+    e.txn_delete(txn2, "k1").unwrap();
+    assert_eq!(
+        e.txn_get(txn2, "k1").unwrap(),
+        None,
+        "own delete visible to self"
+    );
+    e.rollback(txn2).unwrap();
+    assert_eq!(e.get("k2"), None, "rolled-back insert must be gone");
+    assert_eq!(
+        e.get("k1"),
+        Some("v1".to_string()),
+        "rolled-back delete must not take effect"
+    );
+    drop(e);
+    cleanup(&dir);
+}
+
+#[test]
+fn txn_snapshot_isolation_hides_later_commits() {
+    let dir = tmp_dir("txn-snapshot");
+    let mut e = Engine::open(&dir).unwrap();
+    e.put("a", "old").unwrap();
+    // T1 begins, then another writer commits a new value...
+    let t1 = e.begin();
+    e.put("a", "new").unwrap();
+    e.put("b", "brand-new").unwrap();
+    // ...but T1 still sees the world as of BEGIN.
+    assert_eq!(
+        e.txn_get(t1, "a").unwrap(),
+        Some("old".to_string()),
+        "a snapshot must not see data committed after BEGIN"
+    );
+    assert_eq!(
+        e.txn_get(t1, "b").unwrap(),
+        None,
+        "a snapshot must not see rows created after BEGIN"
+    );
+    // A fresh read sees the new data.
+    assert_eq!(e.get("a"), Some("new".to_string()));
+    assert_eq!(e.get("b"), Some("brand-new".to_string()));
+    // Committing a read-only transaction changes nothing.
+    e.commit(t1).unwrap();
+    assert_eq!(e.get("a"), Some("new".to_string()));
+    drop(e);
+    cleanup(&dir);
+}
+
+#[test]
+fn txn_write_write_conflict_aborts_second_committer() {
+    use zeno::txn::CommitError;
+    let dir = tmp_dir("txn-conflict");
+    let mut e = Engine::open(&dir).unwrap();
+    e.put("row", "v0").unwrap();
+    // Two transactions begin on the same snapshot and both change
+    // the same key: first-committer-wins.
+    let t1 = e.begin();
+    let t2 = e.begin();
+    e.txn_put(t1, "row", "from-t1").unwrap();
+    e.txn_put(t2, "row", "from-t2").unwrap();
+    e.commit(t1).unwrap();
+    assert_eq!(e.get("row"), Some("from-t1".to_string()));
+    let err = e.commit(t2).unwrap_err();
+    assert!(
+        matches!(err, CommitError::Conflict(_)),
+        "second committer must get a conflict, got: {err}"
+    );
+    // The loser's write is gone; the winner's stands.
+    assert_eq!(e.get("row"), Some("from-t1".to_string()));
+    // The aborted transaction is gone: no further operations on it.
+    assert!(e.txn_put(t2, "row", "again").is_err());
+    drop(e);
+    cleanup(&dir);
+}
+
+#[test]
+fn txn_table_update_and_delete_with_rollback() {
+    let dir = tmp_dir("txn-table");
+    let mut e = Engine::open(&dir).unwrap();
+    let mut tables = TableStore::open(&dir).unwrap();
+    tables
+        .create_table("users", vec!["id".to_string(), "city".to_string()])
+        .unwrap();
+    tables
+        .insert(&mut e, "users", vec!["1".to_string(), "Delhi".to_string()])
+        .unwrap();
+    // Inside a transaction: UPDATE is visible to self, DELETE
+    // removes the row for self — nobody else sees either yet.
+    let txn = e.begin();
+    let updated = tables
+        .update_txn(&mut e, txn, "users", "city", "Mumbai", None)
+        .unwrap();
+    assert_eq!(updated, 1);
+    let rows = tables.select_txn(&mut e, txn, "users", None).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1.get("city").unwrap(), "Mumbai");
+    let rows_outside = tables.select(&mut e, "users", None).unwrap();
+    assert_eq!(
+        rows_outside[0].1.get("city").unwrap(),
+        "Delhi",
+        "uncommitted UPDATE must be invisible outside the txn"
+    );
+    let deleted = tables.delete_txn(&mut e, txn, "users", None).unwrap();
+    assert_eq!(deleted, 1);
+    assert!(tables
+        .select_txn(&mut e, txn, "users", None)
+        .unwrap()
+        .is_empty());
+    // Rollback: the row comes back, UPDATE and DELETE both undone.
+    e.rollback(txn).unwrap();
+    let rows = tables.select(&mut e, "users", None).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1.get("city").unwrap(), "Delhi");
+    drop(e);
+    cleanup(&dir);
+}
+
+#[test]
+fn wal_replay_recovers_only_committed_txns() {
+    // Hand-write WAL records: txn 900 commits, txn 901 never
+    // does (crash before its commit marker). On reopen only 900's
+    // data may come back — and the next txn id must stay above
+    // both, so neither id is ever reused.
+    use std::io::Write as _;
+    use zeno::wal::WalRecord;
+    let dir = tmp_dir("txn-wal-replay");
+    {
+        let mut e = Engine::open(&dir).unwrap();
+        e.put("committed-before", "yes").unwrap();
+    }
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("wal.log"))
+            .unwrap();
+        writeln!(
+            f,
+            "{}",
+            serde_json::to_string(&WalRecord::put_txn(900, "txn-committed", "c")).unwrap()
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "{}",
+            serde_json::to_string(&WalRecord::commit(900)).unwrap()
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "{}",
+            serde_json::to_string(&WalRecord::put_txn(901, "txn-crashed", "x")).unwrap()
+        )
+        .unwrap();
+        // No commit record for 901: the crash.
+    }
+    let mut e2 = Engine::open(&dir).unwrap();
+    assert_eq!(e2.get("committed-before"), Some("yes".to_string()));
+    assert_eq!(
+        e2.get("txn-committed"),
+        Some("c".to_string()),
+        "a committed txn must survive replay"
+    );
+    assert_eq!(
+        e2.get("txn-crashed"),
+        None,
+        "an uncommitted txn must be discarded on replay"
+    );
+    assert!(
+        e2.next_txn_id() > 901,
+        "next txn id must stay above every id seen in the WAL, got {}",
+        e2.next_txn_id()
+    );
+    drop(e2);
+    cleanup(&dir);
+}
+
+#[test]
+fn legacy_wal_records_without_txn_replay_as_committed() {
+    // A genuine V0.5 WAL file has no "txn" field at all. It must
+    // still open, and its rows must be readable (as pre-MVCC data,
+    // visible to every snapshot).
+    use std::io::Write as _;
+    let dir = tmp_dir("txn-legacy-wal");
+    {
+        let mut f = std::fs::File::create(dir.join("wal.log")).unwrap();
+        writeln!(
+            f,
+            "{{\"op\":\"put\",\"key\":\"old-key\",\"value\":\"old-val\"}}"
+        )
+        .unwrap();
+        writeln!(f, "{{\"op\":\"put\",\"key\":\"gone\",\"value\":\"x\"}}").unwrap();
+        writeln!(f, "{{\"op\":\"del\",\"key\":\"gone\"}}").unwrap();
+    }
+    let mut e = Engine::open(&dir).unwrap();
+    assert_eq!(e.get("old-key"), Some("old-val".to_string()));
+    assert_eq!(e.get("gone"), None);
+    // And new MVCC writes work on top of the legacy data.
+    let txn = e.begin();
+    e.txn_put(txn, "old-key", "new-val").unwrap();
+    e.commit(txn).unwrap();
+    assert_eq!(e.get("old-key"), Some("new-val".to_string()));
+    drop(e);
+    cleanup(&dir);
+}
+
+#[test]
+fn txn_ids_survive_flush_and_restart() {
+    // After a flush the WAL is cleared, so the next txn id must
+    // come from meta.json / the SSTable envelopes — never reuse
+    // an id that an SSTable version already carries (a reused id
+    // would read as "aborted" and hide committed data).
+    let dir = tmp_dir("txn-id-restart");
+    let first_txn;
+    {
+        let mut e = Engine::open(&dir).unwrap();
+        let txn = e.begin();
+        first_txn = txn;
+        e.txn_put(txn, "k", "v").unwrap();
+        e.commit(txn).unwrap();
+        e.flush().unwrap(); // WAL cleared; version lives in an SSTable now
+    }
+    let mut e2 = Engine::open(&dir).unwrap();
+    assert_eq!(
+        e2.get("k"),
+        Some("v".to_string()),
+        "flushed data must survive"
+    );
+    let txn2 = e2.begin();
+    assert!(
+        txn2 > first_txn,
+        "a restarted engine must not reuse txn id {first_txn}, got {txn2}"
+    );
+    e2.rollback(txn2).unwrap();
+    drop(e2);
+    cleanup(&dir);
+}
+
+/// Count the versions of `key` in every SSTable on disk (the
+/// envelopes as literally stored, not the merged read path).
+fn sstable_chain_lengths(dir: &Path, key: &str) -> Vec<usize> {
+    let mut lengths = Vec::new();
+    let mut names: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("sst-") && n.ends_with(".sst"))
+        .collect();
+    names.sort();
+    for name in names {
+        let text = std::fs::read_to_string(dir.join(&name)).unwrap();
+        for line in text.lines().skip(2) {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+            if entry["k"].as_str() == Some(key) {
+                let value = entry["v"].as_str().map(str::to_string);
+                lengths.push(decode_chain(value.as_deref()).len());
+            }
+        }
+    }
+    lengths
+}
+
+#[test]
+fn flush_does_not_duplicate_version_chain() {
+    // B1: the old flush wrote the memtable's WHOLE envelope
+    // (the full chain) into every new SSTable while the old
+    // SSTable kept its copy, so the chain doubled on every flush
+    // (2, 3, 6, 12, 24 entries for 5 versions). A flush must
+    // write only the delta.
+    let dir = tmp_dir("flush-no-dupe");
+    let mut e = Engine::open(&dir).unwrap();
+    for (i, v) in ["v1", "v2", "v3", "v4", "v5"].iter().enumerate() {
+        e.put("k", v).unwrap();
+        e.flush().unwrap();
+        assert_eq!(
+            e.version_chain_len("k"),
+            i + 1,
+            "after {} version(s) the chain must have exactly that many versions",
+            i + 1
+        );
+        assert_eq!(e.get("k"), Some(v.to_string()));
+    }
+    // Each SSTable on disk holds exactly one new version.
+    let lengths = sstable_chain_lengths(&dir, "k");
+    assert_eq!(
+        lengths.iter().sum::<usize>(),
+        5,
+        "5 versions must be stored as 5 entries across all SSTables, got {lengths:?}"
+    );
+    assert!(
+        lengths.iter().all(|&n| n == 1),
+        "each flush must store only its delta: {lengths:?}"
+    );
+    // Ten more flushes with no new writes change nothing.
+    for _ in 0..10 {
+        e.flush().unwrap();
+    }
+    assert_eq!(e.version_chain_len("k"), 5);
+    assert_eq!(e.get("k"), Some("v5".to_string()));
+    // And the chain still reads right after a reopen.
+    drop(e);
+    let mut e2 = Engine::open(&dir).unwrap();
+    assert_eq!(e2.version_chain_len("k"), 5);
+    assert_eq!(e2.get("k"), Some("v5".to_string()));
+    drop(e2);
+    cleanup(&dir);
+}
+
+#[test]
+fn envelope_shaped_legacy_values_are_plain_data() {
+    // M1: a V0.5-style SSTable whose raw values happen to look
+    // like MVCC envelopes must NOT be misread as version chains
+    // — no injected "pwned" value, no hidden rows, and no
+    // inflated next_txn_id.
+    let dir = tmp_dir("envelope-collision");
+    let forged_pwned =
+        r#"{"__zeno_mvcc":1,"versions":[{"xmin":999999,"xmax":null,"value":"pwned"}]}"#;
+    let forged_null = r#"{"__zeno_mvcc":1,"versions":[{"xmin":0,"value":null}]}"#;
+    let forged_hidden = r#"{"__zeno_mvcc":1,"versions":[{"xmin":0,"xmax":1,"value":"hidden"}]}"#;
+    let mut lines = vec![
+        "ZENO-SSTABLE-1".to_string(),
+        "ff".repeat(1024),
+        serde_json::to_string(&serde_json::json!({"k": "k1", "v": forged_pwned})).unwrap(),
+        serde_json::to_string(&serde_json::json!({"k": "k2", "v": forged_null})).unwrap(),
+        serde_json::to_string(&serde_json::json!({"k": "k3", "v": forged_hidden})).unwrap(),
+    ];
+    std::fs::write(dir.join("sst-000001.sst"), lines.join("\n") + "\n").unwrap();
+    lines.clear();
+    // No meta.json, no WAL: a bare V0.5-style directory.
+    let mut e = Engine::open(&dir).unwrap();
+    assert_eq!(
+        e.get("k1"),
+        Some(forged_pwned.to_string()),
+        "the forged envelope must read back as the plain text it is, not 'pwned'"
+    );
+    assert_eq!(
+        e.get("k2"),
+        Some(forged_null.to_string()),
+        "an envelope-shaped null must not delete the row"
+    );
+    assert_eq!(
+        e.get("k3"),
+        Some(forged_hidden.to_string()),
+        "an envelope-shaped hidden value must stay visible"
+    );
+    assert!(
+        e.next_txn_id() < 100,
+        "next_txn_id must not be inflated by the forged xmin 999999, got {}",
+        e.next_txn_id()
+    );
+    drop(e);
+    cleanup(&dir);
+}
+
+#[test]
+fn old_unprefixed_envelope_is_trusted_when_ids_are_plausible() {
+    // M1, migration side: a REAL pre-fix envelope (unprefixed,
+    // written by the old encoder) in a database whose meta.json
+    // proves its ids are plausible must still read correctly —
+    // the bound is a forgery check, not a format break.
+    let dir = tmp_dir("envelope-migration");
+    let old_envelope = r#"{"__zeno_mvcc":1,"versions":[{"xmin":1,"xmax":2,"value":"old"},{"xmin":2,"xmax":null,"value":"new"}]}"#;
+    let lines = [
+        "ZENO-SSTABLE-1".to_string(),
+        "ff".repeat(1024),
+        serde_json::to_string(&serde_json::json!({"k": "k", "v": old_envelope})).unwrap(),
+    ];
+    std::fs::write(dir.join("sst-000001.sst"), lines.join("\n") + "\n").unwrap();
+    std::fs::write(
+        dir.join("meta.json"),
+        r#"{"puts":0,"gets":0,"flushes":0,"compactions":0,"deletes":0,"wal_corrupt_lines":0,"wal_corrupt_lines_current":0,"wal_size_seen":0,"next_txn_id":10}"#,
+    )
+    .unwrap();
+    let mut e = Engine::open(&dir).unwrap();
+    assert_eq!(e.get("k"), Some("new".to_string()));
+    assert_eq!(e.version_chain_len("k"), 2);
+    drop(e);
+    cleanup(&dir);
+}
+
+#[test]
+fn commit_succeeds_when_flush_fails() {
+    // M3: the commit is durable in the WAL before any flush, so
+    // a flush failure must not report the commit as failed (the
+    // old code did exactly that, against its own comment).
+    let dir = tmp_dir("commit-flush-fail");
+    let mut e = Engine::open(&dir).unwrap();
+    // Fill the memtable to the flush threshold inside one
+    // transaction, arm the failure, then commit: the commit must
+    // still return Ok, and the data must be readable.
+    let txn = e.begin();
+    for i in 0..64 {
+        e.txn_put(txn, &format!("k{i:02}"), &format!("v{i}"))
+            .unwrap();
+    }
+    e.set_flush_failure(true);
+    e.commit(txn)
+        .expect("commit must succeed even when its flush fails");
+    assert_eq!(e.get("k00"), Some("v0".to_string()));
+    assert_eq!(e.get("k63"), Some("v63".to_string()));
+    // The flag is consumed: a manual flush now works.
+    e.flush().unwrap();
+    drop(e);
+    // Same for the autocommit put path: 63 puts, arm the failure,
+    // the 64th put triggers the flush and must still return Ok.
+    let mut e2 = Engine::open(&dir).unwrap();
+    for i in 0..63 {
+        e2.put(&format!("p{i:02}"), "x").unwrap();
+    }
+    e2.set_flush_failure(true);
+    e2.put("p63", "x")
+        .expect("put must succeed even when its flush fails");
+    assert_eq!(e2.get("p63"), Some("x".to_string()));
+    drop(e2);
+    cleanup(&dir);
+}
+
+fn write_wal(dir: &Path, lines: &[String]) {
+    std::fs::write(dir.join("wal.log"), lines.join("\n") + "\n").unwrap();
+}
+
+#[test]
+fn wal_replay_discards_txn_with_torn_write() {
+    // M4: a committed transaction whose WAL lost a write line
+    // (torn write) must be discarded WHOLE — never applied
+    // partially. Txn 7 has 2 writes but only 1 survives; txn 8
+    // is intact and must apply.
+    let dir = tmp_dir("wal-torn-txn");
+    let mut lines = vec![
+        serde_json::to_string(&WalRecord::put_txn(7, "k1", "v1")).unwrap(),
+        "{\"op\":\"put\",\"txn\":7,\"key\":\"k2\",\"val".to_string(), // torn line
+        serde_json::to_string(&WalRecord::commit_count(7, 2)).unwrap(),
+        serde_json::to_string(&WalRecord::put_txn(8, "k3", "v3")).unwrap(),
+        serde_json::to_string(&WalRecord::commit_count(8, 1)).unwrap(),
+    ];
+    write_wal(&dir, &lines);
+    lines.clear();
+    let mut e = Engine::open(&dir).unwrap();
+    assert_eq!(
+        e.get("k1"),
+        None,
+        "txn 7 lost a write line, so NONE of it may apply (no partial commit)"
+    );
+    assert_eq!(e.get("k2"), None);
+    assert_eq!(
+        e.get("k3"),
+        Some("v3".to_string()),
+        "the intact transaction must still apply"
+    );
+    assert_eq!(e.stats().wal_discarded_txns, 1);
+    drop(e);
+    cleanup(&dir);
+}
+
+#[test]
+fn wal_replay_discards_txn_with_torn_delete() {
+    // M4, delete side: a torn `del` inside a transaction must not
+    // resurrect the old value by applying the rest of the txn —
+    // the whole transaction goes, so the old value stays because
+    // the transaction never happened, not because the delete was
+    // silently lost.
+    let dir = tmp_dir("wal-torn-del");
+    let lines = [
+        "ZENO-SSTABLE-1".to_string(),
+        "ff".repeat(1024),
+        serde_json::to_string(&serde_json::json!({"k": "k4", "v": "oldval"})).unwrap(),
+    ];
+    std::fs::write(dir.join("sst-000001.sst"), lines.join("\n") + "\n").unwrap();
+    let wal_lines = vec![
+        serde_json::to_string(&WalRecord::del_txn(9, "k4")).unwrap(),
+        "{\"op\":\"put\",\"txn\":9,\"key\":\"k5\",\"val".to_string(), // torn line
+        serde_json::to_string(&WalRecord::commit_count(9, 2)).unwrap(),
+    ];
+    write_wal(&dir, &wal_lines);
+    let mut e = Engine::open(&dir).unwrap();
+    assert_eq!(
+        e.get("k4"),
+        Some("oldval".to_string()),
+        "the torn transaction must not apply its delete either"
+    );
+    assert_eq!(e.get("k5"), None);
+    assert_eq!(e.stats().wal_discarded_txns, 1);
+    drop(e);
+    cleanup(&dir);
+}
+
+#[test]
+fn vacuum_prunes_old_versions_and_committed_set_but_keeps_live_snapshots() {
+    // M5: VACUUM prunes versions no live snapshot can see, and
+    // prunes the committed set to the oldest live snapshot's
+    // watermark — while a live snapshot still sees its own old
+    // version.
+    let dir = tmp_dir("vacuum-live");
+    let mut e = Engine::open(&dir).unwrap();
+    e.put("k", "v1").unwrap();
+    e.flush().unwrap();
+    e.put("k", "v2").unwrap();
+    e.flush().unwrap();
+    e.put("k", "v3").unwrap();
+    e.flush().unwrap();
+    assert_eq!(e.version_chain_len("k"), 3);
+    // A begins: its snapshot sees v3.
+    let txn_a = e.begin();
+    assert_eq!(e.txn_get(txn_a, "k").unwrap(), Some("v3".to_string()));
+    // Two more versions land after A's BEGIN.
+    e.put("k", "v4").unwrap();
+    e.flush().unwrap();
+    e.put("k", "v5").unwrap();
+    e.flush().unwrap();
+    assert_eq!(e.version_chain_len("k"), 5);
+    let committed_before = e.stats().committed_txns;
+    assert!(
+        committed_before >= 5,
+        "committed set must hold the puts: {committed_before}"
+    );
+    // VACUUM while A is live: keep v3 (A's visible version),
+    // v4+v5 (created after A's snapshot) — v1, v2 go.
+    let report = e.vacuum().unwrap();
+    assert_eq!(report.pruned_versions, 2, "only v1 and v2 may be pruned");
+    assert_eq!(e.version_chain_len("k"), 3);
+    assert_eq!(e.get("k"), Some("v5".to_string()));
+    assert_eq!(
+        e.txn_get(txn_a, "k").unwrap(),
+        Some("v3".to_string()),
+        "the live snapshot must still see v3 after VACUUM"
+    );
+    assert!(
+        e.stats().committed_txns < committed_before,
+        "the committed set must shrink: {} -> {}",
+        committed_before,
+        e.stats().committed_txns
+    );
+    // A rolls back; a second VACUUM (no live snapshot) prunes to
+    // the newest version only.
+    e.rollback(txn_a).unwrap();
+    let report = e.vacuum().unwrap();
+    assert_eq!(
+        report.pruned_versions, 2,
+        "v3 and v4 go once no snapshot needs them"
+    );
+    assert_eq!(e.version_chain_len("k"), 1);
+    assert_eq!(e.get("k"), Some("v5".to_string()));
+    assert_eq!(e.stats().committed_txns, 0, "no live txn: the set empties");
+    drop(e);
+    cleanup(&dir);
+}
+
+#[test]
+fn vacuum_drops_deleted_key_when_no_snapshot_needs_it() {
+    let dir = tmp_dir("vacuum-delete");
+    let mut e = Engine::open(&dir).unwrap();
+    e.put("k", "v1").unwrap();
+    e.flush().unwrap();
+    e.put("k", "v2").unwrap();
+    e.flush().unwrap();
+    e.delete("k").unwrap();
+    e.flush().unwrap();
+    assert_eq!(e.version_chain_len("k"), 3);
+    assert_eq!(e.get("k"), None);
+    e.vacuum().unwrap();
+    assert_eq!(
+        e.version_chain_len("k"),
+        0,
+        "a deleted key must be physically gone"
+    );
+    assert!(e.scan_prefix_raw("k").is_empty());
+    drop(e);
+    cleanup(&dir);
+}
+
+fn wal_txn_summary(dir: &Path) -> Vec<serde_json::Value> {
+    let text = std::fs::read_to_string(dir.join("wal.log")).unwrap();
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+#[test]
+fn autocommit_update_and_delete_are_single_wal_transactions() {
+    // M6: one autocommit UPDATE over 3 rows must be ONE txn id
+    // plus ONE commit marker in the WAL — not 3 transactions.
+    let dir = tmp_dir("autocommit-atomic");
+    let mut e = Engine::open(&dir).unwrap();
+    let mut tables = TableStore::open(&dir).unwrap();
+    tables
+        .create_table("u", vec!["id".into(), "city".into()])
+        .unwrap();
+    for (id, city) in [("1", "A"), ("2", "B"), ("3", "C")] {
+        tables
+            .insert(&mut e, "u", vec![id.into(), city.into()])
+            .unwrap();
+    }
+    tables.update(&mut e, "u", "city", "Z", None).unwrap();
+    let records = wal_txn_summary(&dir);
+    let last_commit = records
+        .iter()
+        .rev()
+        .find(|r| r["op"] == "commit")
+        .expect("an UPDATE must end with a commit record");
+    let txn = last_commit["txn"].as_u64().expect("commit needs a txn id");
+    assert_eq!(
+        last_commit["count"],
+        serde_json::json!(3),
+        "commit must count 3 writes"
+    );
+    let writes: Vec<_> = records
+        .iter()
+        .filter(|r| r["txn"].as_u64() == Some(txn) && r["op"] == "put")
+        .collect();
+    assert_eq!(writes.len(), 3, "one txn id must carry all 3 UPDATE writes");
+    assert_eq!(
+        records
+            .iter()
+            .filter(|r| r["txn"].as_u64() == Some(txn) && r["op"] == "commit")
+            .count(),
+        1,
+        "exactly one commit marker for the UPDATE"
+    );
+    let rows = tables.select(&mut e, "u", None).unwrap();
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|(_, r)| r["city"] == "Z"));
+    // Same for DELETE: 3 deletes, one txn, one commit.
+    tables.delete(&mut e, "u", None).unwrap();
+    let records = wal_txn_summary(&dir);
+    let last_commit = records
+        .iter()
+        .rev()
+        .find(|r| r["op"] == "commit")
+        .expect("a DELETE must end with a commit record");
+    let txn = last_commit["txn"].as_u64().unwrap();
+    assert_eq!(last_commit["count"], serde_json::json!(3));
+    assert_eq!(
+        records
+            .iter()
+            .filter(|r| r["txn"].as_u64() == Some(txn) && r["op"] == "del")
+            .count(),
+        3
+    );
+    assert_eq!(tables.select(&mut e, "u", None).unwrap().len(), 0);
+    drop(e);
+    cleanup(&dir);
+}
+
+#[test]
+fn reserved_key_prefixes_are_rejected_for_raw_puts() {
+    // m2: a raw KV put of a `table:` / `doc:` key used to forge
+    // table rows straight past the registry. The public put/del
+    // refuse those prefixes now; the table/document stores still
+    // work through their internal path.
+    let dir = tmp_dir("reserved-prefix");
+    let mut e = Engine::open(&dir).unwrap();
+    assert!(
+        e.put("table:users:00000000000000000099", "forged").is_err(),
+        "a raw put must not forge a table row"
+    );
+    assert!(e.put("doc:profiles:u1", "{}").is_err());
+    assert!(e.delete("table:users:00000000000000000001").is_err());
+    assert_eq!(e.get("table:users:00000000000000000099"), None);
+    // The real stores are unaffected.
+    let mut tables = TableStore::open(&dir).unwrap();
+    tables
+        .create_table("users", vec!["id".into(), "name".into()])
+        .unwrap();
+    tables
+        .insert(&mut e, "users", vec!["1".into(), "Sanjay".into()])
+        .unwrap();
+    assert_eq!(tables.select(&mut e, "users", None).unwrap().len(), 1);
+    DocStore::put(&mut e, "profiles", "u1", r#"{"name":"Sanjay"}"#).unwrap();
+    assert_eq!(
+        DocStore::get(&mut e, "profiles", "u1").as_deref(),
+        Some(r#"{"name":"Sanjay"}"#)
+    );
+    drop(e);
     cleanup(&dir);
 }

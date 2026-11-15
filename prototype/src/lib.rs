@@ -13,4 +13,5 @@ pub mod quarantine;
 pub mod sstable;
 pub mod table;
 pub mod tls;
+pub mod txn;
 pub mod wal;

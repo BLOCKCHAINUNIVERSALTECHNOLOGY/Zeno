@@ -137,6 +137,22 @@ impl Drop for Server {
     }
 }
 
+impl Server {
+    /// Kill the server WITHOUT cleaning up the data directory, so
+    /// a new server can be started on the same directory (a
+    /// restart / crash-recovery test). `mem::forget` skips the
+    /// `Drop` above, which would delete the directory; the caller
+    /// owns cleanup from here (usually by starting a second
+    /// `Server` on the returned directory, whose `Drop` removes it).
+    fn stop_keep_dir(mut self) -> PathBuf {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let dir = self.dir.clone();
+        std::mem::forget(self);
+        dir
+    }
+}
+
 // ---------------------------------------------------------------------
 // Minimal PostgreSQL client: builds frames, parses reply messages.
 // ---------------------------------------------------------------------
@@ -914,9 +930,25 @@ fn unsupported_sql_errors_but_connection_survives() {
     client.query("CREATE TABLE users (id, name)");
     client.query("INSERT INTO users VALUES (1, 'Sanjay')");
 
-    // UPDATE is not in the V0.3 subset: ErrorResponse, then ReadyForQuery.
+    // UPDATE is supported since V0.6: it changes the row and
+    // reports UPDATE 1 (this block used to assert 0A000 when
+    // UPDATE was not in the subset).
     let msgs = client.query("UPDATE users SET name = 'X' WHERE id = 1");
-    let (code, message) = Client::error(&msgs).expect("UPDATE must produce an ErrorResponse");
+    assert!(
+        Client::error(&msgs).is_none(),
+        "UPDATE must succeed in V0.6: {msgs:?}"
+    );
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("UPDATE 1"), "{msgs:?}");
+    let msgs = client.query("SELECT * FROM users");
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![Some("1".to_string()), Some("X".to_string())]],
+        "the row must show the updated name: {msgs:?}"
+    );
+
+    // DROP TABLE is still unsupported: 0A000, then ReadyForQuery.
+    let msgs = client.query("DROP TABLE users");
+    let (code, message) = Client::error(&msgs).expect("DROP TABLE must produce an ErrorResponse");
     assert_eq!(
         code, "0A000",
         "unsupported feature must be 0A000: {message}"
@@ -1681,8 +1713,10 @@ fn extended_parse_rejects_gaps_and_multi_statement() {
     assert_eq!(code, "42601", "{msgs:?}");
 
     // Unsupported statement kind fails at Parse with 0A000.
-    let msgs = client.extended(&[parse_frame("", "UPDATE t SET a = 'x'", &[]), sync_frame()]);
-    let (code, _) = Client::error(&msgs).expect("UPDATE Parse must error");
+    // (V0.6: UPDATE is supported now, so DROP TABLE stands in
+    // for the unsupported kind here.)
+    let msgs = client.extended(&[parse_frame("", "DROP TABLE t", &[]), sync_frame()]);
+    let (code, _) = Client::error(&msgs).expect("DROP TABLE Parse must error");
     assert_eq!(code, "0A000", "{msgs:?}");
 
     // Unsupported declared param type: 0A000.
@@ -2977,4 +3011,564 @@ fn connection_limit_ssl_request_gets_n_then_53300() {
     );
     c2.terminate();
     c1.terminate();
+}
+
+// ---------------------------------------------------------------------
+// V0.6 tests: MVCC transactions over the wire protocol.
+// ---------------------------------------------------------------------
+
+/// ReadyForQuery 'T' means "in a transaction", 'I' means idle.
+fn ready_status(msgs: &[Msg]) -> u8 {
+    match msgs.last() {
+        Some(Msg::ReadyForQuery(status)) => *status,
+        other => panic!("last message must be ReadyForQuery, got {other:?} in {msgs:?}"),
+    }
+}
+
+#[test]
+fn txn_snapshot_isolation_two_connections() {
+    let server = Server::start("txn-isolation");
+    let (mut a, _) = Client::connect(server.port);
+    let (mut b, _) = Client::connect(server.port);
+    a.query("CREATE TABLE users (id, city)");
+    a.query("INSERT INTO users VALUES (1, 'Delhi')");
+
+    // A begins: ReadyForQuery turns 'T'. Its INSERT is visible to
+    // A itself, invisible to B.
+    let msgs = a.query("BEGIN");
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("BEGIN"), "{msgs:?}");
+    assert_eq!(ready_status(&msgs), b'T', "BEGIN must report status 'T'");
+    a.query("INSERT INTO users VALUES (2, 'Mumbai')");
+    assert_eq!(Client::rows(&a.query("SELECT * FROM users")).len(), 2);
+    assert_eq!(
+        Client::rows(&b.query("SELECT * FROM users")).len(),
+        1,
+        "B must not see A's uncommitted row"
+    );
+
+    // A commits: ReadyForQuery back to 'I', and B sees both rows.
+    let msgs = a.query("COMMIT");
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("COMMIT"), "{msgs:?}");
+    assert_eq!(ready_status(&msgs), b'I', "COMMIT must report status 'I'");
+    assert_eq!(Client::rows(&b.query("SELECT * FROM users")).len(), 2);
+    a.terminate();
+    b.terminate();
+}
+
+#[test]
+fn txn_rollback_hides_writes() {
+    let server = Server::start("txn-rollback");
+    let (mut a, _) = Client::connect(server.port);
+    let (mut b, _) = Client::connect(server.port);
+    a.query("CREATE TABLE users (id, city)");
+    a.query("INSERT INTO users VALUES (1, 'Delhi')");
+    a.query("BEGIN");
+    a.query("INSERT INTO users VALUES (2, 'Mumbai')");
+    a.query("DELETE FROM users WHERE id = 1");
+    assert_eq!(
+        Client::rows(&a.query("SELECT * FROM users")).len(),
+        1,
+        "inside the txn the delete + insert apply"
+    );
+    let msgs = a.query("ROLLBACK");
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("ROLLBACK"), "{msgs:?}");
+    assert_eq!(ready_status(&msgs), b'I');
+    // Both writes are gone: the original row is back, the new one never was.
+    assert_eq!(Client::rows(&a.query("SELECT * FROM users")).len(), 1);
+    assert_eq!(Client::rows(&b.query("SELECT * FROM users")).len(), 1);
+    assert_eq!(
+        Client::rows(&b.query("SELECT * FROM users"))[0][1],
+        Some("Delhi".to_string())
+    );
+    a.terminate();
+    b.terminate();
+}
+
+#[test]
+fn txn_update_visible_only_after_commit() {
+    let server = Server::start("txn-update");
+    let (mut a, _) = Client::connect(server.port);
+    let (mut b, _) = Client::connect(server.port);
+    a.query("CREATE TABLE users (id, city)");
+    a.query("INSERT INTO users VALUES (1, 'Delhi')");
+    a.query("BEGIN");
+    let msgs = a.query("UPDATE users SET city = 'Mumbai' WHERE id = 1");
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("UPDATE 1"), "{msgs:?}");
+    assert_eq!(
+        Client::rows(&a.query("SELECT * FROM users"))[0][1],
+        Some("Mumbai".to_string()),
+        "own UPDATE must be visible inside the txn"
+    );
+    assert_eq!(
+        Client::rows(&b.query("SELECT * FROM users"))[0][1],
+        Some("Delhi".to_string()),
+        "uncommitted UPDATE must be invisible to others"
+    );
+    a.query("COMMIT");
+    assert_eq!(
+        Client::rows(&b.query("SELECT * FROM users"))[0][1],
+        Some("Mumbai".to_string()),
+        "committed UPDATE must become visible"
+    );
+    // UPDATE with no matching row: UPDATE 0, no error.
+    let msgs = a.query("UPDATE users SET city = 'X' WHERE id = 99");
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("UPDATE 0"), "{msgs:?}");
+    // UPDATE on an unknown column: 42703.
+    let msgs = a.query("UPDATE users SET nope = 'X' WHERE id = 1");
+    let (code, _) = Client::error(&msgs).expect("unknown SET column must error");
+    assert_eq!(code, "42703", "{msgs:?}");
+    a.terminate();
+    b.terminate();
+}
+
+#[test]
+fn txn_write_write_conflict_returns_40001() {
+    let server = Server::start("txn-conflict");
+    let (mut a, _) = Client::connect(server.port);
+    let (mut b, _) = Client::connect(server.port);
+    a.query("CREATE TABLE users (id, city)");
+    a.query("INSERT INTO users VALUES (1, 'Delhi')");
+    // Both connections begin on the same snapshot and UPDATE the
+    // same row: first-committer-wins.
+    a.query("BEGIN");
+    b.query("BEGIN");
+    a.query("UPDATE users SET city = 'Mumbai' WHERE id = 1");
+    b.query("UPDATE users SET city = 'Jaipur' WHERE id = 1");
+    let msgs = a.query("COMMIT");
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("COMMIT"), "{msgs:?}");
+    let msgs = b.query("COMMIT");
+    let (code, message) = Client::error(&msgs).expect("losing COMMIT must error");
+    assert_eq!(
+        code, "40001",
+        "write-write conflict must be 40001: {message}"
+    );
+    // The loser's transaction is already aborted: the connection
+    // is idle again ('I') and can BEGIN anew.
+    assert_eq!(
+        ready_status(&msgs),
+        b'I',
+        "after 40001 the txn is gone: {msgs:?}"
+    );
+    assert_eq!(
+        Client::rows(&b.query("SELECT * FROM users"))[0][1],
+        Some("Mumbai".to_string()),
+        "the winner's value must stand, the loser's must be gone"
+    );
+    // And B can start a fresh transaction right away.
+    let msgs = b.query("BEGIN");
+    assert_eq!(ready_status(&msgs), b'T');
+    b.query("ROLLBACK");
+    a.terminate();
+    b.terminate();
+}
+
+#[test]
+fn txn_errors_without_transaction_and_ddl_inside() {
+    let server = Server::start("txn-errors");
+    let (mut client, _) = Client::connect(server.port);
+    client.query("CREATE TABLE users (id, city)");
+    // COMMIT / ROLLBACK with no transaction: 25P01.
+    let msgs = client.query("COMMIT");
+    let (code, _) = Client::error(&msgs).expect("COMMIT without txn must error");
+    assert_eq!(code, "25P01", "{msgs:?}");
+    let msgs = client.query("ROLLBACK");
+    let (code, _) = Client::error(&msgs).expect("ROLLBACK without txn must error");
+    assert_eq!(code, "25P01", "{msgs:?}");
+    // A second BEGIN while one is open: 25001.
+    client.query("BEGIN");
+    let msgs = client.query("BEGIN");
+    let (code, _) = Client::error(&msgs).expect("nested BEGIN must error");
+    assert_eq!(code, "25001", "{msgs:?}");
+    // DDL inside a transaction: 0A000 — and the transaction is
+    // still open afterwards (the failed statement did not kill it).
+    let msgs = client.query("CREATE TABLE other (id)");
+    let (code, _) = Client::error(&msgs).expect("DDL inside txn must error");
+    assert_eq!(code, "0A000", "{msgs:?}");
+    assert_eq!(
+        ready_status(&msgs),
+        b'T',
+        "txn must survive the failed DDL: {msgs:?}"
+    );
+    // Clean up: the failed CREATE left no table behind.
+    client.query("ROLLBACK");
+    let msgs = client.query("SELECT * FROM other");
+    let (code, _) = Client::error(&msgs).expect("other must not exist");
+    assert_eq!(code, "42P01", "{msgs:?}");
+    client.terminate();
+}
+
+#[test]
+fn txn_multi_statement_simple_query() {
+    // BEGIN / INSERT / COMMIT in ONE Simple Query message: the
+    // session is threaded through every statement in the batch.
+    let server = Server::start("txn-multi");
+    let (mut a, _) = Client::connect(server.port);
+    let (mut b, _) = Client::connect(server.port);
+    a.query("CREATE TABLE users (id, city)");
+    let msgs = a.query("BEGIN; INSERT INTO users VALUES (1, 'Delhi'); COMMIT;");
+    assert!(
+        msgs.iter()
+            .any(|m| matches!(m, Msg::CommandComplete(t) if t == "COMMIT")),
+        "the batch must run BEGIN + INSERT + COMMIT: {msgs:?}"
+    );
+    assert_eq!(ready_status(&msgs), b'I');
+    assert_eq!(Client::rows(&b.query("SELECT * FROM users")).len(), 1);
+    // And a ROLLBACK batch leaves nothing behind.
+    a.query("BEGIN; INSERT INTO users VALUES (2, 'Mumbai'); ROLLBACK;");
+    assert_eq!(Client::rows(&b.query("SELECT * FROM users")).len(), 1);
+    a.terminate();
+    b.terminate();
+}
+
+#[test]
+fn txn_extended_protocol_begin_commit() {
+    // BEGIN / INSERT ($1 parameter) / COMMIT over the extended
+    // protocol, then visibility from a second connection.
+    let server = Server::start("txn-extended");
+    let (mut a, _) = Client::connect(server.port);
+    let (mut b, _) = Client::connect(server.port);
+    a.query("CREATE TABLE users (id, city)");
+    // Parse + Bind + Execute + Sync: Parse alone only validates,
+    // the statement runs at Execute.
+    let msgs = a.extended(&[
+        parse_frame("", "BEGIN", &[]),
+        bind_frame("", "", &[], &[], &[]),
+        execute_frame("", 0),
+        sync_frame(),
+    ]);
+    assert!(
+        Client::error(&msgs).is_none(),
+        "BEGIN over extended protocol must work: {msgs:?}"
+    );
+    assert_eq!(ready_status(&msgs), b'T');
+    // INSERT with a bound parameter, inside the transaction.
+    let msgs = a.extended(&[
+        parse_frame("", "INSERT INTO users VALUES ($1, $2)", &[]),
+        bind_frame("", "", &[], &[text_param("7"), text_param("Pune")], &[]),
+        execute_frame("", 0),
+        sync_frame(),
+    ]);
+    assert!(Client::error(&msgs).is_none(), "{msgs:?}");
+    assert_eq!(
+        Client::rows(&b.query("SELECT * FROM users")).len(),
+        0,
+        "B must not see the uncommitted extended-protocol INSERT"
+    );
+    // A SELECT over the extended protocol inside the txn sees it.
+    let msgs = a.extended(&[
+        parse_frame("", "SELECT * FROM users", &[]),
+        bind_frame("", "", &[], &[], &[]),
+        execute_frame("", 0),
+        sync_frame(),
+    ]);
+    assert_eq!(Client::rows(&msgs).len(), 1, "{msgs:?}");
+    let msgs = a.extended(&[
+        parse_frame("", "COMMIT", &[]),
+        bind_frame("", "", &[], &[], &[]),
+        execute_frame("", 0),
+        sync_frame(),
+    ]);
+    assert!(Client::error(&msgs).is_none(), "{msgs:?}");
+    assert_eq!(ready_status(&msgs), b'I');
+    assert_eq!(Client::rows(&b.query("SELECT * FROM users")).len(), 1);
+    a.terminate();
+    b.terminate();
+}
+
+#[test]
+fn txn_disconnect_rolls_back() {
+    // A connection that goes away with a transaction open
+    // abandons it: the uncommitted row never becomes visible.
+    let server = Server::start("txn-disconnect");
+    let (mut a, _) = Client::connect(server.port);
+    let (mut b, _) = Client::connect(server.port);
+    a.query("CREATE TABLE users (id, city)");
+    a.query("BEGIN");
+    a.query("INSERT INTO users VALUES (1, 'Delhi')");
+    a.terminate(); // no COMMIT — the server must roll back
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        Client::rows(&b.query("SELECT * FROM users")).len(),
+        0,
+        "a disconnected transaction must roll back"
+    );
+    b.terminate();
+}
+
+#[test]
+fn txn_crash_recovery_only_committed_data_survives() {
+    // Kill -9 the server with a transaction still open (and one
+    // committed row): after restart only the committed row is
+    // there. This is the crash test — the server process is
+    // killed, not shut down cleanly.
+    let server = Server::start("txn-crash");
+    let (mut a, _) = Client::connect(server.port);
+    a.query("CREATE TABLE users (id, city)");
+    a.query("INSERT INTO users VALUES (1, 'Delhi')");
+    a.query("BEGIN");
+    a.query("INSERT INTO users VALUES (2, 'Mumbai')");
+    // Kill the server mid-transaction (no COMMIT, no clean exit).
+    let dir = server.stop_keep_dir();
+    let server2 = Server::start_with_args_on_dir(dir, &[]);
+    let (mut b, _) = Client::connect(server2.port);
+    let rows = Client::rows(&b.query("SELECT * FROM users"));
+    assert_eq!(
+        rows.len(),
+        1,
+        "only the committed row may survive: {rows:?}"
+    );
+    assert_eq!(rows[0][1], Some("Delhi".to_string()));
+    // The server still works after the restart.
+    b.query("INSERT INTO users VALUES (3, 'Jaipur')");
+    assert_eq!(Client::rows(&b.query("SELECT * FROM users")).len(), 2);
+    b.terminate();
+}
+
+#[test]
+fn txn_aborted_state_returns_25p02_until_rollback() {
+    // M2: a failed statement inside a transaction aborts it
+    // (PostgreSQL 25P02). Afterwards only ROLLBACK runs; SELECT,
+    // INSERT and COMMIT all fail with 25P02, the transaction
+    // reports status 'E', and nothing it wrote commits.
+    let server = Server::start("txn-aborted");
+    let (mut a, _) = Client::connect(server.port);
+    let (mut b, _) = Client::connect(server.port);
+    a.query("CREATE TABLE t (id, city)");
+    a.query("INSERT INTO t VALUES (1, 'Delhi')");
+    a.query("BEGIN");
+    let msgs = a.query("INSERT INTO nosuch VALUES (9, 'X')");
+    let (code, _) = Client::error(&msgs).expect("bad INSERT must error");
+    assert_eq!(code, "42P01", "{msgs:?}");
+    assert_eq!(
+        ready_status(&msgs),
+        b'E',
+        "an aborted transaction reports status 'E': {msgs:?}"
+    );
+    for sql in [
+        "SELECT * FROM t",
+        "INSERT INTO t VALUES (4, 'Pune')",
+        "COMMIT",
+    ] {
+        let msgs = a.query(sql);
+        let (code, _) = Client::error(&msgs).expect("aborted txn must error");
+        assert_eq!(
+            code, "25P02",
+            "{sql} in an aborted txn must be 25P02: {msgs:?}"
+        );
+    }
+    // ROLLBACK is the only way out — and it works.
+    let msgs = a.query("ROLLBACK");
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("ROLLBACK"), "{msgs:?}");
+    assert_eq!(ready_status(&msgs), b'I');
+    assert_eq!(
+        Client::rows(&b.query("SELECT * FROM t")).len(),
+        1,
+        "nothing from the aborted transaction may commit"
+    );
+    // A fresh transaction works again right away.
+    a.query("BEGIN");
+    a.query("INSERT INTO t VALUES (2, 'Mumbai')");
+    a.query("COMMIT");
+    assert_eq!(Client::rows(&b.query("SELECT * FROM t")).len(), 2);
+    // Multi-statement batch: a bad middle statement aborts the
+    // batch's transaction, so the later INSERT and COMMIT fail
+    // and row 5 never lands.
+    a.query(
+        "BEGIN; INSERT INTO nosuch VALUES (1, 'x'); INSERT INTO t VALUES (5, 'Indore'); COMMIT",
+    );
+    a.query("ROLLBACK");
+    assert!(
+        !Client::rows(&b.query("SELECT * FROM t"))
+            .iter()
+            .any(|r| r[0] == Some("5".to_string())),
+        "row 5 must not land from an aborted multi-statement batch"
+    );
+    a.terminate();
+    b.terminate();
+}
+
+#[test]
+fn portal_cache_dies_with_transaction() {
+    // B2: a portal bound inside a transaction must not serve
+    // its cached rows after that transaction ends — its cache
+    // can hold rows that never committed (ROLLBACK) or that
+    // belong to a snapshot that no longer exists (COMMIT).
+    let server = Server::start("portal-txn-end");
+    let (mut a, _) = Client::connect(server.port);
+    let (mut b, _) = Client::connect(server.port);
+    a.query("CREATE TABLE t (id, city)");
+    a.query("INSERT INTO t VALUES (1, 'Delhi')");
+
+    // ROLLBACK case: suspend a SELECT portal inside the txn,
+    // roll back, then resume the same portal.
+    a.query("BEGIN");
+    a.query("INSERT INTO t VALUES (7, 'Bhopal')");
+    let msgs = a.extended(&[
+        parse_frame("sel", "SELECT * FROM t", &[]),
+        bind_frame("selp", "sel", &[], &[], &[]),
+        execute_frame("selp", 1),
+        sync_frame(),
+    ]);
+    assert!(
+        msgs.iter().any(|m| matches!(m, Msg::PortalSuspended)),
+        "first Execute must suspend: {msgs:?}"
+    );
+    a.query("ROLLBACK");
+    let msgs = a.extended(&[execute_frame("selp", 0), sync_frame()]);
+    let (code, _) = Client::error(&msgs).expect("resuming a dead portal must error");
+    assert_eq!(
+        code, "26000",
+        "a portal closed at ROLLBACK must be gone: {msgs:?}"
+    );
+    assert!(
+        !Client::rows(&msgs)
+            .iter()
+            .any(|r| r[0] == Some("7".to_string())),
+        "the rolled-back row must never come back: {msgs:?}"
+    );
+    assert_eq!(
+        Client::rows(&b.query("SELECT * FROM t")).len(),
+        1,
+        "row 7 is gone for everyone"
+    );
+
+    // COMMIT case: suspend inside the txn, COMMIT via Simple
+    // Query (which closes all portals), then resume.
+    a.query("BEGIN");
+    a.query("INSERT INTO t VALUES (8, 'Patna')");
+    let msgs = a.extended(&[
+        parse_frame("sel2", "SELECT * FROM t", &[]),
+        bind_frame("selp2", "sel2", &[], &[], &[]),
+        execute_frame("selp2", 1),
+        sync_frame(),
+    ]);
+    assert!(
+        msgs.iter().any(|m| matches!(m, Msg::PortalSuspended)),
+        "first Execute must suspend: {msgs:?}"
+    );
+    a.query("COMMIT");
+    let msgs = a.extended(&[execute_frame("selp2", 0), sync_frame()]);
+    let (code, _) = Client::error(&msgs).expect("resuming a dead portal must error");
+    assert_eq!(
+        code, "26000",
+        "a portal closed at COMMIT must be gone: {msgs:?}"
+    );
+    // The committed row itself is visible through a fresh query.
+    assert!(
+        Client::rows(&b.query("SELECT * FROM t"))
+            .iter()
+            .any(|r| r[0] == Some("8".to_string())),
+        "row 8 committed and is visible normally"
+    );
+    a.terminate();
+    b.terminate();
+}
+
+#[test]
+fn ddl_created_after_begin_is_invisible_in_txn() {
+    // m1: a table created by another connection AFTER this
+    // transaction began is invisible inside it (42P01) — the
+    // transaction only sees the tables that existed at BEGIN.
+    let server = Server::start("ddl-snapshot");
+    let (mut a, _) = Client::connect(server.port);
+    let (mut b, _) = Client::connect(server.port);
+    a.query("CREATE TABLE t (id, city)");
+    a.query("BEGIN");
+    b.query("CREATE TABLE late (id, x)");
+    let msgs = a.query("INSERT INTO late VALUES (1, 'y')");
+    let (code, _) = Client::error(&msgs).expect("INSERT into a later table must error");
+    assert_eq!(code, "42P01", "{msgs:?}");
+    a.query("ROLLBACK");
+    // Outside the transaction the table is there, as normal.
+    b.query("INSERT INTO late VALUES (1, 'y')");
+    assert_eq!(Client::rows(&b.query("SELECT * FROM late")).len(), 1);
+    a.terminate();
+    b.terminate();
+}
+
+#[test]
+fn txn_idle_timeout_rolls_back() {
+    // m5: a transaction that executes no statement for longer
+    // than the idle timeout is rolled back automatically, so an
+    // abandoned transaction cannot pin its snapshot forever.
+    // The timeout is 1s here via the diagnostic env var (the
+    // default is 5 minutes).
+    std::env::set_var("ZENO_TXN_IDLE_TIMEOUT_SECS", "1");
+    let server = Server::start("txn-idle-timeout");
+    let (mut a, _) = Client::connect(server.port);
+    let (mut b, _) = Client::connect(server.port);
+    a.query("CREATE TABLE t (id, city)");
+    a.query("BEGIN");
+    a.query("INSERT INTO t VALUES (1, 'Delhi')");
+    std::thread::sleep(Duration::from_millis(1500));
+    let msgs = a.query("SELECT * FROM t");
+    let (code, _) = Client::error(&msgs).expect("an idle-timed-out txn must error");
+    assert_eq!(code, "57014", "idle timeout must be 57014: {msgs:?}");
+    assert_eq!(
+        ready_status(&msgs),
+        b'I',
+        "the timed-out txn is gone: {msgs:?}"
+    );
+    assert_eq!(
+        Client::rows(&b.query("SELECT * FROM t")).len(),
+        0,
+        "the timed-out transaction's row must be rolled back"
+    );
+    // And the connection can BEGIN again right away.
+    let msgs = a.query("BEGIN");
+    assert_eq!(ready_status(&msgs), b'T');
+    a.query("ROLLBACK");
+    std::env::remove_var("ZENO_TXN_IDLE_TIMEOUT_SECS");
+    a.terminate();
+    b.terminate();
+}
+
+#[test]
+fn vacuum_sql_prunes_versions_and_keeps_live_snapshot() {
+    // M5: VACUUM runs while the server is live, prunes old row
+    // versions, and never disturbs a live snapshot.
+    let server = Server::start("vacuum-sql");
+    let (mut a, _) = Client::connect(server.port);
+    let (mut b, _) = Client::connect(server.port);
+    a.query("CREATE TABLE t (id, city)");
+    a.query("INSERT INTO t VALUES (1, 'Delhi')");
+    for city in ["Mumbai", "Goa", "Pune", "Agra"] {
+        a.query(&format!("UPDATE t SET city = '{city}' WHERE id = 1"));
+    }
+    let msgs = a.query("VACUUM");
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("VACUUM"), "{msgs:?}");
+    assert_eq!(
+        Client::rows(&a.query("SELECT * FROM t"))[0][1],
+        Some("Agra".to_string()),
+        "the newest value must survive VACUUM"
+    );
+    // VACUUM inside a transaction is refused.
+    a.query("BEGIN");
+    let msgs = a.query("VACUUM");
+    let (code, _) = Client::error(&msgs).expect("VACUUM in a txn must error");
+    assert_eq!(code, "25001", "{msgs:?}");
+    a.query("ROLLBACK");
+    // A live snapshot still sees its own old version after a
+    // VACUUM run by another connection.
+    a.query("BEGIN");
+    assert_eq!(
+        Client::rows(&a.query("SELECT * FROM t"))[0][1],
+        Some("Agra".to_string())
+    );
+    b.query("UPDATE t SET city = 'Nagpur' WHERE id = 1");
+    let msgs = b.query("VACUUM");
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("VACUUM"), "{msgs:?}");
+    assert_eq!(
+        Client::rows(&a.query("SELECT * FROM t"))[0][1],
+        Some("Agra".to_string()),
+        "the live snapshot must still see Agra after VACUUM"
+    );
+    assert_eq!(
+        Client::rows(&b.query("SELECT * FROM t"))[0][1],
+        Some("Nagpur".to_string()),
+        "the new value is visible outside the snapshot"
+    );
+    a.query("ROLLBACK");
+    a.terminate();
+    b.terminate();
 }

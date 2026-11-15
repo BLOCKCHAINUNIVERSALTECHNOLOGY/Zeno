@@ -15,18 +15,25 @@
 //   after 5 failed logins per user@IP (see `auth::LoginRateLimiter`).
 // - ParameterStatus (server_version, client_encoding,
 //   standard_conforming_strings), BackendKeyData, ReadyForQuery.
-// - Simple Query 'Q': CREATE TABLE / INSERT / SELECT (WHERE
-//   column=value) / DELETE, mapped onto the engine's table API.
-//   One Query message may hold several statements separated by ';';
-//   each runs in turn, then one ReadyForQuery closes the cycle.
+// - Simple Query 'Q': CREATE TABLE / INSERT / UPDATE / SELECT
+//   (WHERE column=value) / DELETE / VACUUM, plus BEGIN / COMMIT /
+//   ROLLBACK for MVCC transactions (V0.6, see txn.rs), mapped
+//   onto the engine's table API. One Query message may hold
+//   several statements separated by ';'; each runs in turn, then
+//   one ReadyForQuery closes the cycle. The ReadyForQuery status
+//   byte is 'T' while a transaction is open, 'I' otherwise, 'E'
+//   while the transaction is aborted (M2: 25P02 — only ROLLBACK
+//   runs in that state).
 // - Extended query protocol (see `extended.rs`): Parse/Bind/
-//   Describe/Execute/Close/Sync over the same four statements,
+//   Describe/Execute/Close/Sync over the same statements,
 //   with $1, $2 parameters (text format, plus binary int4/text),
 //   named + unnamed statements and portals, PortalSuspended for
 //   limited Execute, and the protocol's error rule — after an
 //   extended-protocol error the server sends ONE ErrorResponse and
 //   then reads and discards messages until Sync, so a pipelined
-//   driver never desyncs.
+//   driver never desyncs. BEGIN / COMMIT / ROLLBACK work here
+//   too (V0.6): the per-connection transaction session is shared
+//   between Simple Query and the extended protocol.
 // - Terminate 'X' closes the connection; a client disconnect never
 //   stops the server; clients are served one thread each, sharing one
 //   engine behind a Mutex (the data-dir LOCK still allows exactly one
@@ -35,7 +42,9 @@
 //
 // What it deliberately does NOT implement (see README, honest limits):
 // - COPY, LISTEN/NOTIFY, cursors.
-// - MVCC/transactions: every statement sees the latest value.
+// - Savepoints, two-phase commit, DDL inside a transaction, or
+//   SERIALIZABLE / READ COMMITTED: transactions are snapshot
+//   isolation only (V0.6, see txn.rs).
 //
 // All values travel as text (type OID 25, `text`), because every
 // Zeno table column is a string. RowDescription therefore always
@@ -54,12 +63,14 @@ use crate::engine::Engine;
 use crate::extended::ExtendedState;
 use crate::table::TableStore;
 use crate::tls;
+use crate::txn::CommitError;
+use std::collections::BTreeSet;
 use std::io::{BufReader, Cursor, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How long a connection may sit idle (or half-way through a
 /// message) before the server closes it: 60 seconds. Without this a
@@ -100,6 +111,88 @@ pub(crate) struct Shared {
     /// The SCRAM login rate limiter, shared by all connections
     /// (one limiter per server process — a restart resets it).
     rate_limiter: Arc<LoginRateLimiter>,
+}
+
+/// Per-connection transaction session (V0.6): at most one open
+/// transaction per connection, holding its engine transaction id.
+/// The session owns nothing else — the engine owns the snapshot
+/// and the write buffer. A transaction is per-connection state:
+/// two connections never share one, and a transaction never
+/// outlives its connection (see `handle_client`: a connection
+/// that ends with a transaction still open rolls it back).
+pub(crate) struct Session {
+    pub(crate) txn: Option<u64>,
+    /// M2 (25P02): true once a statement inside the transaction
+    /// has failed. While aborted, every statement except ROLLBACK
+    /// fails with 25P02 ("current transaction is aborted,
+    /// commands ignored until end of transaction block") and
+    /// COMMIT fails with 25P02 too — like PostgreSQL. Only
+    /// ROLLBACK ends an aborted transaction. Set only by
+    /// data-statement (INSERT/SELECT/UPDATE/DELETE) failures:
+    /// a failed CREATE TABLE (0A000, DDL is not versioned) or a
+    /// nested BEGIN (25001) does NOT abort the transaction, and
+    /// neither does a Parse/Bind/Describe error — the extended
+    /// protocol's planning errors leave the transaction alive.
+    aborted: bool,
+    /// B2: bumped every time a transaction of this connection
+    /// ends (COMMIT or ROLLBACK, success or failure). Portals
+    /// remember the generation they were bound in; a portal
+    /// bound inside a transaction that has since ended is dead
+    /// (PostgreSQL closes portals at transaction end), so its
+    /// cached rows can never be served again.
+    pub(crate) generation: u64,
+    /// m1: the tables that existed when this transaction began
+    /// (its DDL snapshot). A table created by another connection
+    /// AFTER this BEGIN is invisible inside the transaction —
+    /// statements against it fail with 42P01. `None` outside a
+    /// transaction. CREATE TABLE inside a transaction is already
+    /// refused (0A000), so this set only ever shrinks nothing —
+    /// it is a snapshot of names, taken at BEGIN.
+    txn_tables: Option<BTreeSet<String>>,
+    /// m5: when this connection last executed a statement. A
+    /// transaction idle longer than `txn_idle_timeout()` is
+    /// rolled back automatically (its snapshot stops pinning old
+    /// versions forever). Updated on every executed statement.
+    last_activity: Instant,
+}
+
+impl Session {
+    pub(crate) fn new() -> Self {
+        Self {
+            txn: None,
+            aborted: false,
+            generation: 0,
+            txn_tables: None,
+            last_activity: Instant::now(),
+        }
+    }
+
+    /// ReadyForQuery status byte: 'T' while a transaction is
+    /// open, 'I' otherwise, 'E' while the transaction is aborted
+    /// (M2 — PostgreSQL's "in a failed transaction" status).
+    pub(crate) fn status(&self) -> u8 {
+        if self.aborted {
+            b'E'
+        } else if self.txn.is_some() {
+            b'T'
+        } else {
+            b'I'
+        }
+    }
+}
+
+/// Idle-transaction timeout (m5): a transaction that executes no
+/// statement for this long is rolled back automatically, so an
+/// abandoned transaction cannot pin its snapshot (and block
+/// VACUUM) forever. Default 5 minutes; the
+/// `ZENO_TXN_IDLE_TIMEOUT_SECS` environment variable overrides
+/// it (diagnostic/test hook — e.g. `1` for a fast test).
+pub(crate) fn txn_idle_timeout() -> Duration {
+    std::env::var("ZENO_TXN_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(300))
 }
 
 /// Lock the shared engine, RECOVERING from poisoning instead of
@@ -176,7 +269,7 @@ pub fn serve(data_dir: &Path, port: u16, opts: &ServeOptions) -> std::io::Result
     }));
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     println!(
-        "zeno 0.5.0 listening on 127.0.0.1:{} (data dir: {})",
+        "zeno 0.6.0 listening on 127.0.0.1:{} (data dir: {})",
         port,
         data_dir.display()
     );
@@ -518,8 +611,12 @@ fn backend_key_data(writer: &mut impl Write, pid: i32, secret: i32) -> std::io::
 
 /// ReadyForQuery: 'Z' + status byte ('I' = idle; Zeno has no
 /// transactions yet, so it is always idle).
-fn ready_for_query(writer: &mut impl Write) -> std::io::Result<()> {
-    write_message(writer, b'Z', b"I")
+fn ready_for_query(writer: &mut impl Write, status: u8) -> std::io::Result<()> {
+    // `status` is 'I' (idle), 'T' (in a transaction), or 'E'
+    // (in a FAILED transaction — M2, 25P02: the transaction is
+    // aborted and only ROLLBACK will end it). The caller passes
+    // `session.status()`.
+    write_message(writer, b'Z', &[status])
 }
 
 /// ErrorResponse: 'E' + fields ('S' severity, 'V' severity,
@@ -641,6 +738,81 @@ fn handle_client<R: Read, W: Write>(
         return Err(e);
     }
 
+    // Per-connection transaction session (V0.6) plus the
+    // extended-protocol state for this connection (prepared
+    // statements + portals, and the error flag — see the loop).
+    // The session lives inside `ConnSession`, whose `Drop`
+    // rolls back an abandoned transaction — on EVERY exit path,
+    // including a panic unwinding this thread (m3: the old code
+    // rolled back only after `client_loop` returned normally,
+    // so a panicking connection leaked its transaction — and
+    // its snapshot — in the engine forever).
+    let mut conn = ConnSession::new(shared.clone(), conn_id);
+    client_loop(
+        &mut reader,
+        &mut writer,
+        &shared,
+        conn_id,
+        &mut conn.session,
+    )
+}
+
+/// One connection's session, with a `Drop` guard that rolls back
+/// an abandoned transaction (m3). The guard owns the session, so
+/// its `Drop` runs when `handle_client` returns AND when the
+/// connection thread panics (a `Drop` runs during an unwind — a
+/// rollback written after `client_loop` returns does not).
+/// The rollback is best-effort and never panics: a `Drop`
+/// during an unwind must not panic again.
+pub(crate) struct ConnSession {
+    session: Session,
+    shared: Arc<Mutex<Shared>>,
+    conn_id: u32,
+}
+
+impl ConnSession {
+    pub(crate) fn new(shared: Arc<Mutex<Shared>>, conn_id: u32) -> Self {
+        Self {
+            session: Session::new(),
+            shared,
+            conn_id,
+        }
+    }
+}
+
+impl Drop for ConnSession {
+    fn drop(&mut self) {
+        // A connection that ends with a transaction still open
+        // abandons it: roll it back, so uncommitted writes never
+        // leak into another connection's view. (COMMIT and
+        // ROLLBACK already cleared `session.txn`; this only fires
+        // on disconnect, Terminate, timeout, an error return, or
+        // a panic in the connection thread.)
+        if let Some(txn) = self.session.txn.take() {
+            let mut guard = recover_lock(&self.shared);
+            if let Err(e) = guard.engine.rollback(txn) {
+                eprintln!(
+                    "pgwire conn {}: could not roll back abandoned transaction {txn}: {e}",
+                    self.conn_id
+                );
+            }
+        }
+    }
+}
+
+/// The per-message loop of one connection, split out of
+/// `handle_client` so the connection state stays in one place.
+/// Transaction rollback on exit is the `ConnSession` guard's
+/// `Drop` in `handle_client` (m3) — it runs on disconnect,
+/// Terminate, timeout, error, AND panic, which a rollback
+/// written after this loop returns could not cover.
+fn client_loop<R: Read, W: Write>(
+    mut reader: &mut R,
+    mut writer: &mut W,
+    shared: &Arc<Mutex<Shared>>,
+    conn_id: u32,
+    session: &mut Session,
+) -> std::io::Result<()> {
     // Extended-protocol state for this connection: prepared
     // statements + portals, and the error flag (see the loop).
     let mut ext = ExtendedState::new();
@@ -673,7 +845,7 @@ fn handle_client<R: Read, W: Write>(
             match tag {
                 b'S' => {
                     ext.in_error = false;
-                    ready_for_query(&mut writer)?;
+                    ready_for_query(&mut writer, session.status())?;
                 }
                 b'X' => return Ok(()),
                 _ => {}
@@ -690,8 +862,17 @@ fn handle_client<R: Read, W: Write>(
                 let sql = cstr_to_string(&body);
                 // A write failure here means the client is gone; stop
                 // this connection, not the server.
-                run_query(&mut writer, &shared, &sql)?;
-                ready_for_query(&mut writer)?;
+                let generation_before = session.generation;
+                run_query(&mut writer, shared, &sql, session)?;
+                // B2: a COMMIT/ROLLBACK in this Simple Query ended
+                // the transaction — PostgreSQL closes every portal
+                // at transaction end, so do that here too (the
+                // extended path does the same via the portal
+                // generation check in `handle_execute`).
+                if session.generation != generation_before {
+                    ext.close_all_portals();
+                }
+                ready_for_query(&mut writer, session.status())?;
             }
             b'X' => return Ok(()), // Terminate
             b'P' | b'B' | b'D' | b'E' | b'C' => {
@@ -701,10 +882,18 @@ fn handle_client<R: Read, W: Write>(
                 // connection enters skip-until-Sync mode (above) —
                 // that is what keeps a pipelined driver in sync.
                 let result = match tag {
-                    b'P' => crate::extended::handle_parse(&mut writer, &shared, &mut ext, &body),
-                    b'B' => crate::extended::handle_bind(&mut writer, &shared, &mut ext, &body),
-                    b'D' => crate::extended::handle_describe(&mut writer, &shared, &mut ext, &body),
-                    b'E' => crate::extended::handle_execute(&mut writer, &shared, &mut ext, &body),
+                    b'P' => crate::extended::handle_parse(&mut writer, shared, &mut ext, &body),
+                    b'B' => {
+                        crate::extended::handle_bind(&mut writer, shared, &mut ext, session, &body)
+                    }
+                    b'D' => crate::extended::handle_describe(&mut writer, shared, &mut ext, &body),
+                    b'E' => crate::extended::handle_execute(
+                        &mut writer,
+                        shared,
+                        &mut ext,
+                        session,
+                        &body,
+                    ),
                     _ => crate::extended::handle_close(&mut writer, &mut ext, &body),
                 };
                 if let Err(e) = result {
@@ -717,7 +906,7 @@ fn handle_client<R: Read, W: Write>(
                 // ONLY ReadyForQuery sent for extended messages — one
                 // per Sync, however many Parse/Bind/Describe/Execute
                 // messages came before it.
-                ready_for_query(&mut writer)?;
+                ready_for_query(&mut writer, session.status())?;
             }
             b'H' => {
                 // Flush: no reply message of its own — just push out
@@ -729,7 +918,7 @@ fn handle_client<R: Read, W: Write>(
                     "08P01",
                     &format!("unsupported frontend message type '{}'", tag as char),
                 )?;
-                ready_for_query(&mut writer)?;
+                ready_for_query(&mut writer, session.status())?;
             }
         }
         writer.flush()?;
@@ -865,7 +1054,7 @@ fn startup_handshake(
                     }
                 };
                 backend_key_data(writer, pid, secret)?;
-                ready_for_query(writer)?;
+                ready_for_query(writer, b'I')?;
                 writer.flush()?;
                 return Ok(());
             }
@@ -920,6 +1109,7 @@ fn run_query(
     writer: &mut impl Write,
     shared: &Arc<Mutex<Shared>>,
     sql: &str,
+    session: &mut Session,
 ) -> std::io::Result<()> {
     let statements = split_statements(sql);
     if statements.iter().all(|s| s.trim().is_empty()) {
@@ -931,7 +1121,7 @@ fn run_query(
         if stmt.is_empty() {
             continue;
         }
-        match execute_statement(shared, stmt) {
+        match execute_statement(shared, stmt, session) {
             Ok(outcome) => write_outcome(writer, &outcome, &[])?,
             Err(e) => {
                 // SQL error: report it, keep the connection alive.
@@ -1090,28 +1280,90 @@ pub(crate) enum StmtOutcome {
 pub(crate) fn execute_statement(
     shared: &Arc<Mutex<Shared>>,
     stmt: &str,
+    session: &mut Session,
 ) -> Result<StmtOutcome, SqlError> {
     let tokens = tokenize(stmt).ok_or_else(|| sql_err("42601", "unterminated string literal"))?;
-    execute_tokens(shared, &tokens)
+    execute_tokens(shared, &tokens, session)
 }
 
 /// Run one statement given as tokens. Extended Execute uses this
 /// after substituting the bound parameter values for the `$n`
 /// placeholders, so parameters can never be re-parsed as SQL.
+/// `session` carries this connection's transaction (if any):
+/// statements inside a transaction run against its snapshot and
+/// buffer, statements outside one autocommit.
 pub(crate) fn execute_tokens(
     shared: &Arc<Mutex<Shared>>,
     tokens: &[Token],
+    session: &mut Session,
 ) -> Result<StmtOutcome, SqlError> {
-    match classify_statement(tokens)? {
-        StmtKind::Create => exec_create(shared, tokens),
-        StmtKind::Insert => exec_insert(shared, tokens),
-        StmtKind::Select => exec_select(shared, tokens),
-        StmtKind::Delete => exec_delete(shared, tokens),
-        StmtKind::Empty => Ok(StmtOutcome::Empty),
+    let kind = classify_statement(tokens)?;
+    // M2: in an aborted transaction only ROLLBACK runs. Anything
+    // else — including COMMIT — is 25P02, and the transaction
+    // stays open (aborted) until that ROLLBACK.
+    if session.aborted && kind != StmtKind::Rollback {
+        return Err(sql_err(
+            "25P02",
+            "current transaction is aborted, commands ignored until end of transaction block",
+        ));
     }
+    // m5: a transaction that has executed no statement for
+    // longer than the idle timeout is rolled back here, so its
+    // snapshot stops pinning old versions (and blocking VACUUM)
+    // forever. The generation bump also kills its portals (B2).
+    if let Some(txn) = session.txn {
+        if session.last_activity.elapsed() > txn_idle_timeout() {
+            let idle_secs = txn_idle_timeout().as_secs();
+            {
+                let mut guard = recover_lock(shared);
+                let _ = guard.engine.rollback(txn);
+            }
+            session.txn = None;
+            session.aborted = false;
+            session.txn_tables = None;
+            session.generation += 1;
+            return Err(sql_err(
+                "57014",
+                format!(
+                    "transaction aborted: idle for longer than {idle_secs}s \
+                     (idle-transaction timeout) — it was rolled back"
+                ),
+            ));
+        }
+    }
+    session.last_activity = Instant::now();
+    let outcome = match kind {
+        StmtKind::Create => exec_create(shared, tokens, session),
+        StmtKind::Insert => exec_insert(shared, tokens, session),
+        StmtKind::Select => exec_select(shared, tokens, session),
+        StmtKind::Delete => exec_delete(shared, tokens, session),
+        StmtKind::Update => exec_update(shared, tokens, session),
+        StmtKind::Begin => exec_begin(shared, tokens, session),
+        StmtKind::Commit => exec_commit(shared, tokens, session),
+        StmtKind::Rollback => exec_rollback(shared, tokens, session),
+        StmtKind::Vacuum => exec_vacuum(shared, tokens, session),
+        StmtKind::Empty => Ok(StmtOutcome::Empty),
+    };
+    // M2: a data-statement failure (INSERT/SELECT/UPDATE/
+    // DELETE) inside a transaction aborts it — the connection
+    // is in the 25P02 state until ROLLBACK. Deliberately NOT
+    // set for DDL (CREATE: 0A000 — the transaction survives a
+    // failed CREATE, as the `txn_errors` test pins), nested
+    // BEGIN (25001), or COMMIT/ROLLBACK themselves (a failed
+    // COMMIT already ended the transaction in the engine).
+    if outcome.is_err()
+        && session.txn.is_some()
+        && matches!(
+            kind,
+            StmtKind::Insert | StmtKind::Select | StmtKind::Delete | StmtKind::Update
+        )
+    {
+        session.aborted = true;
+    }
+    outcome
 }
 
-/// Which of the four supported statements (if any) `tokens` holds.
+/// Which of the supported statements (if any) `tokens` holds.
 /// Extended Parse reuses this, so a bad statement fails at Parse
 /// time with the same error a Simple Query would get.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1120,6 +1372,11 @@ pub(crate) enum StmtKind {
     Insert,
     Select,
     Delete,
+    Update,
+    Begin,
+    Commit,
+    Rollback,
+    Vacuum,
     Empty,
 }
 
@@ -1133,10 +1390,15 @@ pub(crate) fn classify_statement(tokens: &[Token]) -> Result<StmtKind, SqlError>
         "INSERT" => Ok(StmtKind::Insert),
         "SELECT" => Ok(StmtKind::Select),
         "DELETE" => Ok(StmtKind::Delete),
-        "UPDATE" | "DROP" | "ALTER" | "BEGIN" | "COMMIT" | "ROLLBACK" | "SET" | "SHOW"
-        | "GRANT" | "REVOKE" | "TRUNCATE" | "COPY" | "VACUUM" | "EXPLAIN" => Err(sql_err(
+        "UPDATE" => Ok(StmtKind::Update),
+        "BEGIN" | "START" => Ok(StmtKind::Begin),
+        "COMMIT" | "END" => Ok(StmtKind::Commit),
+        "ROLLBACK" | "ABORT" => Ok(StmtKind::Rollback),
+        "VACUUM" => Ok(StmtKind::Vacuum),
+        "DROP" | "ALTER" | "SET" | "SHOW" | "GRANT" | "REVOKE" | "TRUNCATE" | "COPY"
+        | "EXPLAIN" => Err(sql_err(
             "0A000",
-            format!("{first} is not supported in Zeno 0.5.0 (only CREATE TABLE, INSERT, SELECT, DELETE)"),
+            format!("{first} is not supported in Zeno 0.6.0 (only CREATE TABLE, INSERT, UPDATE, SELECT, DELETE, VACUUM, BEGIN, COMMIT, ROLLBACK)"),
         )),
         "" => Ok(StmtKind::Empty),
         other => Err(sql_err(
@@ -1328,10 +1590,41 @@ pub(crate) fn parse_where(tokens: &[Token], i: usize) -> Option<(String, String,
 // The four statements.
 // ---------------------------------------------------------------------
 
+/// m1: a table is visible inside a transaction only if it
+/// existed when the transaction began (its DDL snapshot, taken
+/// in `exec_begin`). A table created by another connection
+/// after this BEGIN is invisible here — 42P01, as if it did not
+/// exist yet. Outside a transaction every registered table is
+/// visible. (CREATE TABLE inside a transaction is refused with
+/// 0A000, so a transaction can never see its own DDL.)
+fn check_table_visible_in_txn(session: &Session, name: &str) -> Result<(), SqlError> {
+    if let Some(tables) = &session.txn_tables {
+        if !tables.contains(name) {
+            return Err(sql_err(
+                "42P01",
+                format!(
+                    "no such table '{name}' (it was created after this transaction began — \
+                     DDL is not snapshot-isolated in the registry, so a transaction only \
+                     sees the tables that existed at its BEGIN; COMMIT or ROLLBACK first)"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// CREATE TABLE name (col1, col2, ...) — column types are NOT parsed:
 /// every Zeno column is text. `CREATE TABLE users (id int, name text)`
 /// therefore also works: the type words are skipped.
-fn exec_create(shared: &Arc<Mutex<Shared>>, tokens: &[Token]) -> Result<StmtOutcome, SqlError> {
+/// DDL inside a transaction is NOT supported in V0.6: the table
+/// registry (`tables.json`) is not versioned, so a CREATE that
+/// later rolled back could not be undone — it fails with 0A000.
+/// Run DDL outside transactions (COMMIT or ROLLBACK first).
+fn exec_create(
+    shared: &Arc<Mutex<Shared>>,
+    tokens: &[Token],
+    session: &mut Session,
+) -> Result<StmtOutcome, SqlError> {
     let mut i =
         expect_keyword(tokens, 0, "CREATE").ok_or_else(|| sql_err("42601", "expected CREATE"))?;
     i = expect_keyword(tokens, i, "TABLE")
@@ -1397,6 +1690,13 @@ fn exec_create(shared: &Arc<Mutex<Shared>>, tokens: &[Token]) -> Result<StmtOutc
     if columns.is_empty() {
         return Err(sql_err("42601", "a table needs at least one column"));
     }
+    if session.txn.is_some() {
+        return Err(sql_err(
+            "0A000",
+            "CREATE TABLE is not supported inside a transaction in Zeno 0.6.0 \
+             (DDL is not versioned — run it outside a transaction, after COMMIT or ROLLBACK)",
+        ));
+    }
     // Poison recovery (V0.5): a thread that panicked while holding
     // this lock must not wedge the server — see `recover_lock`.
     let mut guard = recover_lock(shared);
@@ -1412,7 +1712,13 @@ fn exec_create(shared: &Arc<Mutex<Shared>>, tokens: &[Token]) -> Result<StmtOutc
 
 /// INSERT INTO name VALUES (v1, v2, ...) — values are quoted strings
 /// or bare tokens; the count must match the table's columns.
-fn exec_insert(shared: &Arc<Mutex<Shared>>, tokens: &[Token]) -> Result<StmtOutcome, SqlError> {
+/// Inside a transaction the row is buffered (visible to this
+/// connection only) until COMMIT.
+fn exec_insert(
+    shared: &Arc<Mutex<Shared>>,
+    tokens: &[Token],
+    session: &mut Session,
+) -> Result<StmtOutcome, SqlError> {
     let mut i =
         expect_keyword(tokens, 0, "INSERT").ok_or_else(|| sql_err("42601", "expected INSERT"))?;
     i = expect_keyword(tokens, i, "INTO")
@@ -1448,17 +1754,27 @@ fn exec_insert(shared: &Arc<Mutex<Shared>>, tokens: &[Token]) -> Result<StmtOutc
     if i != tokens.len() {
         return Err(sql_err("42601", "unexpected text after INSERT"));
     }
+    check_table_visible_in_txn(session, &name)?;
     // Poison recovery (V0.5): a thread that panicked while holding
     // this lock must not wedge the server — see `recover_lock`.
     let mut guard = recover_lock(shared);
     let Shared { engine, tables, .. } = &mut *guard;
-    tables.insert(engine, &name, values).map_err(|e| {
-        if e.contains("no such table") {
-            sql_err("42P01", e)
-        } else {
-            sql_err("42601", e)
-        }
-    })?;
+    let _row_id = match session.txn {
+        Some(txn) => tables.insert_txn(engine, txn, &name, values).map_err(|e| {
+            if e.contains("no such table") {
+                sql_err("42P01", e)
+            } else {
+                sql_err("42601", e)
+            }
+        })?,
+        None => tables.insert(engine, &name, values).map_err(|e| {
+            if e.contains("no such table") {
+                sql_err("42P01", e)
+            } else {
+                sql_err("42601", e)
+            }
+        })?,
+    };
     Ok(StmtOutcome::Command("INSERT 0 1".to_string()))
 }
 
@@ -1551,19 +1867,38 @@ pub(crate) fn parse_select(
 }
 
 /// SELECT * | col1, col2 FROM name [WHERE col = value]
-fn exec_select(shared: &Arc<Mutex<Shared>>, tokens: &[Token]) -> Result<StmtOutcome, SqlError> {
+/// Inside a transaction this reads the transaction's BEGIN
+/// snapshot (plus its own writes) — never newer commits.
+fn exec_select(
+    shared: &Arc<Mutex<Shared>>,
+    tokens: &[Token],
+    session: &mut Session,
+) -> Result<StmtOutcome, SqlError> {
     let plan = parse_select(shared, tokens)?;
+    // m1: the table must have existed at this transaction's
+    // BEGIN (parse_select only checks the live registry).
+    check_table_visible_in_txn(session, &plan.table)?;
     // Poison recovery (V0.5): a thread that panicked while holding
     // this lock must not wedge the server — see `recover_lock`.
     let mut guard = recover_lock(shared);
     let Shared { engine, tables, .. } = &mut *guard;
-    let rows = tables
-        .select(
-            engine,
-            &plan.table,
-            plan.filter.as_ref().map(|(c, v)| (c.as_str(), v.as_str())),
-        )
-        .map_err(|e| sql_err("42P01", e))?;
+    let rows = match session.txn {
+        Some(txn) => tables
+            .select_txn(
+                engine,
+                txn,
+                &plan.table,
+                plan.filter.as_ref().map(|(c, v)| (c.as_str(), v.as_str())),
+            )
+            .map_err(|e| sql_err("42P01", e))?,
+        None => tables
+            .select(
+                engine,
+                &plan.table,
+                plan.filter.as_ref().map(|(c, v)| (c.as_str(), v.as_str())),
+            )
+            .map_err(|e| sql_err("42P01", e))?,
+    };
     let out_rows: Vec<Vec<String>> = rows
         .iter()
         .map(|(_, row)| {
@@ -1580,7 +1915,12 @@ fn exec_select(shared: &Arc<Mutex<Shared>>, tokens: &[Token]) -> Result<StmtOutc
 }
 
 /// DELETE FROM name [WHERE col = value] — without WHERE, all rows go.
-fn exec_delete(shared: &Arc<Mutex<Shared>>, tokens: &[Token]) -> Result<StmtOutcome, SqlError> {
+/// Inside a transaction the deletes are buffered until COMMIT.
+fn exec_delete(
+    shared: &Arc<Mutex<Shared>>,
+    tokens: &[Token],
+    session: &mut Session,
+) -> Result<StmtOutcome, SqlError> {
     let mut i =
         expect_keyword(tokens, 0, "DELETE").ok_or_else(|| sql_err("42601", "expected DELETE"))?;
     i = expect_keyword(tokens, i, "FROM")
@@ -1602,24 +1942,275 @@ fn exec_delete(shared: &Arc<Mutex<Shared>>, tokens: &[Token]) -> Result<StmtOutc
     if i != tokens.len() {
         return Err(sql_err("42601", "unexpected text after DELETE"));
     }
+    check_table_visible_in_txn(session, &name)?;
     // Poison recovery (V0.5): a thread that panicked while holding
     // this lock must not wedge the server — see `recover_lock`.
     let mut guard = recover_lock(shared);
     let Shared { engine, tables, .. } = &mut *guard;
-    let deleted = tables
-        .delete(
-            engine,
-            &name,
-            filter.as_ref().map(|(c, v)| (c.as_str(), v.as_str())),
-        )
-        .map_err(|e| {
-            if e.contains("no such table") {
-                sql_err("42P01", e)
-            } else {
-                sql_err("42601", e)
-            }
-        })?;
+    let deleted = match session.txn {
+        Some(txn) => tables
+            .delete_txn(
+                engine,
+                txn,
+                &name,
+                filter.as_ref().map(|(c, v)| (c.as_str(), v.as_str())),
+            )
+            .map_err(|e| {
+                if e.contains("no such table") {
+                    sql_err("42P01", e)
+                } else {
+                    sql_err("42601", e)
+                }
+            })?,
+        None => tables
+            .delete(
+                engine,
+                &name,
+                filter.as_ref().map(|(c, v)| (c.as_str(), v.as_str())),
+            )
+            .map_err(|e| {
+                if e.contains("no such table") {
+                    sql_err("42P01", e)
+                } else {
+                    sql_err("42601", e)
+                }
+            })?,
+    };
     Ok(StmtOutcome::Command(format!("DELETE {deleted}")))
+}
+
+/// UPDATE name SET col = value [WHERE col = value] (V0.6) — one
+/// SET assignment only. Each matching row is rewritten as a new
+/// version; the CommandComplete tag reports the row count
+/// (`UPDATE n`). Inside a transaction the new versions are
+/// buffered until COMMIT, and the rows matched are the ones the
+/// transaction's snapshot sees.
+fn exec_update(
+    shared: &Arc<Mutex<Shared>>,
+    tokens: &[Token],
+    session: &mut Session,
+) -> Result<StmtOutcome, SqlError> {
+    let mut i =
+        expect_keyword(tokens, 0, "UPDATE").ok_or_else(|| sql_err("42601", "expected UPDATE"))?;
+    let (name, next) = expect_name(tokens, i)
+        .ok_or_else(|| sql_err("42601", "expected a table name after UPDATE"))?;
+    i = next;
+    i = expect_keyword(tokens, i, "SET")
+        .ok_or_else(|| sql_err("42601", "expected SET after the table name"))?;
+    let (set_col, next) = expect_name(tokens, i)
+        .ok_or_else(|| sql_err("42601", "expected a column name after SET"))?;
+    i = next;
+    i = expect_punct(tokens, i, "=")
+        .ok_or_else(|| sql_err("42601", "expected '=' after the SET column"))?;
+    let set_val = tokens
+        .get(i)
+        .ok_or_else(|| sql_err("42601", "expected a value after SET column ="))?
+        .text
+        .clone();
+    i += 1;
+    let mut filter: Option<(String, String)> = None;
+    if i < tokens.len() {
+        let (col, value, next) = parse_where(tokens, i)
+            .ok_or_else(|| sql_err("42601", "expected WHERE column = value after the SET value"))?;
+        filter = Some((col, value));
+        i = next;
+    }
+    if i != tokens.len() {
+        return Err(sql_err("42601", "unexpected text after UPDATE"));
+    }
+    check_table_visible_in_txn(session, &name)?;
+    // Poison recovery (V0.5): a thread that panicked while holding
+    // this lock must not wedge the server — see `recover_lock`.
+    let mut guard = recover_lock(shared);
+    let Shared { engine, tables, .. } = &mut *guard;
+    let updated = match session.txn {
+        Some(txn) => tables
+            .update_txn(
+                engine,
+                txn,
+                &name,
+                &set_col,
+                &set_val,
+                filter.as_ref().map(|(c, v)| (c.as_str(), v.as_str())),
+            )
+            .map_err(|e| {
+                if e.contains("no such table") {
+                    sql_err("42P01", e)
+                } else if e.contains("does not exist") {
+                    sql_err("42703", e)
+                } else {
+                    sql_err("42601", e)
+                }
+            })?,
+        None => tables
+            .update(
+                engine,
+                &name,
+                &set_col,
+                &set_val,
+                filter.as_ref().map(|(c, v)| (c.as_str(), v.as_str())),
+            )
+            .map_err(|e| {
+                if e.contains("no such table") {
+                    sql_err("42P01", e)
+                } else if e.contains("does not exist") {
+                    sql_err("42703", e)
+                } else {
+                    sql_err("42601", e)
+                }
+            })?,
+    };
+    Ok(StmtOutcome::Command(format!("UPDATE {updated}")))
+}
+
+/// BEGIN [TRANSACTION] / START TRANSACTION (V0.6): open a
+/// transaction for this connection. A second BEGIN while one is
+/// open fails with 25001 — Zeno has no nested transactions
+/// (PostgreSQL would warn and keep the old one; Zeno reports the
+/// mistake instead — see README).
+fn exec_begin(
+    shared: &Arc<Mutex<Shared>>,
+    tokens: &[Token],
+    session: &mut Session,
+) -> Result<StmtOutcome, SqlError> {
+    let first = tokens
+        .first()
+        .map(|t| t.text.to_ascii_uppercase())
+        .unwrap_or_default();
+    let mut i = 1;
+    if first == "START" {
+        i = expect_keyword(tokens, i, "TRANSACTION")
+            .ok_or_else(|| sql_err("42601", "expected START TRANSACTION"))?;
+    } else if let Some(next) = expect_keyword(tokens, i, "TRANSACTION") {
+        i = next;
+    }
+    if i != tokens.len() {
+        return Err(sql_err("42601", "unexpected text after BEGIN"));
+    }
+    if session.txn.is_some() {
+        return Err(sql_err(
+            "25001",
+            "already in a transaction — COMMIT or ROLLBACK first \
+             (Zeno 0.6.0 has no nested transactions)",
+        ));
+    }
+    // Poison recovery (V0.5): see `recover_lock`.
+    let mut guard = recover_lock(shared);
+    let txn = guard.engine.begin();
+    // m1: snapshot the table names at BEGIN — tables created
+    // after this are invisible inside the transaction.
+    session.txn_tables = Some(guard.tables.list_tables().into_iter().collect());
+    session.txn = Some(txn);
+    Ok(StmtOutcome::Command("BEGIN".to_string()))
+}
+
+/// COMMIT [TRANSACTION] / END (V0.6): commit this connection's
+/// transaction. A write-write conflict fails with 40001
+/// (serialization failure) and the transaction is aborted; the
+/// connection is idle again afterwards. COMMIT with no
+/// transaction open fails with 25P01 (PostgreSQL would warn and
+/// return COMMIT; Zeno reports the mistake instead — see README).
+/// COMMIT of an ABORTED transaction (M2) fails with 25P02 and the
+/// transaction stays open until ROLLBACK — that case is caught in
+/// `execute_tokens` before this runs.
+fn exec_commit(
+    shared: &Arc<Mutex<Shared>>,
+    tokens: &[Token],
+    session: &mut Session,
+) -> Result<StmtOutcome, SqlError> {
+    let mut i = 1;
+    if let Some(next) = expect_keyword(tokens, i, "TRANSACTION") {
+        i = next;
+    }
+    if i != tokens.len() {
+        return Err(sql_err("42601", "unexpected text after COMMIT"));
+    }
+    let txn = session.txn.take().ok_or_else(|| {
+        sql_err(
+            "25P01",
+            "there is no transaction in progress — COMMIT outside a transaction",
+        )
+    })?;
+    // Poison recovery (V0.5): see `recover_lock`.
+    let mut guard = recover_lock(shared);
+    let result = guard.engine.commit(txn).map_err(|e| match e {
+        CommitError::Conflict(conflict) => sql_err("40001", conflict.to_string()),
+        CommitError::Unknown(msg) => sql_err("25P01", msg),
+        CommitError::Io(e) => sql_err("XX000", e.to_string()),
+    });
+    // The transaction has ended, whatever the outcome (success,
+    // conflict, or I/O error): clear the aborted flag and the
+    // DDL snapshot, and bump the generation so portals bound
+    // inside it die (B2).
+    session.aborted = false;
+    session.txn_tables = None;
+    session.generation += 1;
+    result?;
+    Ok(StmtOutcome::Command("COMMIT".to_string()))
+}
+
+/// ROLLBACK [TRANSACTION] / ABORT (V0.6): drop this connection's
+/// transaction and all its buffered writes. ROLLBACK with no
+/// transaction open fails with 25P01, like COMMIT. ROLLBACK is
+/// the ONLY statement that runs in an aborted transaction (M2).
+fn exec_rollback(
+    shared: &Arc<Mutex<Shared>>,
+    tokens: &[Token],
+    session: &mut Session,
+) -> Result<StmtOutcome, SqlError> {
+    let mut i = 1;
+    if let Some(next) = expect_keyword(tokens, i, "TRANSACTION") {
+        i = next;
+    }
+    if i != tokens.len() {
+        return Err(sql_err("42601", "unexpected text after ROLLBACK"));
+    }
+    let txn = session.txn.take().ok_or_else(|| {
+        sql_err(
+            "25P01",
+            "there is no transaction in progress — ROLLBACK outside a transaction",
+        )
+    })?;
+    // Poison recovery (V0.5): see `recover_lock`.
+    let mut guard = recover_lock(shared);
+    let result = guard.engine.rollback(txn).map_err(|e| sql_err("25P01", e));
+    session.aborted = false;
+    session.txn_tables = None;
+    session.generation += 1;
+    result?;
+    Ok(StmtOutcome::Command("ROLLBACK".to_string()))
+}
+
+/// VACUUM (V0.6-fix, M5): online vacuum — prune version chains
+/// and the committed set while the server runs (see
+/// `Engine::vacuum`). No arguments are supported yet (`VACUUM`
+/// alone). It cannot run inside a transaction block (25001,
+/// like PostgreSQL): a transaction's own snapshot is exactly
+/// what a VACUUM must respect, and running one from inside the
+/// transaction it would prune is not sane.
+fn exec_vacuum(
+    shared: &Arc<Mutex<Shared>>,
+    tokens: &[Token],
+    session: &mut Session,
+) -> Result<StmtOutcome, SqlError> {
+    if tokens.len() != 1 {
+        return Err(sql_err("42601", "VACUUM takes no arguments in Zeno 0.6.0"));
+    }
+    if session.txn.is_some() {
+        return Err(sql_err(
+            "25001",
+            "VACUUM cannot run inside a transaction block — COMMIT or ROLLBACK first",
+        ));
+    }
+    let mut guard = recover_lock(shared);
+    guard
+        .engine
+        .vacuum()
+        .map_err(|e| sql_err("XX000", e.to_string()))?;
+    // The pruned counts are in `stats` (vacuums, committed
+    // txns); the CommandComplete tag stays plain "VACUUM", like
+    // PostgreSQL.
+    Ok(StmtOutcome::Command("VACUUM".to_string()))
 }
 
 #[cfg(test)]
@@ -1900,6 +2491,61 @@ mod tests {
         let mut guard = recover_lock(&lock);
         guard.push_str("-still-works");
         assert_eq!(*guard, "engine-data-still-works");
+    }
+
+    #[test]
+    fn conn_session_drop_rolls_back_abandoned_txn_even_on_panic() {
+        // m3: the `ConnSession` Drop guard must roll back an
+        // abandoned transaction when the connection thread ends
+        // — including when it PANICS (a rollback written after
+        // `client_loop` returns never runs on that path, and the
+        // transaction — with its snapshot — leaked in the engine
+        // forever).
+        use std::panic::AssertUnwindSafe;
+        let dir = std::env::temp_dir().join("zeno-pgwire-connsession-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = Engine::open(&dir).unwrap();
+        let tables = TableStore::open(&dir).unwrap();
+        let shared = Arc::new(Mutex::new(Shared {
+            engine,
+            tables,
+            data_dir: dir.clone(),
+            rate_limiter: Arc::new(LoginRateLimiter::new()),
+        }));
+        // Normal drop: the transaction is rolled back.
+        let txn = {
+            let mut guard = recover_lock(&shared);
+            guard.engine.begin()
+        };
+        assert!(recover_lock(&shared).engine.txn_active(txn));
+        {
+            let mut conn = ConnSession::new(Arc::clone(&shared), 1);
+            conn.session.txn = Some(txn);
+            // `conn` drops here, at the end of the block.
+        }
+        assert!(
+            !recover_lock(&shared).engine.txn_active(txn),
+            "dropping the session must roll the transaction back"
+        );
+        // Panic unwind: the guard's Drop still runs, and the
+        // transaction is still rolled back.
+        let txn2 = {
+            let mut guard = recover_lock(&shared);
+            guard.engine.begin()
+        };
+        let shared2 = Arc::clone(&shared);
+        let panicked = std::panic::catch_unwind(AssertUnwindSafe(move || {
+            let mut conn = ConnSession::new(shared2, 2);
+            conn.session.txn = Some(txn2);
+            panic!("injected connection-thread panic");
+        }));
+        assert!(panicked.is_err(), "the closure must panic");
+        assert!(
+            !recover_lock(&shared).engine.txn_active(txn2),
+            "a panicking connection must still roll its transaction back"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

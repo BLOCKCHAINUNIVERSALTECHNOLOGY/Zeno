@@ -1,19 +1,29 @@
 // pgwire.rs — PostgreSQL wire protocol (frontend/backend, v3.0),
-// Simple Query only. Written from the official PostgreSQL docs
-// ("Message Flow" and "Message Formats", protocol 3.0) — no pgwire
-// crate, no new dependency, just `std::net::TcpListener`.
+// Simple Query + extended query protocol. Written from the official
+// PostgreSQL docs ("Message Flow" and "Message Formats", protocol
+// 3.0) — no pgwire crate, just `std::net::TcpListener`.
 //
 // What this implements:
 // - Startup handshake: StartupMessage (protocol 3.0), SSLRequest
 //   (answered 'N' — no SSL), CancelRequest (closed, no reply).
-// - Trust auth: every client gets AuthenticationOk, no password.
-//   **Local prototype only — see the BOLD warning in the README.**
+// - Auth: trust auth when no password is set (every client gets
+//   AuthenticationOk, no password — **local prototype only, see the
+//   BOLD warning in the README**); SCRAM-SHA-256 when users exist
+//   in `users.json` (see `auth.rs`).
 // - ParameterStatus (server_version, client_encoding,
 //   standard_conforming_strings), BackendKeyData, ReadyForQuery.
 // - Simple Query 'Q': CREATE TABLE / INSERT / SELECT (WHERE
 //   column=value) / DELETE, mapped onto the engine's table API.
 //   One Query message may hold several statements separated by ';';
 //   each runs in turn, then one ReadyForQuery closes the cycle.
+// - Extended query protocol (see `extended.rs`): Parse/Bind/
+//   Describe/Execute/Close/Sync over the same four statements,
+//   with $1, $2 parameters (text format, plus binary int4/text),
+//   named + unnamed statements and portals, PortalSuspended for
+//   limited Execute, and the protocol's error rule — after an
+//   extended-protocol error the server sends ONE ErrorResponse and
+//   then reads and discards messages until Sync, so a pipelined
+//   driver never desyncs.
 // - Terminate 'X' closes the connection; a client disconnect never
 //   stops the server; clients are served one thread each, sharing one
 //   engine behind a Mutex (the data-dir LOCK still allows exactly one
@@ -21,29 +31,27 @@
 //   directory fails with the lock error).
 //
 // What it deliberately does NOT implement (see README, honest limits):
-// - Extended query protocol: Parse/Bind/Describe/Execute/Close get
-//   a clear ErrorResponse ("not supported") and NO ReadyForQuery —
-//   per the PostgreSQL protocol ReadyForQuery is sent ONLY after
-//   Sync, so a driver that pipelines P/B/D/E/S in one flush and
-//   reads until the first ReadyForQuery stays in sync and its next
-//   Simple Query is answered normally. The connection stays alive.
-// - SSL, password/SCRAM auth, COPY, LISTEN/NOTIFY, cursors.
+// - SSL, COPY, LISTEN/NOTIFY, cursors.
 // - MVCC/transactions: every statement sees the latest value.
 //
 // All values travel as text (type OID 25, `text`), because every
 // Zeno table column is a string. RowDescription therefore always
-// reports OID 25, typlen -1, format 0 (text).
+// reports OID 25, typlen -1; the format code is 0 (text) unless the
+// client asked for binary result format in Bind — binary text is the
+// same bytes, so a binary DataRow carries the same UTF-8 string.
 //
 // `server_version` is reported as "18.0": that is the PostgreSQL
 // version whose wire protocol this implements (the docs this code was
 // written against), so clients that parse the version do not choke.
 // Zeno is NOT PostgreSQL — the README says so plainly.
 
+use crate::auth;
 use crate::engine::Engine;
+use crate::extended::ExtendedState;
 use crate::table::TableStore;
 use std::io::{BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -74,9 +82,13 @@ static NEXT_CONN_ID: AtomicU32 = AtomicU32::new(1);
 /// The one engine + table registry shared by all connections of one
 /// server process. Every statement locks this for its whole run, so
 /// two clients can never interleave a read and a write halfway.
-struct Shared {
+pub(crate) struct Shared {
     engine: Engine,
     tables: TableStore,
+    /// The data directory, so the handshake can re-read `users.json`
+    /// on every connection (a password set with `zeno user` takes
+    /// effect for new connections without restarting the server).
+    data_dir: PathBuf,
 }
 
 /// Start the server: open the engine (this takes the data-dir lock —
@@ -87,14 +99,29 @@ struct Shared {
 pub fn serve(data_dir: &Path, port: u16) -> std::io::Result<()> {
     let engine = Engine::open(data_dir)?;
     let tables = TableStore::open(data_dir)?;
-    let shared = Arc::new(Mutex::new(Shared { engine, tables }));
+    // Fail closed: a corrupt users.json must never silently
+    // become trust auth (that would switch password auth off). A
+    // missing users.json simply means "no users yet" -> trust auth.
+    let users = auth::load_users(data_dir)?;
+    let shared = Arc::new(Mutex::new(Shared {
+        engine,
+        tables,
+        data_dir: data_dir.to_path_buf(),
+    }));
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     println!(
-        "zeno 0.3.0 listening on 127.0.0.1:{} (data dir: {})",
+        "zeno 0.4.0 listening on 127.0.0.1:{} (data dir: {})",
         port,
         data_dir.display()
     );
-    println!("trust auth: any local client may connect, no password — local prototype only");
+    if users.is_empty() {
+        println!("trust auth: any local client may connect, no password — local prototype only");
+    } else {
+        println!(
+            "SCRAM-SHA-256 auth: {} user(s) configured, password required — local prototype only, no SSL",
+            users.len()
+        );
+    }
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
@@ -136,7 +163,7 @@ pub fn serve(data_dir: &Path, port: u16) -> std::io::Result<()> {
 /// buffer is allocated, so a hostile frame claiming 64 MiB (or a
 /// negative/garbage length) can never make us allocate before we
 /// know the frame is legal.
-fn read_message(reader: &mut impl Read) -> std::io::Result<Option<(u8, Vec<u8>)>> {
+pub(crate) fn read_message(reader: &mut impl Read) -> std::io::Result<Option<(u8, Vec<u8>)>> {
     let mut tag = [0u8; 1];
     match reader.read_exact(&mut tag) {
         Ok(()) => {}
@@ -158,7 +185,7 @@ fn read_message(reader: &mut impl Read) -> std::io::Result<Option<(u8, Vec<u8>)>
 }
 
 /// Write one framed message: type byte, length, body.
-fn write_message(writer: &mut impl Write, tag: u8, body: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_message(writer: &mut impl Write, tag: u8, body: &[u8]) -> std::io::Result<()> {
     let len = (body.len() + 4) as i32;
     writer.write_all(&[tag])?;
     writer.write_all(&len.to_be_bytes())?;
@@ -166,13 +193,13 @@ fn write_message(writer: &mut impl Write, tag: u8, body: &[u8]) -> std::io::Resu
     Ok(())
 }
 
-fn put_i16(out: &mut Vec<u8>, v: i16) {
+pub(crate) fn put_i16(out: &mut Vec<u8>, v: i16) {
     out.extend_from_slice(&v.to_be_bytes());
 }
-fn put_i32(out: &mut Vec<u8>, v: i32) {
+pub(crate) fn put_i32(out: &mut Vec<u8>, v: i32) {
     out.extend_from_slice(&v.to_be_bytes());
 }
-fn put_cstr(out: &mut Vec<u8>, s: &str) {
+pub(crate) fn put_cstr(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(s.as_bytes());
     out.push(0);
 }
@@ -212,7 +239,11 @@ fn ready_for_query(writer: &mut impl Write) -> std::io::Result<()> {
 /// message (Parse/Bind/Describe/Execute/Close) it does NOT — the
 /// PostgreSQL protocol sends ReadyForQuery only after Sync, and
 /// sending one per extended message would desync pipelined drivers.
-fn error_response(writer: &mut impl Write, code: &str, message: &str) -> std::io::Result<()> {
+pub(crate) fn error_response(
+    writer: &mut impl Write,
+    code: &str,
+    message: &str,
+) -> std::io::Result<()> {
     let mut body = Vec::new();
     body.push(b'S');
     put_cstr(&mut body, "ERROR");
@@ -227,7 +258,7 @@ fn error_response(writer: &mut impl Write, code: &str, message: &str) -> std::io
 }
 
 /// EmptyQueryResponse: 'I', for a Query that held no statement at all.
-fn empty_query_response(writer: &mut impl Write) -> std::io::Result<()> {
+pub(crate) fn empty_query_response(writer: &mut impl Write) -> std::io::Result<()> {
     write_message(writer, b'I', &[])
 }
 
@@ -240,17 +271,24 @@ fn empty_query_response(writer: &mut impl Write) -> std::io::Result<()> {
 /// negative count). Zeno tables are small in practice and no guard
 /// is added in V0.3 — a table with >32767 columns is a protocol
 /// error waiting to happen, not a supported case.
-fn row_description(writer: &mut impl Write, columns: &[String]) -> std::io::Result<()> {
+pub(crate) fn row_description(
+    writer: &mut impl Write,
+    columns: &[String],
+    formats: &[i16],
+) -> std::io::Result<()> {
     let mut body = Vec::new();
     put_i16(&mut body, columns.len() as i16);
-    for col in columns {
+    for (i, col) in columns.iter().enumerate() {
         put_cstr(&mut body, col);
         put_i32(&mut body, 0); // table OID
         put_i16(&mut body, 0); // column number
         put_i32(&mut body, 25); // type OID: text
         put_i16(&mut body, -1); // typlen: variable
         put_i32(&mut body, -1); // typmod
-        put_i16(&mut body, 0); // format: text
+                                // Format code: 0 = text, 1 = binary. `formats` holds one per
+                                // column (from Bind); a missing entry means text. Binary
+                                // text is the same bytes as text, so DataRow is unchanged.
+        put_i16(&mut body, formats.get(i).copied().unwrap_or(0));
     }
     write_message(writer, b'T', &body)
 }
@@ -258,7 +296,7 @@ fn row_description(writer: &mut impl Write, columns: &[String]) -> std::io::Resu
 /// DataRow: 'D' + Int16 field count, then per field Int32 length
 /// (-1 = NULL) + bytes. Zeno values are never NULL, so -1 never
 /// appears here — a missing column is sent as an empty string.
-fn data_row(writer: &mut impl Write, values: &[String]) -> std::io::Result<()> {
+pub(crate) fn data_row(writer: &mut impl Write, values: &[String]) -> std::io::Result<()> {
     let mut body = Vec::new();
     put_i16(&mut body, values.len() as i16);
     for v in values {
@@ -269,7 +307,7 @@ fn data_row(writer: &mut impl Write, values: &[String]) -> std::io::Result<()> {
 }
 
 /// CommandComplete: 'C' + tag, e.g. "SELECT 2", "INSERT 0 1".
-fn command_complete(writer: &mut impl Write, tag: &str) -> std::io::Result<()> {
+pub(crate) fn command_complete(writer: &mut impl Write, tag: &str) -> std::io::Result<()> {
     let mut body = Vec::new();
     put_cstr(&mut body, tag);
     write_message(writer, b'C', &body)
@@ -286,15 +324,23 @@ fn handle_client(
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
+    let data_dir = shared
+        .lock()
+        .map(|g| g.data_dir.clone())
+        .unwrap_or_else(|e| e.into_inner().data_dir.clone());
     // A read timeout during the handshake is a quiet client, not a
     // server error: close this connection cleanly, keep serving.
-    if let Err(e) = startup_handshake(&mut reader, &mut writer, conn_id) {
+    if let Err(e) = startup_handshake(&mut reader, &mut writer, &data_dir, conn_id) {
         if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut {
             eprintln!("pgwire conn {conn_id}: read timeout during handshake, closing");
             return Ok(());
         }
         return Err(e);
     }
+
+    // Extended-protocol state for this connection: prepared
+    // statements + portals, and the error flag (see the loop).
+    let mut ext = ExtendedState::new();
 
     loop {
         let msg = match read_message(&mut reader) {
@@ -314,8 +360,30 @@ fn handle_client(
         let Some((tag, body)) = msg else {
             return Ok(()); // client disconnected; server keeps running
         };
+        // Error recovery (protocol 54.2.3): after an error in an
+        // extended-protocol message, the backend sends ONE
+        // ErrorResponse and then reads and DISCARDS every message
+        // until Sync — even a Simple Query ('Q') in the batch is
+        // discarded, never run. Sync ends the skip with exactly one
+        // ReadyForQuery; Terminate still closes the connection.
+        if ext.in_error {
+            match tag {
+                b'S' => {
+                    ext.in_error = false;
+                    ready_for_query(&mut writer)?;
+                }
+                b'X' => return Ok(()),
+                _ => {}
+            }
+            writer.flush()?;
+            continue;
+        }
+
         match tag {
             b'Q' => {
+                // A simple Query destroys the unnamed statement and
+                // portal (protocol docs, 54.2.3 note).
+                ext.clear_unnamed();
                 let sql = cstr_to_string(&body);
                 // A write failure here means the client is gone; stop
                 // this connection, not the server.
@@ -324,23 +392,22 @@ fn handle_client(
             }
             b'X' => return Ok(()), // Terminate
             b'P' | b'B' | b'D' | b'E' | b'C' => {
-                // Extended query protocol: not in V0.3. Say so clearly
-                // and keep the connection alive for the next message —
-                // but send NO ReadyForQuery here. The PostgreSQL
-                // protocol sends ReadyForQuery only after Sync; a
-                // driver pipelines Parse+Bind+Describe+Execute+Sync
-                // in one flush and reads until the FIRST ReadyForQuery,
-                // so one ReadyForQuery per extended message would
-                // leave stale replies that get read as the answers to
-                // the NEXT Simple Query (desync). Sync below is the
-                // one message that closes the cycle with ReadyForQuery.
-                error_response(
-                    &mut writer,
-                    "0A000",
-                    "extended query protocol (Parse/Bind/Describe/Execute/Sync) is not \
-                     supported in Zeno 0.3.0 — use the Simple Query protocol",
-                )?;
-                writer.flush()?;
+                // Extended query protocol (see extended.rs). Success
+                // replies are written by the handler; on error ONE
+                // ErrorResponse is sent, NO ReadyForQuery, and the
+                // connection enters skip-until-Sync mode (above) —
+                // that is what keeps a pipelined driver in sync.
+                let result = match tag {
+                    b'P' => crate::extended::handle_parse(&mut writer, &shared, &mut ext, &body),
+                    b'B' => crate::extended::handle_bind(&mut writer, &shared, &mut ext, &body),
+                    b'D' => crate::extended::handle_describe(&mut writer, &shared, &mut ext, &body),
+                    b'E' => crate::extended::handle_execute(&mut writer, &shared, &mut ext, &body),
+                    _ => crate::extended::handle_close(&mut writer, &mut ext, &body),
+                };
+                if let Err(e) = result {
+                    error_response(&mut writer, e.code, &e.message)?;
+                    ext.in_error = true;
+                }
             }
             b'S' => {
                 // Sync: end of an extended-query cycle. This is the
@@ -348,13 +415,10 @@ fn handle_client(
                 // per Sync, however many Parse/Bind/Describe/Execute
                 // messages came before it.
                 ready_for_query(&mut writer)?;
-                writer.flush()?;
             }
             b'H' => {
                 // Flush: no reply message of its own — just push out
-                // whatever is already queued (here: nothing, since
-                // every extended message above already answered).
-                writer.flush()?;
+                // whatever is already queued.
             }
             _ => {
                 error_response(
@@ -365,6 +429,7 @@ fn handle_client(
                 ready_for_query(&mut writer)?;
             }
         }
+        writer.flush()?;
     }
 }
 
@@ -375,6 +440,7 @@ fn handle_client(
 fn startup_handshake(
     reader: &mut impl Read,
     writer: &mut impl Write,
+    data_dir: &Path,
     conn_id: u32,
 ) -> std::io::Result<()> {
     loop {
@@ -411,9 +477,28 @@ fn startup_handshake(
             PROTOCOL_V3 => {
                 // Parameters are NUL-separated name/value pairs after
                 // the version, ending with an empty string. We accept
-                // any user/database — trust auth — and ignore the rest.
-                let _params = parse_startup_params(&body[4..]);
-                auth_ok(writer)?;
+                // any user/database and ignore the rest.
+                let params = parse_startup_params(&body[4..]);
+                let user = params
+                    .iter()
+                    .find(|(k, _)| k == "user")
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default();
+                // Auth: `users.json` is re-read on EVERY connection,
+                // so a password set with `zeno user` applies to new
+                // connections at once. No users configured -> trust
+                // auth (any local client, no password). Users
+                // configured -> SCRAM-SHA-256 is required for every
+                // connection (see auth.rs). A corrupt users.json
+                // fails the connection rather than silently falling
+                // back to trust auth.
+                let users = auth::load_users(data_dir)?;
+                if users.is_empty() {
+                    auth_ok(writer)?;
+                } else {
+                    auth::scram_handshake(reader, writer, &user, &users, data_dir)?;
+                    auth_ok(writer)?;
+                }
                 // server_version "18.0" = the PostgreSQL version whose
                 // wire protocol this implements (see module docs).
                 // Zeno is not PostgreSQL; this only keeps clients that
@@ -499,8 +584,8 @@ fn run_query(
         if stmt.is_empty() {
             continue;
         }
-        match execute_statement(writer, shared, stmt) {
-            Ok(()) => {}
+        match execute_statement(shared, stmt) {
+            Ok(outcome) => write_outcome(writer, &outcome, &[])?,
             Err(e) => {
                 // SQL error: report it, keep the connection alive.
                 error_response(writer, e.code, &e.message)?;
@@ -510,20 +595,56 @@ fn run_query(
     writer.flush()
 }
 
+/// Write one statement's result messages (Simple Query path: the
+/// whole result at once). `formats` holds one format code per output
+/// column (0 = text, 1 = binary); an empty slice means "all text",
+/// which is what Simple Query always uses. Extended Execute writes
+/// its own slices (PortalSuspended), so it does not use this.
+pub(crate) fn write_outcome(
+    writer: &mut impl Write,
+    outcome: &StmtOutcome,
+    formats: &[i16],
+) -> std::io::Result<()> {
+    match outcome {
+        StmtOutcome::Empty => Ok(()),
+        StmtOutcome::Command(tag) => command_complete(writer, tag),
+        StmtOutcome::Rows { columns, rows } => {
+            row_description(writer, columns, formats)?;
+            for values in rows {
+                data_row(writer, values)?;
+            }
+            command_complete(writer, &format!("SELECT {}", rows.len()))
+        }
+    }
+}
+
 /// Split SQL on ';' that sits outside single-quoted strings,
-/// double-quoted identifiers, and `--` line comments.
-/// `''` inside a string is an escaped quote, not the end of it, and
-/// `""` inside a double-quoted identifier is the same. Comment text
-/// (including any ';' in it) is dropped; the newline ending the
-/// comment is kept so the statements stay separated.
-fn split_statements(sql: &str) -> Vec<String> {
+/// double-quoted identifiers, `--` line comments and `/* */`
+/// block comments. `''` inside a string is an escaped quote, not
+/// the end of it, and `""` inside a double-quoted identifier is
+/// the same. Comment text (including any ';' in it) is dropped;
+/// the newline ending a line comment is kept so the statements
+/// stay separated, and a block comment is replaced by one space
+/// so the tokens around it never merge (`SELECT/*c*/*` stays two
+/// tokens, not one).
+pub(crate) fn split_statements(sql: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut chars = sql.chars().peekable();
     let mut in_string = false; // '...'
     let mut in_ident = false; // "..."
     let mut in_comment = false; // -- to end of line
+    let mut in_block_comment = false; // /* ... */
     while let Some(c) = chars.next() {
+        if in_block_comment {
+            // A `/*` inside a block comment does not nest (like
+            // PostgreSQL): the first `*/` ends the comment.
+            if c == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                in_block_comment = false;
+            }
+            continue; // comment text (and its ';') is dropped
+        }
         if in_comment {
             if c == '\n' {
                 in_comment = false;
@@ -566,6 +687,11 @@ fn split_statements(sql: &str) -> Vec<String> {
                 chars.next(); // consume the second '-'
                 in_comment = true;
             }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next(); // consume the '*'
+                in_block_comment = true;
+                cur.push(' '); // keep the tokens around it apart
+            }
             ';' => out.push(std::mem::take(&mut cur)),
             _ => cur.push(c),
         }
@@ -578,43 +704,94 @@ fn split_statements(sql: &str) -> Vec<String> {
 
 /// One SQL error: a PostgreSQL SQLSTATE code + message. `code` is
 /// "42601" (syntax error), "42P01" (undefined table), "42703"
-/// (undefined column), "42P07" (table already exists) or "0A000"
-/// (feature not supported).
-struct SqlError {
-    code: &'static str,
-    message: String,
+/// (undefined column), "42P07" (table already exists), "0A000"
+/// (feature not supported), or one of the extended-protocol codes
+/// ("08P01" protocol violation, "26000" unknown prepared statement
+/// or portal, "42P05"/"42P03" duplicate statement/portal, "42P18"
+/// indeterminate parameter type, "22P02"/"22P03" bad parameter
+/// value, "54000" too many parameters).
+#[derive(Debug)]
+pub(crate) struct SqlError {
+    pub(crate) code: &'static str,
+    pub(crate) message: String,
 }
 
-fn sql_err(code: &'static str, message: impl Into<String>) -> SqlError {
+pub(crate) fn sql_err(code: &'static str, message: impl Into<String>) -> SqlError {
     SqlError {
         code,
         message: message.into(),
     }
 }
 
-/// Run one statement and write its RowDescription/DataRow/
-/// CommandComplete (or return its SqlError for the caller to report).
-fn execute_statement(
-    writer: &mut impl Write,
+/// The result of running one statement, without any wire bytes:
+/// the caller decides how to write it — Simple Query writes it all
+/// at once (`write_outcome`); extended Execute may stream it in
+/// slices and end with PortalSuspended instead of CommandComplete.
+pub(crate) enum StmtOutcome {
+    /// SELECT: output columns + all rows (values in column order).
+    Rows {
+        columns: Vec<String>,
+        rows: Vec<Vec<String>>,
+    },
+    /// CREATE / INSERT / DELETE: the CommandComplete tag.
+    Command(String),
+    /// An empty statement: nothing to send.
+    Empty,
+}
+
+/// Run one statement given as SQL text.
+pub(crate) fn execute_statement(
     shared: &Arc<Mutex<Shared>>,
     stmt: &str,
-) -> Result<(), SqlError> {
+) -> Result<StmtOutcome, SqlError> {
     let tokens = tokenize(stmt).ok_or_else(|| sql_err("42601", "unterminated string literal"))?;
+    execute_tokens(shared, &tokens)
+}
+
+/// Run one statement given as tokens. Extended Execute uses this
+/// after substituting the bound parameter values for the `$n`
+/// placeholders, so parameters can never be re-parsed as SQL.
+pub(crate) fn execute_tokens(
+    shared: &Arc<Mutex<Shared>>,
+    tokens: &[Token],
+) -> Result<StmtOutcome, SqlError> {
+    match classify_statement(tokens)? {
+        StmtKind::Create => exec_create(shared, tokens),
+        StmtKind::Insert => exec_insert(shared, tokens),
+        StmtKind::Select => exec_select(shared, tokens),
+        StmtKind::Delete => exec_delete(shared, tokens),
+        StmtKind::Empty => Ok(StmtOutcome::Empty),
+    }
+}
+
+/// Which of the four supported statements (if any) `tokens` holds.
+/// Extended Parse reuses this, so a bad statement fails at Parse
+/// time with the same error a Simple Query would get.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StmtKind {
+    Create,
+    Insert,
+    Select,
+    Delete,
+    Empty,
+}
+
+pub(crate) fn classify_statement(tokens: &[Token]) -> Result<StmtKind, SqlError> {
     let first = tokens
         .first()
         .map(|t| t.text.to_ascii_uppercase())
         .unwrap_or_default();
     match first.as_str() {
-        "CREATE" => exec_create(writer, shared, &tokens),
-        "INSERT" => exec_insert(writer, shared, &tokens),
-        "SELECT" => exec_select(writer, shared, &tokens),
-        "DELETE" => exec_delete(writer, shared, &tokens),
+        "CREATE" => Ok(StmtKind::Create),
+        "INSERT" => Ok(StmtKind::Insert),
+        "SELECT" => Ok(StmtKind::Select),
+        "DELETE" => Ok(StmtKind::Delete),
         "UPDATE" | "DROP" | "ALTER" | "BEGIN" | "COMMIT" | "ROLLBACK" | "SET" | "SHOW"
         | "GRANT" | "REVOKE" | "TRUNCATE" | "COPY" | "VACUUM" | "EXPLAIN" => Err(sql_err(
             "0A000",
-            format!("{first} is not supported in Zeno 0.3.0 (only CREATE TABLE, INSERT, SELECT, DELETE)"),
+            format!("{first} is not supported in Zeno 0.4.0 (only CREATE TABLE, INSERT, SELECT, DELETE)"),
         )),
-        "" => Ok(()),
+        "" => Ok(StmtKind::Empty),
         other => Err(sql_err(
             "42601",
             format!("syntax error: unsupported statement starting with '{other}'"),
@@ -629,15 +806,18 @@ fn execute_statement(
 // ---------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq)]
-struct Token {
+pub(crate) struct Token {
     /// The token text, unquoted: for 'abc' this is `abc`, for "col"
     /// this is `col`, for bare words/numbers the word itself.
-    text: String,
+    pub(crate) text: String,
     /// True only for a 'single-quoted' string literal.
-    quoted_string: bool,
+    pub(crate) quoted_string: bool,
+    /// True only for a "double-quoted" identifier. A `$1` inside
+    /// one is an identifier, not a parameter placeholder.
+    pub(crate) quoted_ident: bool,
 }
 
-fn tokenize(sql: &str) -> Option<Vec<Token>> {
+pub(crate) fn tokenize(sql: &str) -> Option<Vec<Token>> {
     let mut tokens = Vec::new();
     let mut chars = sql.chars().peekable();
     while let Some(&c) = chars.peek() {
@@ -665,6 +845,7 @@ fn tokenize(sql: &str) -> Option<Vec<Token>> {
                 tokens.push(Token {
                     text: s,
                     quoted_string: true,
+                    quoted_ident: false,
                 });
             }
             '"' => {
@@ -673,26 +854,67 @@ fn tokenize(sql: &str) -> Option<Vec<Token>> {
                 loop {
                     match chars.next() {
                         None => return None,
-                        Some('"') => break,
+                        // `""` inside a double-quoted identifier is
+                        // an escaped quote, not the end of it.
+                        Some('"') => {
+                            if chars.peek() == Some(&'"') {
+                                chars.next();
+                                s.push('"');
+                            } else {
+                                break;
+                            }
+                        }
                         Some(ch) => s.push(ch),
                     }
                 }
                 tokens.push(Token {
                     text: s,
                     quoted_string: false,
+                    quoted_ident: true,
                 });
+            }
+            '/' => {
+                chars.next();
+                if chars.peek() == Some(&'*') {
+                    // `/* ... */` block comment: skipped entirely,
+                    // like whitespace. A `/*` inside a string or
+                    // identifier never reaches here (those loops
+                    // consume it first), and an unterminated block
+                    // comment is a syntax error (None -> 42601).
+                    chars.next();
+                    loop {
+                        match chars.next() {
+                            None => return None,
+                            Some('*') if chars.peek() == Some(&'/') => {
+                                chars.next();
+                                break;
+                            }
+                            Some(_) => {}
+                        }
+                    }
+                } else {
+                    tokens.push(Token {
+                        text: "/".to_string(),
+                        quoted_string: false,
+                        quoted_ident: false,
+                    });
+                }
             }
             '(' | ')' | ',' | '=' | '*' | '.' | ';' => {
                 tokens.push(Token {
                     text: c.to_string(),
                     quoted_string: false,
+                    quoted_ident: false,
                 });
                 chars.next();
             }
             _ => {
                 let mut s = String::new();
                 while let Some(&ch) = chars.peek() {
-                    if ch.is_whitespace() || "()',=\";*".contains(ch) {
+                    // '/' ends a bare token too: `SELECT/*c*/FROM`
+                    // must tokenize as SELECT, FROM — the '/' arm
+                    // above then skips the block comment.
+                    if ch.is_whitespace() || "()',=\";*/".contains(ch) {
                         break;
                     }
                     s.push(ch);
@@ -702,6 +924,7 @@ fn tokenize(sql: &str) -> Option<Vec<Token>> {
                     tokens.push(Token {
                         text: s,
                         quoted_string: false,
+                        quoted_ident: false,
                     });
                 }
             }
@@ -712,7 +935,7 @@ fn tokenize(sql: &str) -> Option<Vec<Token>> {
 
 /// Case-insensitive keyword match at `tokens[i]`; returns the index
 /// after the keyword, or None.
-fn expect_keyword(tokens: &[Token], i: usize, kw: &str) -> Option<usize> {
+pub(crate) fn expect_keyword(tokens: &[Token], i: usize, kw: &str) -> Option<usize> {
     if tokens
         .get(i)
         .map(|t| t.text.eq_ignore_ascii_case(kw))
@@ -727,7 +950,7 @@ fn expect_keyword(tokens: &[Token], i: usize, kw: &str) -> Option<usize> {
 /// A table/column name: any non-quoted-string token that is not
 /// punctuation. (Keywords as names are allowed here — this is a
 /// prototype subset, not full PostgreSQL.)
-fn expect_name(tokens: &[Token], i: usize) -> Option<(String, usize)> {
+pub(crate) fn expect_name(tokens: &[Token], i: usize) -> Option<(String, usize)> {
     let t = tokens.get(i)?;
     if t.quoted_string || ["(", ")", ",", "=", "*", "."].contains(&t.text.as_str()) {
         return None;
@@ -735,7 +958,7 @@ fn expect_name(tokens: &[Token], i: usize) -> Option<(String, usize)> {
     Some((t.text.clone(), i + 1))
 }
 
-fn expect_punct(tokens: &[Token], i: usize, p: &str) -> Option<usize> {
+pub(crate) fn expect_punct(tokens: &[Token], i: usize, p: &str) -> Option<usize> {
     if tokens.get(i).map(|t| t.text.as_str()) == Some(p) {
         Some(i + 1)
     } else {
@@ -745,7 +968,7 @@ fn expect_punct(tokens: &[Token], i: usize, p: &str) -> Option<usize> {
 
 /// `WHERE col = value` at `tokens[i]`; `value` may be a quoted string
 /// or a bare token (number or word). Returns (column, value, next).
-fn parse_where(tokens: &[Token], i: usize) -> Option<(String, String, usize)> {
+pub(crate) fn parse_where(tokens: &[Token], i: usize) -> Option<(String, String, usize)> {
     let mut i = expect_keyword(tokens, i, "WHERE")?;
     let (col, next) = expect_name(tokens, i)?;
     i = next;
@@ -761,11 +984,7 @@ fn parse_where(tokens: &[Token], i: usize) -> Option<(String, String, usize)> {
 /// CREATE TABLE name (col1, col2, ...) — column types are NOT parsed:
 /// every Zeno column is text. `CREATE TABLE users (id int, name text)`
 /// therefore also works: the type words are skipped.
-fn exec_create(
-    writer: &mut impl Write,
-    shared: &Arc<Mutex<Shared>>,
-    tokens: &[Token],
-) -> Result<(), SqlError> {
+fn exec_create(shared: &Arc<Mutex<Shared>>, tokens: &[Token]) -> Result<StmtOutcome, SqlError> {
     let mut i =
         expect_keyword(tokens, 0, "CREATE").ok_or_else(|| sql_err("42601", "expected CREATE"))?;
     i = expect_keyword(tokens, i, "TABLE")
@@ -841,17 +1060,12 @@ fn exec_create(
             sql_err("42601", e)
         }
     })?;
-    command_complete(writer, "CREATE TABLE").map_err(|e| sql_err("XX000", e.to_string()))?;
-    Ok(())
+    Ok(StmtOutcome::Command("CREATE TABLE".to_string()))
 }
 
 /// INSERT INTO name VALUES (v1, v2, ...) — values are quoted strings
 /// or bare tokens; the count must match the table's columns.
-fn exec_insert(
-    writer: &mut impl Write,
-    shared: &Arc<Mutex<Shared>>,
-    tokens: &[Token],
-) -> Result<(), SqlError> {
+fn exec_insert(shared: &Arc<Mutex<Shared>>, tokens: &[Token]) -> Result<StmtOutcome, SqlError> {
     let mut i =
         expect_keyword(tokens, 0, "INSERT").ok_or_else(|| sql_err("42601", "expected INSERT"))?;
     i = expect_keyword(tokens, i, "INTO")
@@ -868,7 +1082,10 @@ fn exec_insert(
         let t = tokens
             .get(i)
             .ok_or_else(|| sql_err("42601", "expected a value in the value list"))?;
-        if t.text == ")" {
+        // Only an UNQUOTED ')' closes the value list: a quoted
+        // string value of ')' (or any other punctuation) is data,
+        // not syntax — `VALUES (9, ')', 'Delhi')` must insert.
+        if t.text == ")" && !t.quoted_string {
             break;
         }
         values.push(t.text.clone());
@@ -887,7 +1104,7 @@ fn exec_insert(
     let mut guard = shared
         .lock()
         .map_err(|_| sql_err("XX000", "server lock poisoned"))?;
-    let Shared { engine, tables } = &mut *guard;
+    let Shared { engine, tables, .. } = &mut *guard;
     tables.insert(engine, &name, values).map_err(|e| {
         if e.contains("no such table") {
             sql_err("42P01", e)
@@ -895,16 +1112,28 @@ fn exec_insert(
             sql_err("42601", e)
         }
     })?;
-    command_complete(writer, "INSERT 0 1").map_err(|e| sql_err("XX000", e.to_string()))?;
-    Ok(())
+    Ok(StmtOutcome::Command("INSERT 0 1".to_string()))
 }
 
-/// SELECT * | col1, col2 FROM name [WHERE col = value]
-fn exec_select(
-    writer: &mut impl Write,
+/// A parsed SELECT, ready to run: output columns (resolved
+/// against the registry — `*` becomes all columns in registry
+/// order), table name, and the optional WHERE filter. Extended
+/// Bind/Describe reuse this so a prepared SELECT is checked the
+/// same way a Simple Query SELECT is, without executing it.
+pub(crate) struct SelectPlan {
+    pub columns: Vec<String>,
+    pub table: String,
+    pub filter: Option<(String, String)>,
+}
+
+/// Parse `SELECT * | col1, col2 FROM name [WHERE col = value]` and
+/// resolve its output columns. The WHERE column is NOT checked
+/// against the registry here — matching `exec_select`'s V0.3
+/// behaviour, a filter on an unknown column simply matches no rows.
+pub(crate) fn parse_select(
     shared: &Arc<Mutex<Shared>>,
     tokens: &[Token],
-) -> Result<(), SqlError> {
+) -> Result<SelectPlan, SqlError> {
     let mut i =
         expect_keyword(tokens, 0, "SELECT").ok_or_else(|| sql_err("42601", "expected SELECT"))?;
     // Column list: '*' or comma-separated names.
@@ -946,11 +1175,11 @@ fn exec_select(
         return Err(sql_err("42601", "unexpected text after SELECT"));
     }
 
-    let mut guard = shared
+    let guard = shared
         .lock()
         .map_err(|_| sql_err("XX000", "server lock poisoned"))?;
-    let Shared { engine, tables } = &mut *guard;
-    let all_columns = tables
+    let all_columns = guard
+        .tables
         .columns(&name)
         .ok_or_else(|| sql_err("42P01", format!("no such table '{name}'")))?
         .to_vec();
@@ -969,32 +1198,44 @@ fn exec_select(
             want.clone()
         }
     };
+    Ok(SelectPlan {
+        columns: out_columns,
+        table: name,
+        filter,
+    })
+}
+
+/// SELECT * | col1, col2 FROM name [WHERE col = value]
+fn exec_select(shared: &Arc<Mutex<Shared>>, tokens: &[Token]) -> Result<StmtOutcome, SqlError> {
+    let plan = parse_select(shared, tokens)?;
+    let mut guard = shared
+        .lock()
+        .map_err(|_| sql_err("XX000", "server lock poisoned"))?;
+    let Shared { engine, tables, .. } = &mut *guard;
     let rows = tables
         .select(
             engine,
-            &name,
-            filter.as_ref().map(|(c, v)| (c.as_str(), v.as_str())),
+            &plan.table,
+            plan.filter.as_ref().map(|(c, v)| (c.as_str(), v.as_str())),
         )
         .map_err(|e| sql_err("42P01", e))?;
-    row_description(writer, &out_columns).map_err(|e| sql_err("XX000", e.to_string()))?;
-    for (_, row) in &rows {
-        let values: Vec<String> = out_columns
-            .iter()
-            .map(|c| row.get(c).cloned().unwrap_or_default())
-            .collect();
-        data_row(writer, &values).map_err(|e| sql_err("XX000", e.to_string()))?;
-    }
-    command_complete(writer, &format!("SELECT {}", rows.len()))
-        .map_err(|e| sql_err("XX000", e.to_string()))?;
-    Ok(())
+    let out_rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|(_, row)| {
+            plan.columns
+                .iter()
+                .map(|c| row.get(c).cloned().unwrap_or_default())
+                .collect()
+        })
+        .collect();
+    Ok(StmtOutcome::Rows {
+        columns: plan.columns,
+        rows: out_rows,
+    })
 }
 
 /// DELETE FROM name [WHERE col = value] — without WHERE, all rows go.
-fn exec_delete(
-    writer: &mut impl Write,
-    shared: &Arc<Mutex<Shared>>,
-    tokens: &[Token],
-) -> Result<(), SqlError> {
+fn exec_delete(shared: &Arc<Mutex<Shared>>, tokens: &[Token]) -> Result<StmtOutcome, SqlError> {
     let mut i =
         expect_keyword(tokens, 0, "DELETE").ok_or_else(|| sql_err("42601", "expected DELETE"))?;
     i = expect_keyword(tokens, i, "FROM")
@@ -1019,7 +1260,7 @@ fn exec_delete(
     let mut guard = shared
         .lock()
         .map_err(|_| sql_err("XX000", "server lock poisoned"))?;
-    let Shared { engine, tables } = &mut *guard;
+    let Shared { engine, tables, .. } = &mut *guard;
     let deleted = tables
         .delete(
             engine,
@@ -1033,9 +1274,7 @@ fn exec_delete(
                 sql_err("42601", e)
             }
         })?;
-    command_complete(writer, &format!("DELETE {deleted}"))
-        .map_err(|e| sql_err("XX000", e.to_string()))?;
-    Ok(())
+    Ok(StmtOutcome::Command(format!("DELETE {deleted}")))
 }
 
 #[cfg(test)]
@@ -1069,6 +1308,56 @@ mod tests {
         let stmts = split_statements("CREATE TABLE \"a\"\"b\" (id); SELECT 1");
         assert_eq!(stmts.len(), 2);
         assert!(stmts[0].contains("\"a\"\"b\""));
+    }
+
+    #[test]
+    fn split_handles_block_comments() {
+        // A ';' inside a /* */ comment must not split, and the
+        // comment text itself is dropped.
+        let stmts = split_statements("SELECT * FROM t /* ; comment ; */ WHERE a = 1; SELECT 2");
+        assert_eq!(stmts.len(), 2);
+        assert!(stmts[0].contains("SELECT * FROM t"));
+        assert!(!stmts[0].contains("comment"));
+        // A comment that is the whole statement leaves nothing.
+        let stmts = split_statements("/* ; */");
+        assert!(stmts.is_empty(), "a comment-only query has no statements");
+        // A comment between tokens must not merge them.
+        let stmts = split_statements("SELECT/*c*/* FROM t");
+        assert_eq!(stmts.len(), 1);
+        assert!(stmts[0].contains("SELECT"));
+        assert!(stmts[0].contains("FROM t"));
+        // A /* inside a string literal is data, not a comment.
+        let stmts = split_statements("INSERT INTO t VALUES ('/* not a comment */'); SELECT 2");
+        assert_eq!(stmts.len(), 2);
+        assert!(stmts[0].contains("'/* not a comment */'"));
+        // An unterminated block comment drops the rest, like a
+        // trailing line comment does.
+        let stmts = split_statements("SELECT 1 /* never closed");
+        assert_eq!(stmts.len(), 1);
+        assert!(stmts[0].contains("SELECT 1"));
+    }
+
+    #[test]
+    fn tokenize_handles_block_comments_and_escaped_ident_quotes() {
+        // `$2` inside a block comment is not a token at all.
+        let tokens = tokenize("SELECT * FROM t WHERE a = $1 /* $2 */").unwrap();
+        assert_eq!(tokens.iter().filter(|t| t.text.starts_with('$')).count(), 1);
+        assert_eq!(tokens.iter().find(|t| t.text == "$1").unwrap().text, "$1");
+        // `/*` inside a string literal is data, not a comment.
+        let tokens = tokenize("SELECT '/* $1 */' FROM t WHERE a = $1").unwrap();
+        assert_eq!(tokens.iter().filter(|t| t.text.starts_with('$')).count(), 1);
+        // `""` inside a double-quoted identifier is an escaped
+        // quote: "a""b" is one identifier, `a"b`.
+        let tokens = tokenize("CREATE TABLE \"a\"\"b\" (id)").unwrap();
+        let ident = tokens.iter().find(|t| t.quoted_ident).unwrap();
+        assert_eq!(ident.text, "a\"b");
+        // A comment between tokens never merges them.
+        let tokens = tokenize("SELECT/*c*/* FROM t").unwrap();
+        assert_eq!(tokens[0].text, "SELECT");
+        assert_eq!(tokens[1].text, "*");
+        assert_eq!(tokens[2].text, "FROM");
+        // An unterminated block comment is a syntax error.
+        assert!(tokenize("SELECT 1 /* never closed").is_none());
     }
 
     #[test]
@@ -1129,7 +1418,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let engine = Engine::open(&dir).unwrap();
         let tables = TableStore::open(&dir).unwrap();
-        let shared = Arc::new(Mutex::new(Shared { engine, tables }));
+        let shared = Arc::new(Mutex::new(Shared {
+            engine,
+            tables,
+            data_dir: dir.clone(),
+        }));
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();

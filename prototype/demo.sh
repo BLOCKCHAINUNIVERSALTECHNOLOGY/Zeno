@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# demo.sh — Zeno V0.3 end-to-end demo.
+# demo.sh — Zeno V0.4 end-to-end demo.
 #
 # Runs a full scenario against one data directory:
 #   1. Key-value put / get / delete
@@ -20,6 +20,12 @@
 #      handshake + Simple Query) because psql is NOT installed in this
 #      sandbox, and prints the decoded messages. A second server on
 #      the same data dir is refused (LOCK).
+#  10. EXTENDED QUERY PROTOCOL + SCRAM-SHA-256 AUTH (V0.4) — the same
+#      Python client pipelines Parse+Bind+Describe+Execute+Sync with
+#      a $1 parameter, fetches one row at a time (PortalSuspended),
+#      then sets a password with `zeno user set-password` and logs in
+#      with a full SCRAM-SHA-256 handshake (Python hashlib client),
+#      plus a wrong-password rejection.
 #
 # No fake numbers: everything printed below is real output of the binary.
 set -euo pipefail
@@ -58,7 +64,7 @@ $ZENO --data "$DATA" table insert users 3,Ravi,Delhi
 $ZENO --data "$DATA" table select users
 $ZENO --data "$DATA" table select users city=Delhi
 
-say "3. JSON DOCUMENT — put / get / find (linear scan in V0.3)"
+say "3. JSON DOCUMENT — put / get / find (linear scan in V0.4)"
 $ZENO --data "$DATA" doc put profiles u1 '{"name":"Sanjay","city":"Delhi","role":"builder"}'
 $ZENO --data "$DATA" doc put profiles u2 '{"name":"Asha","city":"Mumbai","role":"designer"}'
 $ZENO --data "$DATA" doc put profiles u3 '{"name":"Ravi","city":"Delhi","role":"tester"}'
@@ -218,10 +224,256 @@ else
 fi
 kill $SERVER2 || true
 wait $SERVER2 2>/dev/null || true
+say "10. EXTENDED QUERY PROTOCOL + SCRAM-SHA-256 AUTH (V0.4)"
+echo "(prepared statements with \$1 params, PortalSuspended resume,"
+echo " then a password set with 'zeno user' and a full SCRAM login)"
+$ZENO --data "$DATA" serve --port 5433 &
+SERVER=$!
+sleep 1
+python3 - <<'PYEOF'
+import socket, struct
+
+def recvn(s, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = s.recv(n - len(buf))
+        if not chunk:
+            raise EOFError("connection closed")
+        buf += chunk
+    return buf
+
+def read_msg(s):
+    tag = recvn(s, 1)
+    (ln,) = struct.unpack("!I", recvn(s, 4))
+    return tag, recvn(s, ln - 4)
+
+def show(s, label):
+    print(f"-- {label}:")
+    while True:
+        tag, body = read_msg(s)
+        if tag == b'R': print("   AuthenticationOk")
+        elif tag == b'S':
+            name, _, rest = body.partition(b"\0")
+            print(f"   ParameterStatus {name.decode()}={rest.split(bytes([0]))[0].decode()}")
+        elif tag == b'K': print("   BackendKeyData")
+        elif tag == b'1': print("   ParseComplete")
+        elif tag == b'2': print("   BindComplete")
+        elif tag == b'3': print("   CloseComplete")
+        elif tag == b't':
+            n = struct.unpack("!H", body[:2])[0]
+            oids = [struct.unpack("!i", body[2 + 4 * i:6 + 4 * i])[0] for i in range(n)]
+            print(f"   ParameterDescription {oids}")
+        elif tag == b'n': print("   NoData")
+        elif tag == b's': print("   PortalSuspended")
+        elif tag == b'T':
+            n = struct.unpack("!H", body[:2])[0]
+            cols, p = [], 2
+            for _ in range(n):
+                end = body.index(b"\0", p)
+                cols.append(body[p:end].decode())
+                p = end + 1 + 18
+            print(f"   RowDescription {cols}")
+        elif tag == b'D':
+            n = struct.unpack("!H", body[:2])[0]
+            vals, p = [], 2
+            for _ in range(n):
+                (ln,) = struct.unpack("!i", body[p:p + 4]); p += 4
+                vals.append(body[p:p + ln].decode()); p += ln
+            print(f"   DataRow {vals}")
+        elif tag == b'C':
+            print(f"   CommandComplete {body.split(bytes([0]))[0].decode()}")
+        elif tag == b'E':
+            code, msg, p = "", "", 0
+            while p < len(body) and body[p] != 0:
+                f = chr(body[p]); p += 1
+                end = body.index(b"\0", p)
+                v = body[p:end].decode(); p = end + 1
+                if f == 'C': code = v
+                if f == 'M': msg = v
+            print(f"   ErrorResponse [{code}] {msg}")
+        elif tag == b'Z':
+            print(f"   ReadyForQuery '{body.decode()}'")
+            return
+        else:
+            print(f"   (other message {tag!r})")
+
+def frame(tag, body):
+    return tag + struct.pack("!I", len(body) + 4) + body
+
+def parse(name, sql, types=()):
+    b = name.encode() + b"\0" + sql.encode() + b"\0" + struct.pack("!H", len(types))
+    for t in types:
+        b += struct.pack("!i", t)
+    return frame(b'P', b)
+
+def bind(portal, stmt, params, result_formats=()):
+    b = portal.encode() + b"\0" + stmt.encode() + b"\0"
+    b += struct.pack("!H", 0)  # all params text format
+    b += struct.pack("!H", len(params))
+    for v in params:
+        if v is None:
+            b += struct.pack("!i", -1)
+        else:
+            vb = v.encode()
+            b += struct.pack("!i", len(vb)) + vb
+    b += struct.pack("!H", len(result_formats))
+    for f in result_formats:
+        b += struct.pack("!H", f)
+    return frame(b'B', b)
+
+def describe(kind, name):
+    return frame(b'D', kind.encode() + name.encode() + b"\0")
+
+def execute(portal, max_rows):
+    return frame(b'E', portal.encode() + b"\0" + struct.pack("!i", max_rows))
+
+def sync():
+    return frame(b'S', b"")
+
+s = socket.create_connection(("127.0.0.1", 5433))
+params = b"user\0zeno\0database\0zeno\0\0"
+body = struct.pack("!I", 196608) + params
+s.sendall(struct.pack("!I", len(body) + 4) + body)
+show(s, "startup handshake (trust auth — no users set yet)")
+
+# One pipelined batch: Parse + Describe(statement) + Bind($1) +
+# Describe(portal) + Execute + Sync, all in one flush.
+s.sendall(
+    parse("", "SELECT name FROM demo_users WHERE city = $1")
+    + describe("S", "")
+    + bind("", "", ["Delhi"])
+    + describe("P", "")
+    + execute("", 0)
+    + sync()
+)
+show(s, "extended batch: Parse+Describe+Bind+Describe+Execute+Sync ($1='Delhi')")
+
+# PortalSuspended: fetch the 2 demo_users rows one at a time.
+s.sendall(parse("all", "SELECT * FROM demo_users") + bind("", "all", []) + sync())
+show(s, "Parse named 'all' + Bind (unnamed portal)")
+s.sendall(execute("", 1) + sync())
+show(s, "Execute max_rows=1 -> PortalSuspended after 1 row")
+s.sendall(execute("", 1) + sync())
+show(s, "Execute again -> last row + CommandComplete SELECT 2")
+s.sendall(frame(b'C', b'Sall\0') + sync())
+show(s, "Close statement 'all'")
+s.sendall(b"X" + struct.pack("!I", 4))
+s.close()
+print("extended demo done — connection closed cleanly")
+PYEOF
+kill $SERVER || true
+wait $SERVER 2>/dev/null || true
+
+echo "-- setting a password for user 'sanjay' (typed twice on stdin):"
+printf '%s\n%s\n' "demo-password" "demo-password" | $ZENO --data "$DATA" user set-password sanjay
+$ZENO --data "$DATA" user list
+echo "-- restarting the server: new connections now need SCRAM-SHA-256:"
+$ZENO --data "$DATA" serve --port 5433 &
+SERVER=$!
+sleep 1
+python3 - <<'PYEOF'
+import socket, struct, hashlib, hmac, base64
+
+def recvn(s, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = s.recv(n - len(buf))
+        if not chunk:
+            raise EOFError("connection closed")
+        buf += chunk
+    return buf
+
+def read_msg(s):
+    tag = recvn(s, 1)
+    (ln,) = struct.unpack("!I", recvn(s, 4))
+    return tag, recvn(s, ln - 4)
+
+def read_until_ready(s, label):
+    print(f"-- {label}:")
+    while True:
+        tag, body = read_msg(s)
+        if tag == b'R' and struct.unpack("!I", body[:4])[0] == 0:
+            print("   AuthenticationOk")
+        elif tag == b'S':
+            print("   ParameterStatus")
+        elif tag == b'K':
+            print("   BackendKeyData")
+        elif tag == b'T':
+            print("   RowDescription")
+        elif tag == b'D':
+            print("   DataRow")
+        elif tag == b'C':
+            print(f"   CommandComplete {body.split(bytes([0]))[0].decode()}")
+        elif tag == b'E':
+            print("   ErrorResponse")
+        elif tag == b'Z':
+            print(f"   ReadyForQuery '{body.decode()}'")
+            return
+        else:
+            print(f"   (other message {tag!r})")
+
+def scram_login(user, password, expect_ok):
+    s = socket.create_connection(("127.0.0.1", 5433))
+    params = f"user\0{user}\0database\0zeno\0\0".encode()
+    body = struct.pack("!I", 196608) + params
+    s.sendall(struct.pack("!I", len(body) + 4) + body)
+    tag, body = read_msg(s)
+    assert tag == b'R' and struct.unpack("!I", body[:4])[0] == 10, f"expected AuthenticationSASL, got {tag} {body!r}"
+    print(f"-- SCRAM login as '{user}': server offered SCRAM-SHA-256")
+    client_nonce = "demo-nonce-12345"
+    client_first_bare = f"n={user},r={client_nonce}"
+    client_first = f"n,,{client_first_bare}".encode()
+    pbody = b"SCRAM-SHA-256\0" + struct.pack("!I", len(client_first)) + client_first
+    s.sendall(b"p" + struct.pack("!I", len(pbody) + 4) + pbody)
+    tag, body = read_msg(s)
+    assert tag == b'R' and struct.unpack("!I", body[:4])[0] == 11, f"expected SASLContinue, got {tag}"
+    server_first = body[4:].decode()
+    parts = dict(kv.split("=", 1) for kv in server_first.split(","))
+    salt = base64.b64decode(parts["s"])
+    salted = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, int(parts["i"]), 32)
+    client_key = hmac.new(salted, b"Client Key", hashlib.sha256).digest()
+    stored_key = hashlib.sha256(client_key).digest()
+    server_key = hmac.new(salted, b"Server Key", hashlib.sha256).digest()
+    client_final_wo = f"c=biws,r={parts['r']}"
+    auth_msg = f"{client_first_bare},{server_first},{client_final_wo}".encode()
+    sig = hmac.new(stored_key, auth_msg, hashlib.sha256).digest()
+    proof = bytes(a ^ b for a, b in zip(client_key, sig))
+    client_final = f"{client_final_wo},p={base64.b64encode(proof).decode()}"
+    s.sendall(b"p" + struct.pack("!I", len(client_final) + 4) + client_final.encode())
+    tag, body = read_msg(s)
+    if expect_ok:
+        assert tag == b'R' and struct.unpack("!I", body[:4])[0] == 12, f"expected SASLFinal, got {tag} {body!r}"
+        want = "v=" + base64.b64encode(hmac.new(server_key, auth_msg, hashlib.sha256).digest()).decode()
+        assert body[4:].decode() == want, "server signature mismatch"
+        print("   server signature verified (mutual auth — server proved itself too)")
+        read_until_ready(s, "post-SCRAM handshake")
+    else:
+        assert tag == b'E', f"expected ErrorResponse, got {tag}"
+        print("   ErrorResponse 28P01 (wrong password, as expected)")
+        try:
+            read_msg(s)
+            print("   (unexpected: server sent more after the error)")
+        except EOFError:
+            print("   connection closed by the server, as expected")
+    return s
+
+s = scram_login("sanjay", "demo-password", expect_ok=True)
+body = b"SELECT * FROM demo_users\0"
+s.sendall(b"Q" + struct.pack("!I", len(body) + 4) + body)
+read_until_ready(s, "QUERY after SCRAM login: SELECT * FROM demo_users")
+s.sendall(b"X" + struct.pack("!I", 4))
+s.close()
+scram_login("sanjay", "wrong-password", expect_ok=False)
+print("SCRAM demo done")
+PYEOF
+kill $SERVER || true
+wait $SERVER 2>/dev/null || true
+
 echo
 echo "PostgreSQL demo done. Try it yourself with psql (on a machine that has it):"
 echo "  ./target/release/zeno --data $DATA serve --port 5433"
 echo "  psql -h 127.0.0.1 -p 5433 -U zeno -d zeno   # no password (trust auth, local only)"
+echo "  (with a password set: PGPASSWORD=<password> psql -h 127.0.0.1 -p 5433 -U sanjay -d zeno)"
 echo
 echo "Demo done. Data directory kept at: $DATA"
 echo "Note: the torn line stays in $DATA/wal.log, so later opens will"

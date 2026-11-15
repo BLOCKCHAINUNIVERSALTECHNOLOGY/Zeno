@@ -1,8 +1,8 @@
 [package]
 name = "zeno"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
-description = "Zeno — One Engine, All Data. Hybrid key-value + table + JSON document database in Rust (V0.3 prototype)."
+description = "Zeno — One Engine, All Data. Hybrid key-value + table + JSON document database in Rust (V0.4 prototype)."
 license = "Apache-2.0"
 
 [[bin]]
@@ -12,6 +12,17 @@ path = "src/main.rs"
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# SCRAM-SHA-256 auth (V0.4): RustCrypto crates, all small and widely
+# reviewed — SHA-256, HMAC, PBKDF2, base64, CSPRNG, constant-time
+# comparison. No other new dependencies in V0.4.
+sha2 = "0.10"
+hmac = "0.12"
+pbkdf2 = "0.12"
+base64 = "0.22"
+getrandom = "0.2"
+subtle = "2"
+# SASLprep (RFC 4013) needs NFKC normalization for passwords.
+unicode-normalization = "0.1"
 
 [profile.release]
 opt-level = 2

@@ -130,11 +130,20 @@ enum Msg {
     ParameterStatus(String, String),
     BackendKeyData(i32, i32),
     ReadyForQuery(u8),
-    RowDescription(Vec<String>),
+    RowDescription(Vec<String>, Vec<i16>), // (column names, format codes)
     DataRow(Vec<Option<String>>),
     CommandComplete(String),
     ErrorResponse(String, String), // (SQLSTATE code, message)
     EmptyQueryResponse,
+    ParseComplete,
+    BindComplete,
+    CloseComplete,
+    ParameterDescription(Vec<i32>), // parameter type OIDs
+    NoData,
+    PortalSuspended,
+    AuthSasl(String),         // AuthenticationSASL mechanisms (joined)
+    AuthSaslContinue(String), // AuthenticationSASLContinue data
+    AuthSaslFinal(String),    // AuthenticationSASLFinal data
     Other(u8),
 }
 
@@ -169,12 +178,26 @@ fn parse_message(tag: u8, body: &[u8]) -> Msg {
     let mut pos = 0;
     match tag {
         b'R' => {
-            assert_eq!(
-                read_i32(body, &mut pos),
-                0,
-                "expected AuthenticationOk (R, 0)"
-            );
-            Msg::AuthOk
+            let code = read_i32(body, &mut pos);
+            match code {
+                0 => Msg::AuthOk,
+                10 => {
+                    // AuthenticationSASL: NUL-separated mechanisms,
+                    // then a zero-byte terminator.
+                    let mut mechs = Vec::new();
+                    while pos < body.len() {
+                        let m = read_cstr(body, &mut pos);
+                        if m.is_empty() {
+                            break;
+                        }
+                        mechs.push(m);
+                    }
+                    Msg::AuthSasl(mechs.join(","))
+                }
+                11 => Msg::AuthSaslContinue(String::from_utf8_lossy(&body[pos..]).into_owned()),
+                12 => Msg::AuthSaslFinal(String::from_utf8_lossy(&body[pos..]).into_owned()),
+                _ => Msg::Other(b'R'),
+            }
         }
         b'S' => {
             let name = read_cstr(body, &mut pos);
@@ -186,6 +209,7 @@ fn parse_message(tag: u8, body: &[u8]) -> Msg {
         b'T' => {
             let n = read_i16(body, &mut pos);
             let mut cols = Vec::new();
+            let mut formats = Vec::new();
             for _ in 0..n {
                 let name = read_cstr(body, &mut pos);
                 let _table_oid = read_i32(body, &mut pos);
@@ -193,11 +217,12 @@ fn parse_message(tag: u8, body: &[u8]) -> Msg {
                 let type_oid = read_i32(body, &mut pos);
                 let _typlen = read_i16(body, &mut pos);
                 let _typmod = read_i32(body, &mut pos);
-                let _format = read_i16(body, &mut pos);
+                let format = read_i16(body, &mut pos);
                 assert_eq!(type_oid, 25, "all Zeno columns are text (OID 25)");
                 cols.push(name);
+                formats.push(format);
             }
-            Msg::RowDescription(cols)
+            Msg::RowDescription(cols, formats)
         }
         b'D' => {
             let n = read_i16(body, &mut pos);
@@ -231,14 +256,180 @@ fn parse_message(tag: u8, body: &[u8]) -> Msg {
             Msg::ErrorResponse(code, message)
         }
         b'I' => Msg::EmptyQueryResponse,
+        b'1' => Msg::ParseComplete,
+        b'2' => Msg::BindComplete,
+        b'3' => Msg::CloseComplete,
+        b't' => {
+            let n = read_i16(body, &mut pos);
+            let mut types = Vec::new();
+            for _ in 0..n {
+                types.push(read_i32(body, &mut pos));
+            }
+            Msg::ParameterDescription(types)
+        }
+        b'n' => Msg::NoData,
+        b's' => Msg::PortalSuspended,
         other => Msg::Other(other),
     }
+}
+
+// ---------------------------------------------------------------------
+// Extended-protocol frame builders (frontend messages, protocol 54.7).
+// ---------------------------------------------------------------------
+
+fn frame(tag: u8, body: &[u8]) -> Vec<u8> {
+    let mut f = vec![tag];
+    f.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+    f.extend_from_slice(body);
+    f
+}
+
+fn parse_frame(name: &str, sql: &str, param_types: &[i32]) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(name.as_bytes());
+    b.push(0);
+    b.extend_from_slice(sql.as_bytes());
+    b.push(0);
+    b.extend_from_slice(&(param_types.len() as i16).to_be_bytes());
+    for t in param_types {
+        b.extend_from_slice(&t.to_be_bytes());
+    }
+    frame(b'P', &b)
+}
+
+/// A Bind frame. Each param is (format code is given separately,
+/// value: None = SQL NULL, Some(bytes) = the value).
+fn bind_frame(
+    portal: &str,
+    stmt: &str,
+    param_formats: &[i16],
+    params: &[Option<Vec<u8>>],
+    result_formats: &[i16],
+) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(portal.as_bytes());
+    b.push(0);
+    b.extend_from_slice(stmt.as_bytes());
+    b.push(0);
+    b.extend_from_slice(&(param_formats.len() as i16).to_be_bytes());
+    for f in param_formats {
+        b.extend_from_slice(&f.to_be_bytes());
+    }
+    b.extend_from_slice(&(params.len() as i16).to_be_bytes());
+    for v in params {
+        match v {
+            None => b.extend_from_slice(&(-1i32).to_be_bytes()),
+            Some(bytes) => {
+                b.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+                b.extend_from_slice(bytes);
+            }
+        }
+    }
+    b.extend_from_slice(&(result_formats.len() as i16).to_be_bytes());
+    for f in result_formats {
+        b.extend_from_slice(&f.to_be_bytes());
+    }
+    frame(b'B', &b)
+}
+
+fn text_param(value: &str) -> Option<Vec<u8>> {
+    Some(value.as_bytes().to_vec())
+}
+
+fn int4_param(value: i32) -> Option<Vec<u8>> {
+    Some(value.to_be_bytes().to_vec())
+}
+
+fn describe_frame(kind: u8, name: &str) -> Vec<u8> {
+    let mut b = vec![kind];
+    b.extend_from_slice(name.as_bytes());
+    b.push(0);
+    frame(b'D', &b)
+}
+
+fn execute_frame(portal: &str, max_rows: i32) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(portal.as_bytes());
+    b.push(0);
+    b.extend_from_slice(&max_rows.to_be_bytes());
+    frame(b'E', &b)
+}
+
+fn close_frame(kind: u8, name: &str) -> Vec<u8> {
+    let mut b = vec![kind];
+    b.extend_from_slice(name.as_bytes());
+    b.push(0);
+    frame(b'C', &b)
+}
+
+fn sync_frame() -> Vec<u8> {
+    frame(b'S', &[])
+}
+
+fn sasl_initial_response(mechanism: &str, data: &[u8]) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(mechanism.as_bytes());
+    b.push(0);
+    b.extend_from_slice(&(data.len() as i32).to_be_bytes());
+    b.extend_from_slice(data);
+    frame(b'p', &b)
+}
+
+fn sasl_response(data: &[u8]) -> Vec<u8> {
+    frame(b'p', data)
+}
+
+fn startup_frame(user: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&196608i32.to_be_bytes());
+    for (k, v) in [("user", user), ("database", "zeno")] {
+        body.extend_from_slice(k.as_bytes());
+        body.push(0);
+        body.extend_from_slice(v.as_bytes());
+        body.push(0);
+    }
+    body.push(0);
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+    frame.extend_from_slice(&body);
+    frame
+}
+
+/// Run `zeno user set-password` with the password on stdin (twice).
+fn set_password(dir: &std::path::Path, user: &str, password: &str) {
+    let bin = env!("CARGO_BIN_EXE_zeno");
+    let mut child = Command::new(bin)
+        .args([
+            "--data",
+            dir.to_str().unwrap(),
+            "user",
+            "set-password",
+            user,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn zeno user set-password");
+    let mut stdin = child.stdin.take().unwrap();
+    stdin
+        .write_all(format!("{password}\n{password}\n").as_bytes())
+        .unwrap();
+    drop(stdin);
+    let output = child.wait_with_output().expect("wait zeno user");
+    assert!(
+        output.status.success(),
+        "set-password failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 impl Client {
     /// Connect and run the startup handshake. Returns the messages
     /// received up to and including ReadyForQuery.
-    fn connect(port: u16) -> (Client, Vec<Msg>) {
+    /// Connect the socket only — no startup message sent yet.
+    /// The SCRAM tests drive the handshake by hand from here.
+    fn connect_socket(port: u16) -> Client {
         let stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to server");
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -246,24 +437,15 @@ impl Client {
         stream
             .set_write_timeout(Some(Duration::from_secs(5)))
             .unwrap();
-        let mut client = Client {
+        Client {
             stream: stream.try_clone().unwrap(),
             reader: BufReader::new(stream),
-        };
-        // StartupMessage: length + protocol 3.0 (196608) + params.
-        let mut body = Vec::new();
-        body.extend_from_slice(&196608i32.to_be_bytes());
-        for (k, v) in [("user", "zeno"), ("database", "zeno")] {
-            body.extend_from_slice(k.as_bytes());
-            body.push(0);
-            body.extend_from_slice(v.as_bytes());
-            body.push(0);
         }
-        body.push(0);
-        let mut frame = Vec::new();
-        frame.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
-        frame.extend_from_slice(&body);
-        client.stream.write_all(&frame).unwrap();
+    }
+
+    fn connect(port: u16) -> (Client, Vec<Msg>) {
+        let mut client = Self::connect_socket(port);
+        client.stream.write_all(&startup_frame("zeno")).unwrap();
         client.stream.flush().unwrap();
         let msgs = client.read_until_ready();
         (client, msgs)
@@ -291,6 +473,54 @@ impl Client {
                 return msgs;
             }
         }
+    }
+
+    /// Read exactly one backend message. Used mid-handshake (SCRAM)
+    /// and for single extended messages sent without Sync, where
+    /// there is no ReadyForQuery to read until.
+    fn read_one(&mut self) -> Msg {
+        let mut tag = [0u8; 1];
+        self.reader.read_exact(&mut tag).expect("read message tag");
+        let mut len_buf = [0u8; 4];
+        self.reader
+            .read_exact(&mut len_buf)
+            .expect("read message length");
+        let len = i32::from_be_bytes(len_buf);
+        assert!(len >= 4, "message length {len} is too small");
+        let mut body = vec![0u8; (len - 4) as usize];
+        self.reader
+            .read_exact(&mut body)
+            .expect("read message body");
+        parse_message(tag[0], &body)
+    }
+
+    /// Read one backend message, or None if the server closed the
+    /// connection (EOF). Used after a failed login, where the
+    /// server closes the socket instead of answering.
+    fn try_read_one(&mut self) -> Option<Msg> {
+        let mut tag = [0u8; 1];
+        match self.reader.read_exact(&mut tag) {
+            Ok(()) => {}
+            Err(_) => return None,
+        }
+        let mut len_buf = [0u8; 4];
+        self.reader.read_exact(&mut len_buf).ok()?;
+        let len = i32::from_be_bytes(len_buf);
+        if len < 4 {
+            return None;
+        }
+        let mut body = vec![0u8; (len - 4) as usize];
+        self.reader.read_exact(&mut body).ok()?;
+        Some(parse_message(tag[0], &body))
+    }
+
+    /// Send extended-protocol frames (a batch ending in Sync) and
+    /// return the replies up to and including ReadyForQuery.
+    fn extended(&mut self, frames: &[Vec<u8>]) -> Vec<Msg> {
+        for f in frames {
+            self.send_raw(f);
+        }
+        self.read_until_ready()
     }
 
     /// Send one Simple Query ('Q') and return its reply messages,
@@ -435,7 +665,7 @@ fn create_insert_select_roundtrip() {
     assert!(
         msgs.iter().any(|m| matches!(
             m,
-            Msg::RowDescription(cols) if cols == &["id".to_string(), "name".to_string(), "city".to_string()]
+            Msg::RowDescription(cols, _) if cols == &["id".to_string(), "name".to_string(), "city".to_string()]
         )),
         "RowDescription must name id, name, city: {msgs:?}"
     );
@@ -463,7 +693,7 @@ fn create_insert_select_roundtrip() {
     assert!(
         msgs.iter().any(|m| matches!(
             m,
-            Msg::RowDescription(cols) if cols == &["name".to_string(), "city".to_string()]
+            Msg::RowDescription(cols, _) if cols == &["name".to_string(), "city".to_string()]
         )),
         "RowDescription must name only name, city: {msgs:?}"
     );
@@ -657,13 +887,13 @@ fn concurrent_clients_share_one_engine() {
 
 #[test]
 fn extended_batch_then_simple_query_stays_in_sync() {
-    // F1 regression (reviewer repro): a driver pipelines
+    // V0.4: the extended protocol WORKS now. A driver pipelines
     // Parse+Bind+Describe+Execute+Sync in ONE flush and reads until
-    // the first ReadyForQuery. The server must answer each extended
-    // message with an ErrorResponse and NO ReadyForQuery, and Sync
-    // with exactly one ReadyForQuery — so the NEXT Simple Query on
-    // the same connection is answered normally, not with a stale
-    // "extended query protocol not supported" error.
+    // the first ReadyForQuery. The server must answer each message
+    // in order — ParseComplete, BindComplete, RowDescription (from
+    // Describe), RowDescription + DataRow + CommandComplete (from
+    // Execute) — and exactly ONE ReadyForQuery, from Sync. The NEXT
+    // Simple Query on the same connection must then work normally.
     let server = Server::start("extended-sync");
     let (mut client, _) = Client::connect(server.port);
 
@@ -675,54 +905,39 @@ fn extended_batch_then_simple_query_stays_in_sync() {
     seeder.terminate();
 
     // Parse+Bind+Describe+Execute+Sync in one flush, like psycopg/JDBC.
-    let mut frame = Vec::new();
-    let parse_body = {
-        let mut b = Vec::new();
-        b.push(0); // unnamed statement
-        b.extend_from_slice(b"SELECT 1\0");
-        b.extend_from_slice(&0u16.to_be_bytes()); // 0 param types
-        b
-    };
-    frame.push(b'P');
-    frame.extend_from_slice(&((parse_body.len() + 4) as i32).to_be_bytes());
-    frame.extend_from_slice(&parse_body);
-    let bind_body = {
-        let mut b = Vec::new();
-        b.push(0); // unnamed portal
-        b.push(0); // unnamed statement
-        b.extend_from_slice(&0u16.to_be_bytes()); // 0 param format codes
-        b.extend_from_slice(&0u16.to_be_bytes()); // 0 params
-        b.extend_from_slice(&0u16.to_be_bytes()); // 0 result format codes
-        b
-    };
-    frame.push(b'B');
-    frame.extend_from_slice(&((bind_body.len() + 4) as i32).to_be_bytes());
-    frame.extend_from_slice(&bind_body);
-    let desc_body = b"S\0".to_vec(); // Describe portal (unnamed)
-    frame.push(b'D');
-    frame.extend_from_slice(&((desc_body.len() + 4) as i32).to_be_bytes());
-    frame.extend_from_slice(&desc_body);
-    let exec_body = {
-        let mut b = Vec::new();
-        b.push(0); // unnamed portal
-        b.extend_from_slice(&0i32.to_be_bytes()); // 0 rows
-        b
-    };
-    frame.push(b'E');
-    frame.extend_from_slice(&((exec_body.len() + 4) as i32).to_be_bytes());
-    frame.extend_from_slice(&exec_body);
-    frame.push(b'S');
-    frame.extend_from_slice(&4i32.to_be_bytes());
-    client.send_raw(&frame);
-    let msgs = client.read_until_ready();
+    let msgs = client.extended(&[
+        parse_frame("", "SELECT * FROM t", &[]),
+        bind_frame("", "", &[], &[], &[]),
+        describe_frame(b'P', ""),
+        execute_frame("", 0),
+        sync_frame(),
+    ]);
 
-    // Exactly one ErrorResponse per extended message (4: P/B/D/E),
-    // then exactly ONE ReadyForQuery — the Sync reply.
-    let errors = msgs
-        .iter()
-        .filter(|m| matches!(m, Msg::ErrorResponse(_, _)))
-        .count();
-    assert_eq!(errors, 4, "one ErrorResponse per P/B/D/E message: {msgs:?}");
+    assert!(
+        msgs.iter().any(|m| matches!(m, Msg::ParseComplete)),
+        "Parse must answer ParseComplete: {msgs:?}"
+    );
+    assert!(
+        msgs.iter().any(|m| matches!(m, Msg::BindComplete)),
+        "Bind must answer BindComplete: {msgs:?}"
+    );
+    assert!(
+        msgs.iter().any(|m| matches!(
+            m,
+            Msg::RowDescription(cols, _) if cols == &["id".to_string(), "name".to_string()]
+        )),
+        "Describe/Execute must send RowDescription: {msgs:?}"
+    );
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![Some("1".into()), Some("Sanjay".into())]],
+        "Execute must return the seeded row: {msgs:?}"
+    );
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("SELECT 1"), "{msgs:?}");
+    assert!(
+        Client::error(&msgs).is_none(),
+        "no error in a good extended batch: {msgs:?}"
+    );
     let readies = msgs
         .iter()
         .filter(|m| matches!(m, Msg::ReadyForQuery(_)))
@@ -734,7 +949,7 @@ fn extended_batch_then_simple_query_stays_in_sync() {
     assert!(matches!(msgs.last(), Some(Msg::ReadyForQuery(b'I'))));
 
     // The NEXT Simple Query on the SAME connection must now work —
-    // no stale "extended query protocol not supported" error.
+    // no stale replies, no desync.
     let msgs = client.query("SELECT * FROM t");
     assert!(
         Client::error(&msgs).is_none(),
@@ -751,6 +966,635 @@ fn extended_batch_then_simple_query_stays_in_sync() {
     let msgs = client.query("SELECT * FROM t");
     assert!(Client::error(&msgs).is_none(), "{msgs:?}");
     assert_eq!(Client::tag(&msgs).as_deref(), Some("SELECT 1"), "{msgs:?}");
+    client.terminate();
+}
+
+#[test]
+fn extended_unnamed_select_with_params() {
+    // The full extended flow with a $1 parameter: Parse, Describe
+    // statement (ParameterDescription + RowDescription), Bind,
+    // Describe portal, Execute, Sync. Then Execute the same portal
+    // again — a completed portal re-runs from the start.
+    let server = Server::start("ext-params");
+    let (mut client, _) = Client::connect(server.port);
+    client.query("CREATE TABLE users (id, name, city)");
+    client.query("INSERT INTO users VALUES (1, 'Sanjay', 'Delhi')");
+    client.query("INSERT INTO users VALUES (2, 'Asha', 'Mumbai')");
+    client.query("INSERT INTO users VALUES (3, 'Ravi', 'Delhi')");
+
+    let msgs = client.extended(&[
+        parse_frame("", "SELECT id, name FROM users WHERE city = $1", &[]),
+        describe_frame(b'S', ""),
+        bind_frame("", "", &[], &[text_param("Delhi")], &[]),
+        describe_frame(b'P', ""),
+        execute_frame("", 0),
+        sync_frame(),
+    ]);
+    // ParameterDescription: one param, inferred as text (25).
+    assert!(
+        msgs.iter().any(|m| matches!(
+            m,
+            Msg::ParameterDescription(types) if types == &[25]
+        )),
+        "Describe statement must report one text param: {msgs:?}"
+    );
+    assert!(
+        msgs.iter().any(|m| matches!(
+            m,
+            Msg::RowDescription(cols, _) if cols == &["id".to_string(), "name".to_string()]
+        )),
+        "RowDescription must name id, name: {msgs:?}"
+    );
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![
+            vec![Some("1".into()), Some("Sanjay".into())],
+            vec![Some("3".into()), Some("Ravi".into())],
+        ],
+        "only the Delhi rows must come back: {msgs:?}"
+    );
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("SELECT 2"), "{msgs:?}");
+    assert!(Client::error(&msgs).is_none(), "{msgs:?}");
+
+    // Re-Bind the unnamed portal with another city and re-Execute.
+    let msgs = client.extended(&[
+        bind_frame("", "", &[], &[text_param("Mumbai")], &[]),
+        execute_frame("", 0),
+        sync_frame(),
+    ]);
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![Some("2".into()), Some("Asha".into())]],
+        "re-Bind with Mumbai must return only Asha: {msgs:?}"
+    );
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("SELECT 1"), "{msgs:?}");
+    client.terminate();
+}
+
+#[test]
+fn extended_named_statement_and_portal_reuse() {
+    // Named statements and portals live across Syncs; two portals
+    // from one statement are independent; Close removes them.
+    let server = Server::start("ext-named");
+    let (mut client, _) = Client::connect(server.port);
+    client.query("CREATE TABLE users (id, name, city)");
+    client.query("INSERT INTO users VALUES (1, 'Sanjay', 'Delhi')");
+    client.query("INSERT INTO users VALUES (2, 'Asha', 'Mumbai')");
+
+    // One named statement, two named portals with different values.
+    let msgs = client.extended(&[
+        parse_frame("find_city", "SELECT name FROM users WHERE city = $1", &[]),
+        bind_frame("p_delhi", "find_city", &[], &[text_param("Delhi")], &[]),
+        bind_frame("p_mumbai", "find_city", &[], &[text_param("Mumbai")], &[]),
+        execute_frame("p_delhi", 0),
+        sync_frame(),
+    ]);
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![Some("Sanjay".into())]],
+        "{msgs:?}"
+    );
+    let msgs = client.extended(&[execute_frame("p_mumbai", 0), sync_frame()]);
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![Some("Asha".into())]],
+        "{msgs:?}"
+    );
+    // p_delhi still holds Delhi — portals are independent.
+    let msgs = client.extended(&[execute_frame("p_delhi", 0), sync_frame()]);
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![Some("Sanjay".into())]],
+        "{msgs:?}"
+    );
+
+    // Close the portal: Execute must now fail with 26000.
+    let msgs = client.extended(&[
+        close_frame(b'P', "p_delhi"),
+        execute_frame("p_delhi", 0),
+        sync_frame(),
+    ]);
+    assert!(
+        msgs.iter().any(|m| matches!(m, Msg::CloseComplete)),
+        "Close must answer CloseComplete: {msgs:?}"
+    );
+    let (code, _) = Client::error(&msgs).expect("closed portal must error");
+    assert_eq!(code, "26000", "unknown portal must be 26000: {msgs:?}");
+
+    // Close the statement: its remaining portal (p_mumbai) goes
+    // with it, and the statement itself is gone.
+    let msgs = client.extended(&[
+        close_frame(b'S', "find_city"),
+        execute_frame("p_mumbai", 0),
+        sync_frame(),
+    ]);
+    let (code, _) = Client::error(&msgs).expect("portal of a closed statement must error");
+    assert_eq!(code, "26000", "{msgs:?}");
+    let msgs = client.extended(&[
+        bind_frame("p3", "find_city", &[], &[text_param("Delhi")], &[]),
+        sync_frame(),
+    ]);
+    let (code, _) = Client::error(&msgs).expect("closed statement must error");
+    assert_eq!(code, "26000", "{msgs:?}");
+
+    // The connection still works after all that.
+    let msgs = client.query("SELECT * FROM users");
+    assert!(Client::error(&msgs).is_none(), "{msgs:?}");
+    assert_eq!(Client::rows(&msgs).len(), 2);
+    client.terminate();
+}
+
+#[test]
+fn extended_insert_with_int_param_text_and_binary() {
+    // $1 declared int4 (23): text "42" and binary 4-byte int4 both
+    // bind; a non-integer text value fails with 22P02.
+    let server = Server::start("ext-int");
+    let (mut client, _) = Client::connect(server.port);
+    client.query("CREATE TABLE t (id, name)");
+
+    // Text-format int param.
+    let msgs = client.extended(&[
+        parse_frame("", "INSERT INTO t VALUES ($1, $2)", &[23]),
+        bind_frame(
+            "",
+            "",
+            &[],
+            &[text_param("42"), text_param("text-int")],
+            &[],
+        ),
+        execute_frame("", 0),
+        sync_frame(),
+    ]);
+    assert_eq!(
+        Client::tag(&msgs).as_deref(),
+        Some("INSERT 0 1"),
+        "{msgs:?}"
+    );
+
+    // Binary-format int param (4 bytes big-endian) + text param.
+    let msgs = client.extended(&[
+        bind_frame(
+            "",
+            "",
+            &[1, 0],
+            &[int4_param(-7), text_param("bin-int")],
+            &[],
+        ),
+        execute_frame("", 0),
+        sync_frame(),
+    ]);
+    assert_eq!(
+        Client::tag(&msgs).as_deref(),
+        Some("INSERT 0 1"),
+        "{msgs:?}"
+    );
+
+    // Bad text int: 22P02, then the connection recovers via Sync.
+    let msgs = client.extended(&[
+        bind_frame("", "", &[], &[text_param("abc"), text_param("x")], &[]),
+        execute_frame("", 0),
+        sync_frame(),
+    ]);
+    let (code, _) = Client::error(&msgs).expect("bad int must error");
+    assert_eq!(code, "22P02", "{msgs:?}");
+    let msgs = client.query("SELECT * FROM t");
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![
+            vec![Some("42".into()), Some("text-int".into())],
+            vec![Some("-7".into()), Some("bin-int".into())],
+        ],
+        "both good inserts must be there, the bad one must not: {msgs:?}"
+    );
+    client.terminate();
+}
+
+#[test]
+fn extended_error_skips_messages_until_sync() {
+    // Protocol 54.2.3: after an extended-protocol error the server
+    // sends ONE ErrorResponse and discards everything until Sync —
+    // including a Simple Query smuggled into the same pipeline.
+    // The discarded Query must NEVER run.
+    let server = Server::start("ext-skip");
+    let (mut client, _) = Client::connect(server.port);
+
+    // Bad Parse, then a CREATE TABLE as a Simple Query, then Sync —
+    // all in one flush. The CREATE must be discarded.
+    let mut batch = Vec::new();
+    batch.extend_from_slice(&parse_frame("", "BOGUS SYNTAX HERE", &[]));
+    let mut q = Vec::new();
+    q.push(b'Q');
+    let sql = "CREATE TABLE should_not_exist (a)";
+    q.extend_from_slice(&((sql.len() + 1 + 4) as i32).to_be_bytes());
+    q.extend_from_slice(sql.as_bytes());
+    q.push(0);
+    batch.extend_from_slice(&q);
+    batch.extend_from_slice(&sync_frame());
+    client.send_raw(&batch);
+    let msgs = client.read_until_ready();
+    let errors = msgs
+        .iter()
+        .filter(|m| matches!(m, Msg::ErrorResponse(_, _)))
+        .count();
+    assert_eq!(
+        errors, 1,
+        "exactly ONE ErrorResponse for the bad Parse: {msgs:?}"
+    );
+    assert_eq!(
+        msgs.iter()
+            .filter(|m| matches!(m, Msg::ReadyForQuery(_)))
+            .count(),
+        1,
+        "exactly one ReadyForQuery (from Sync): {msgs:?}"
+    );
+    // The CREATE was discarded: the table does not exist.
+    let msgs = client.query("SELECT * FROM should_not_exist");
+    let (code, _) = Client::error(&msgs).expect("missing table must error");
+    assert_eq!(code, "42P01", "{msgs:?}");
+
+    // And a bad Bind (wrong param count) recovers the same way.
+    let msgs = client.extended(&[
+        parse_frame("", "SELECT * FROM users WHERE city = $1", &[]),
+        bind_frame("", "", &[], &[], &[]), // 0 params, 1 needed
+        execute_frame("", 0),
+        sync_frame(),
+    ]);
+    let (code, _) = Client::error(&msgs).expect("param count mismatch must error");
+    assert_eq!(code, "08P01", "{msgs:?}");
+    assert_eq!(
+        msgs.iter()
+            .filter(|m| matches!(m, Msg::ErrorResponse(_, _)))
+            .count(),
+        1,
+        "one error only — the Execute after the bad Bind is skipped: {msgs:?}"
+    );
+    // The connection is fully usable after recovery.
+    let msgs = client.query("CREATE TABLE t2 (a)");
+    assert_eq!(
+        Client::tag(&msgs).as_deref(),
+        Some("CREATE TABLE"),
+        "{msgs:?}"
+    );
+    let msgs = client.query("INSERT INTO t2 VALUES ('ok')");
+    assert_eq!(
+        Client::tag(&msgs).as_deref(),
+        Some("INSERT 0 1"),
+        "{msgs:?}"
+    );
+    client.terminate();
+}
+
+#[test]
+fn extended_portal_suspended_and_resume() {
+    // Execute with max_rows stops early with PortalSuspended; the
+    // next Execute resumes from the same rows; a later Execute
+    // re-runs the statement from the start.
+    let server = Server::start("ext-suspend");
+    let (mut client, _) = Client::connect(server.port);
+    client.query("CREATE TABLE t (id, name)");
+    for i in 1..=3 {
+        client.query(&format!("INSERT INTO t VALUES ({i}, 'n{i}')"));
+    }
+
+    let msgs = client.extended(&[
+        parse_frame("", "SELECT * FROM t", &[]),
+        bind_frame("", "", &[], &[], &[]),
+        execute_frame("", 2),
+        sync_frame(),
+    ]);
+    assert_eq!(
+        Client::rows(&msgs).len(),
+        2,
+        "first Execute sends 2 rows: {msgs:?}"
+    );
+    assert!(
+        msgs.iter().any(|m| matches!(m, Msg::PortalSuspended)),
+        "must end with PortalSuspended, not CommandComplete: {msgs:?}"
+    );
+    assert!(
+        Client::tag(&msgs).is_none(),
+        "no CommandComplete while suspended: {msgs:?}"
+    );
+
+    // Resume: the last row, then CommandComplete SELECT 3 (total).
+    let msgs = client.extended(&[execute_frame("", 2), sync_frame()]);
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![Some("3".into()), Some("n3".into())]],
+        "resume must send the remaining row: {msgs:?}"
+    );
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("SELECT 3"), "{msgs:?}");
+    assert!(
+        !msgs.iter().any(|m| matches!(m, Msg::PortalSuspended)),
+        "completed Execute must not suspend: {msgs:?}"
+    );
+
+    // Execute again: the portal re-runs from the start.
+    let msgs = client.extended(&[execute_frame("", 0), sync_frame()]);
+    assert_eq!(Client::rows(&msgs).len(), 3, "{msgs:?}");
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("SELECT 3"), "{msgs:?}");
+    client.terminate();
+}
+
+#[test]
+fn extended_close_and_redefine_rules() {
+    // Named statements/portals must be Closed before redefinition
+    // (42P05 / 42P03); closing a nonexistent name is NOT an error.
+    let server = Server::start("ext-close");
+    let (mut client, _) = Client::connect(server.port);
+    client.query("CREATE TABLE t (a)");
+
+    let msgs = client.extended(&[
+        parse_frame("s1", "SELECT * FROM t", &[]),
+        parse_frame("s1", "SELECT * FROM t", &[]),
+        sync_frame(),
+    ]);
+    let (code, _) = Client::error(&msgs).expect("re-Parse must error");
+    assert_eq!(code, "42P05", "{msgs:?}");
+    // The error skipped nothing else here (Sync was next), and the
+    // FIRST statement is still the stored one.
+    let msgs = client.extended(&[
+        close_frame(b'S', "s1"),
+        parse_frame("s1", "SELECT * FROM t", &[]),
+        close_frame(b'S', "never_existed"),
+        close_frame(b'P', "never_existed"),
+        sync_frame(),
+    ]);
+    assert!(
+        msgs.iter()
+            .filter(|m| matches!(m, Msg::CloseComplete))
+            .count()
+            >= 2,
+        "both Closes (one real, one nonexistent) answer CloseComplete: {msgs:?}"
+    );
+    assert!(Client::error(&msgs).is_none(), "{msgs:?}");
+
+    // Named portal re-Bind without Close: 42P03.
+    let msgs = client.extended(&[
+        bind_frame("p1", "s1", &[], &[], &[]),
+        bind_frame("p1", "s1", &[], &[], &[]),
+        sync_frame(),
+    ]);
+    let (code, _) = Client::error(&msgs).expect("re-Bind must error");
+    assert_eq!(code, "42P03", "{msgs:?}");
+    client.terminate();
+}
+
+#[test]
+fn extended_describe_unknown_empty_and_nodata() {
+    // Describe of unknown objects: 26000. An empty query parses,
+    // describes as ParameterDescription([]) + NoData, and executes
+    // as EmptyQueryResponse. Non-SELECT statements describe NoData.
+    let server = Server::start("ext-desc");
+    let (mut client, _) = Client::connect(server.port);
+    client.query("CREATE TABLE t (a)");
+
+    let msgs = client.extended(&[
+        describe_frame(b'S', "nope"),
+        describe_frame(b'P', "nope"),
+        sync_frame(),
+    ]);
+    assert_eq!(
+        msgs.iter()
+            .filter(|m| matches!(m, Msg::ErrorResponse(code, _) if code == "26000"))
+            .count(),
+        1,
+        "only the FIRST Describe errors — the second is skipped until Sync: {msgs:?}"
+    );
+
+    let msgs = client.extended(&[
+        parse_frame("", "", &[]),
+        describe_frame(b'S', ""),
+        bind_frame("", "", &[], &[], &[]),
+        execute_frame("", 0),
+        sync_frame(),
+    ]);
+    assert!(
+        msgs.iter().any(|m| matches!(
+            m,
+            Msg::ParameterDescription(types) if types.is_empty()
+        )),
+        "empty statement has no params: {msgs:?}"
+    );
+    assert!(
+        msgs.iter().any(|m| matches!(m, Msg::NoData)),
+        "empty statement describes NoData: {msgs:?}"
+    );
+    assert!(
+        msgs.iter().any(|m| matches!(m, Msg::EmptyQueryResponse)),
+        "empty statement executes as EmptyQueryResponse: {msgs:?}"
+    );
+
+    // INSERT describes ParameterDescription + NoData.
+    let msgs = client.extended(&[
+        parse_frame("", "INSERT INTO t VALUES ($1)", &[]),
+        describe_frame(b'S', ""),
+        sync_frame(),
+    ]);
+    assert!(
+        msgs.iter().any(|m| matches!(
+            m,
+            Msg::ParameterDescription(types) if types == &[25]
+        )),
+        "{msgs:?}"
+    );
+    assert!(
+        msgs.iter().any(|m| matches!(m, Msg::NoData)),
+        "INSERT must describe NoData: {msgs:?}"
+    );
+    client.terminate();
+}
+
+#[test]
+fn extended_create_insert_delete_roundtrip() {
+    // CREATE / INSERT / DELETE through the extended protocol, with
+    // params, verified afterwards over Simple Query.
+    let server = Server::start("ext-ddl");
+    let (mut client, _) = Client::connect(server.port);
+
+    let msgs = client.extended(&[
+        parse_frame("", "CREATE TABLE users (id, name, city)", &[]),
+        bind_frame("", "", &[], &[], &[]),
+        execute_frame("", 0),
+        sync_frame(),
+    ]);
+    assert_eq!(
+        Client::tag(&msgs).as_deref(),
+        Some("CREATE TABLE"),
+        "{msgs:?}"
+    );
+
+    let msgs = client.extended(&[
+        parse_frame("", "INSERT INTO users VALUES ($1, $2, $3)", &[]),
+        bind_frame(
+            "",
+            "",
+            &[],
+            &[text_param("1"), text_param("Sanjay"), text_param("Delhi")],
+            &[],
+        ),
+        execute_frame("", 0),
+        sync_frame(),
+    ]);
+    assert_eq!(
+        Client::tag(&msgs).as_deref(),
+        Some("INSERT 0 1"),
+        "{msgs:?}"
+    );
+    let msgs = client.extended(&[
+        bind_frame(
+            "",
+            "",
+            &[],
+            &[text_param("2"), text_param("Asha"), text_param("Mumbai")],
+            &[],
+        ),
+        execute_frame("", 0),
+        sync_frame(),
+    ]);
+    assert_eq!(
+        Client::tag(&msgs).as_deref(),
+        Some("INSERT 0 1"),
+        "{msgs:?}"
+    );
+
+    let msgs = client.extended(&[
+        parse_frame("", "DELETE FROM users WHERE city = $1", &[]),
+        bind_frame("", "", &[], &[text_param("Mumbai")], &[]),
+        execute_frame("", 0),
+        sync_frame(),
+    ]);
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("DELETE 1"), "{msgs:?}");
+
+    let msgs = client.query("SELECT * FROM users");
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![
+            Some("1".into()),
+            Some("Sanjay".into()),
+            Some("Delhi".into())
+        ]],
+        "{msgs:?}"
+    );
+    client.terminate();
+}
+
+#[test]
+fn extended_binary_result_format() {
+    // Bind with result format 1 (binary): Describe portal reports
+    // format 1 per column, and the DataRow values are still the
+    // same text bytes (binary text = raw UTF-8).
+    let server = Server::start("ext-binfmt");
+    let (mut client, _) = Client::connect(server.port);
+    client.query("CREATE TABLE t (id, name)");
+    client.query("INSERT INTO t VALUES (1, 'Sanjay')");
+
+    let msgs = client.extended(&[
+        parse_frame("", "SELECT * FROM t", &[]),
+        bind_frame("", "", &[], &[], &[1]),
+        describe_frame(b'P', ""),
+        execute_frame("", 0),
+        sync_frame(),
+    ]);
+    assert!(
+        msgs.iter().any(|m| matches!(
+            m,
+            Msg::RowDescription(_, formats) if formats == &[1, 1]
+        )),
+        "binary result format must be reported per column: {msgs:?}"
+    );
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![Some("1".into()), Some("Sanjay".into())]],
+        "binary text rows carry the same bytes: {msgs:?}"
+    );
+    client.terminate();
+}
+
+#[test]
+fn extended_parse_rejects_gaps_and_multi_statement() {
+    // $1 + $3 with no $2: 42P18. Two statements in one Parse: 42601.
+    // Both recover via Sync.
+    let server = Server::start("ext-parse-err");
+    let (mut client, _) = Client::connect(server.port);
+    client.query("CREATE TABLE t (a)");
+
+    let msgs = client.extended(&[
+        parse_frame("", "SELECT * FROM t WHERE a = $1 AND a = $3", &[]),
+        sync_frame(),
+    ]);
+    let (code, _) = Client::error(&msgs).expect("param gap must error");
+    assert_eq!(code, "42P18", "{msgs:?}");
+
+    let msgs = client.extended(&[
+        parse_frame("", "SELECT * FROM t; SELECT * FROM t", &[]),
+        sync_frame(),
+    ]);
+    let (code, _) = Client::error(&msgs).expect("multi-statement Parse must error");
+    assert_eq!(code, "42601", "{msgs:?}");
+
+    // Unsupported statement kind fails at Parse with 0A000.
+    let msgs = client.extended(&[parse_frame("", "UPDATE t SET a = 'x'", &[]), sync_frame()]);
+    let (code, _) = Client::error(&msgs).expect("UPDATE Parse must error");
+    assert_eq!(code, "0A000", "{msgs:?}");
+
+    // Unsupported declared param type: 0A000.
+    let msgs = client.extended(&[
+        parse_frame("", "SELECT * FROM t WHERE a = $1", &[16]),
+        sync_frame(),
+    ]);
+    let (code, _) = Client::error(&msgs).expect("bad param type must error");
+    assert_eq!(code, "0A000", "{msgs:?}");
+
+    // And the connection is fine afterwards.
+    let msgs = client.query("SELECT * FROM t");
+    assert!(Client::error(&msgs).is_none(), "{msgs:?}");
+    client.terminate();
+}
+
+#[test]
+fn extended_null_param_becomes_empty_string() {
+    // Zeno has no NULLs: a bound NULL stores as "" (documented).
+    let server = Server::start("ext-null");
+    let (mut client, _) = Client::connect(server.port);
+    client.query("CREATE TABLE t (a, b)");
+    let msgs = client.extended(&[
+        parse_frame("", "INSERT INTO t VALUES ($1, $2)", &[]),
+        bind_frame("", "", &[], &[text_param("x"), None], &[]),
+        execute_frame("", 0),
+        sync_frame(),
+    ]);
+    assert_eq!(
+        Client::tag(&msgs).as_deref(),
+        Some("INSERT 0 1"),
+        "{msgs:?}"
+    );
+    let msgs = client.query("SELECT * FROM t");
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![Some("x".into()), Some("".into())]],
+        "{msgs:?}"
+    );
+    client.terminate();
+}
+
+#[test]
+fn extended_simple_query_clears_unnamed() {
+    // A Simple Query destroys the unnamed statement and portal:
+    // after one, Bind/Execute on "" must fail with 26000.
+    let server = Server::start("ext-clear");
+    let (mut client, _) = Client::connect(server.port);
+    client.query("CREATE TABLE t (a)");
+    let msgs = client.extended(&[
+        parse_frame("", "SELECT * FROM t", &[]),
+        bind_frame("", "", &[], &[], &[]),
+        sync_frame(),
+    ]);
+    assert!(Client::error(&msgs).is_none(), "{msgs:?}");
+    client.query("SELECT * FROM t"); // Simple Query clears unnamed
+    let msgs = client.extended(&[execute_frame("", 0), sync_frame()]);
+    let (code, _) = Client::error(&msgs).expect("cleared portal must error");
+    assert_eq!(code, "26000", "{msgs:?}");
     client.terminate();
 }
 
@@ -790,4 +1634,676 @@ fn second_server_on_same_data_dir_fails_lock() {
         "{msgs:?}"
     );
     client.terminate();
+}
+
+// ---------------------------------------------------------------------
+// SCRAM-SHA-256 tests. The client side here uses the library's own
+// `zeno::auth::scram_client_response` (whose math is pinned to the
+// RFC 7677 vectors in the unit tests) but drives the framing,
+// nonce echo and server-signature check itself, so the handshake
+// flow is verified end to end against a real server.
+// ---------------------------------------------------------------------
+
+/// Drive a full SCRAM login on an already-connected socket.
+/// Returns the messages after AuthenticationSASLFinal (AuthOk,
+/// ParameterStatus, BackendKeyData, ReadyForQuery).
+fn scram_login(client: &mut Client, user: &str, password: &str) -> Vec<Msg> {
+    client.stream.write_all(&startup_frame(user)).unwrap();
+    client.stream.flush().unwrap();
+    let first = client.read_one();
+    assert!(
+        matches!(first, Msg::AuthSasl(ref m) if m == "SCRAM-SHA-256"),
+        "server must offer SCRAM-SHA-256, got: {first:?}"
+    );
+    let client_nonce = "test-client-nonce-123";
+    let client_first_bare = format!("n={},r={}", user, client_nonce);
+    let client_first = format!("n,,{client_first_bare}");
+    client
+        .stream
+        .write_all(&sasl_initial_response(
+            "SCRAM-SHA-256",
+            client_first.as_bytes(),
+        ))
+        .unwrap();
+    client.stream.flush().unwrap();
+    let second = client.read_one();
+    let Msg::AuthSaslContinue(server_first) = second else {
+        panic!("expected AuthenticationSASLContinue, got: {second:?}");
+    };
+    let (client_final, expected_sig) =
+        zeno::auth::scram_client_response(password, &client_first_bare, &server_first)
+            .expect("client SCRAM computation must work");
+    client
+        .stream
+        .write_all(&sasl_response(client_final.as_bytes()))
+        .unwrap();
+    client.stream.flush().unwrap();
+    let third = client.read_one();
+    let Msg::AuthSaslFinal(server_final) = third else {
+        panic!("expected AuthenticationSASLFinal, got: {third:?}");
+    };
+    assert_eq!(
+        server_final,
+        format!("v={expected_sig}"),
+        "server-final signature must match the client's expectation (mutual auth)"
+    );
+    client.read_until_ready()
+}
+
+#[test]
+fn scram_login_success_then_query_works() {
+    let server = Server::start("scram-ok");
+    set_password(&server.dir, "sanjay", "correct horse battery staple");
+
+    let mut client = Client::connect_socket(server.port);
+    let msgs = scram_login(&mut client, "sanjay", "correct horse battery staple");
+    assert!(
+        msgs.iter().any(|m| matches!(m, Msg::AuthOk)),
+        "SCRAM login must end with AuthenticationOk: {msgs:?}"
+    );
+    assert!(matches!(msgs.last(), Some(Msg::ReadyForQuery(b'I'))));
+
+    let msgs = client.query("CREATE TABLE t (a)");
+    assert_eq!(
+        Client::tag(&msgs).as_deref(),
+        Some("CREATE TABLE"),
+        "{msgs:?}"
+    );
+    let msgs = client.query("INSERT INTO t VALUES ('scram-works')");
+    assert_eq!(
+        Client::tag(&msgs).as_deref(),
+        Some("INSERT 0 1"),
+        "{msgs:?}"
+    );
+    client.terminate();
+}
+
+#[test]
+fn scram_wrong_password_rejected_and_connection_closed() {
+    let server = Server::start("scram-wrong");
+    set_password(&server.dir, "sanjay", "correct horse battery staple");
+
+    // Drive the handshake by hand with the WRONG password: the
+    // server must answer the client-final with ErrorResponse 28P01
+    // and then close the connection.
+    let mut client = Client::connect_socket(server.port);
+    client.stream.write_all(&startup_frame("sanjay")).unwrap();
+    client.stream.flush().unwrap();
+    assert!(matches!(client.read_one(), Msg::AuthSasl(_)));
+    let client_first_bare = "n=sanjay,r=test-client-nonce-123";
+    client
+        .stream
+        .write_all(&sasl_initial_response(
+            "SCRAM-SHA-256",
+            format!("n,,{client_first_bare}").as_bytes(),
+        ))
+        .unwrap();
+    client.stream.flush().unwrap();
+    let second = client.read_one();
+    let Msg::AuthSaslContinue(server_first) = second else {
+        panic!("expected AuthenticationSASLContinue, got: {second:?}");
+    };
+    let (client_final, _) =
+        zeno::auth::scram_client_response("wrong password", client_first_bare, &server_first)
+            .unwrap();
+    client
+        .stream
+        .write_all(&sasl_response(client_final.as_bytes()))
+        .unwrap();
+    client.stream.flush().unwrap();
+    let third = client.read_one();
+    let (code, _) = match &third {
+        Msg::ErrorResponse(code, msg) => (code.clone(), msg.clone()),
+        other => panic!("expected ErrorResponse 28P01, got: {other:?}"),
+    };
+    assert_eq!(code, "28P01", "wrong password must be 28P01");
+    assert!(
+        client.try_read_one().is_none(),
+        "server must close the connection after a failed login"
+    );
+
+    // The server itself is still alive: a correct login works.
+    let mut client2 = Client::connect_socket(server.port);
+    let msgs = scram_login(&mut client2, "sanjay", "correct horse battery staple");
+    assert!(msgs.iter().any(|m| matches!(m, Msg::AuthOk)), "{msgs:?}");
+    client2.terminate();
+}
+
+#[test]
+fn scram_unknown_user_gets_fake_exchange_then_rejected() {
+    // An unknown user still gets a full server-first (fake salt),
+    // so the exchange looks identical — and still ends in 28P01.
+    let server = Server::start("scram-ghost");
+    set_password(&server.dir, "sanjay", "correct horse battery staple");
+
+    let mut client = Client::connect_socket(server.port);
+    client.stream.write_all(&startup_frame("ghost")).unwrap();
+    client.stream.flush().unwrap();
+    assert!(matches!(client.read_one(), Msg::AuthSasl(_)));
+    let client_first_bare = "n=ghost,r=test-client-nonce-123";
+    client
+        .stream
+        .write_all(&sasl_initial_response(
+            "SCRAM-SHA-256",
+            format!("n,,{client_first_bare}").as_bytes(),
+        ))
+        .unwrap();
+    client.stream.flush().unwrap();
+    let second = client.read_one();
+    let Msg::AuthSaslContinue(server_first) = second else {
+        panic!("unknown user must still get a server-first, got: {second:?}");
+    };
+    let (client_final, _) =
+        zeno::auth::scram_client_response("whatever", client_first_bare, &server_first).unwrap();
+    client
+        .stream
+        .write_all(&sasl_response(client_final.as_bytes()))
+        .unwrap();
+    client.stream.flush().unwrap();
+    let third = client.read_one();
+    match &third {
+        Msg::ErrorResponse(code, _) => assert_eq!(code, "28P01", "{third:?}"),
+        other => panic!("expected ErrorResponse 28P01, got: {other:?}"),
+    }
+    assert!(client.try_read_one().is_none());
+    client.terminate();
+}
+
+#[test]
+fn scram_password_set_after_server_start_applies_at_once() {
+    // users.json is re-read on every connection: setting a
+    // password while the server runs must flip NEW connections
+    // from trust auth to SCRAM, with no restart.
+    let server = Server::start("scram-late");
+    // Trust auth first: a plain handshake works.
+    let (client, msgs) = Client::connect(server.port);
+    assert!(msgs.iter().any(|m| matches!(m, Msg::AuthOk)), "{msgs:?}");
+    client.terminate();
+
+    set_password(&server.dir, "sanjay", "late password");
+
+    // The next connection must be offered SCRAM, not AuthOk.
+    let mut client = Client::connect_socket(server.port);
+    client.stream.write_all(&startup_frame("sanjay")).unwrap();
+    client.stream.flush().unwrap();
+    assert!(
+        matches!(client.read_one(), Msg::AuthSasl(_)),
+        "after set-password the server must offer SCRAM"
+    );
+    // Finish the login on this same socket.
+    let client_nonce = "test-client-nonce-123";
+    let client_first_bare = format!("n=sanjay,r={client_nonce}");
+    client
+        .stream
+        .write_all(&sasl_initial_response(
+            "SCRAM-SHA-256",
+            format!("n,,{client_first_bare}").as_bytes(),
+        ))
+        .unwrap();
+    client.stream.flush().unwrap();
+    let second = client.read_one();
+    let Msg::AuthSaslContinue(server_first) = second else {
+        panic!("expected AuthenticationSASLContinue, got: {second:?}");
+    };
+    let (client_final, expected_sig) =
+        zeno::auth::scram_client_response("late password", &client_first_bare, &server_first)
+            .unwrap();
+    client
+        .stream
+        .write_all(&sasl_response(client_final.as_bytes()))
+        .unwrap();
+    client.stream.flush().unwrap();
+    let third = client.read_one();
+    assert!(
+        matches!(third, Msg::AuthSaslFinal(ref v) if v == &format!("v={expected_sig}")),
+        "server-final must verify: {third:?}"
+    );
+    let msgs = client.read_until_ready();
+    assert!(msgs.iter().any(|m| matches!(m, Msg::AuthOk)), "{msgs:?}");
+    client.terminate();
+}
+
+// ---------------------------------------------------------------------
+// V0.4 review fixes: regression tests for the eight must-fix issues
+// (failed Parse/Bind dropping stored state, Describe(S) ordering,
+// block comments, INSERT ')' literal, 32767 param cap) and the
+// SCRAM minors (deterministic fake salt, SASLprep login, strict
+// client-first parsing, short-nonce rejection, set-password on a
+// missing data directory).
+// ---------------------------------------------------------------------
+
+fn seed_users(client: &mut Client) {
+    client.query("CREATE TABLE users (id, name, city)");
+    client.query("INSERT INTO users VALUES (1, 'Sanjay', 'Delhi')");
+    client.query("INSERT INTO users VALUES (2, 'Asha', 'Mumbai')");
+    client.query("INSERT INTO users VALUES (3, 'Ravi', 'Delhi')");
+}
+
+#[test]
+fn extended_failed_parse_drops_the_old_statement() {
+    // Reviewer repro (issue 1): Parse a good SELECT, Bind Delhi
+    // (rows come back), then re-Parse the unnamed statement with
+    // garbage SQL (42601) — the OLD statement must be gone, so a
+    // later Bind + Execute fails with 26000 instead of silently
+    // running the old query for Mumbai.
+    let server = Server::start("ext-failed-parse");
+    let (mut client, _) = Client::connect(server.port);
+    seed_users(&mut client);
+
+    let msgs = client.extended(&[
+        parse_frame("", "SELECT * FROM users WHERE city = $1", &[]),
+        bind_frame("", "", &[], &[text_param("Delhi")], &[]),
+        execute_frame("", 0),
+        sync_frame(),
+    ]);
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("SELECT 2"), "{msgs:?}");
+
+    let msgs = client.extended(&[parse_frame("", "SELEC oops broken", &[]), sync_frame()]);
+    assert_eq!(
+        Client::error(&msgs).map(|(c, _)| c).as_deref(),
+        Some("42601"),
+        "garbage re-Parse must fail with 42601: {msgs:?}"
+    );
+
+    let msgs = client.extended(&[
+        bind_frame("", "", &[], &[text_param("Mumbai")], &[]),
+        execute_frame("", 0),
+        sync_frame(),
+    ]);
+    assert_eq!(
+        Client::error(&msgs).map(|(c, _)| c).as_deref(),
+        Some("26000"),
+        "Bind after a failed Parse must fail (old statement is gone), not run Mumbai: {msgs:?}"
+    );
+    assert!(
+        Client::rows(&msgs).is_empty(),
+        "no rows may come back from a dropped statement: {msgs:?}"
+    );
+
+    // And a fresh Parse works again on the same connection.
+    let msgs = client.extended(&[
+        parse_frame("", "SELECT * FROM users WHERE city = $1", &[]),
+        bind_frame("", "", &[], &[text_param("Mumbai")], &[]),
+        execute_frame("", 0),
+        sync_frame(),
+    ]);
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("SELECT 1"), "{msgs:?}");
+    client.terminate();
+}
+
+#[test]
+fn extended_failed_bind_drops_the_old_portal() {
+    // Issue 1, Bind half: a portal that Bound fine, then a Bind
+    // with a bad int4 value (22P02) — the OLD portal must be gone,
+    // so a later Execute fails with 26000 instead of silently
+    // re-running the old query.
+    let server = Server::start("ext-failed-bind");
+    let (mut client, _) = Client::connect(server.port);
+    seed_users(&mut client);
+
+    let msgs = client.extended(&[
+        parse_frame("", "SELECT * FROM users WHERE id = $1", &[23]),
+        bind_frame("", "", &[], &[text_param("1")], &[]),
+        execute_frame("", 0),
+        sync_frame(),
+    ]);
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("SELECT 1"), "{msgs:?}");
+
+    let msgs = client.extended(&[
+        bind_frame("", "", &[], &[text_param("xx")], &[]),
+        sync_frame(),
+    ]);
+    assert_eq!(
+        Client::error(&msgs).map(|(c, _)| c).as_deref(),
+        Some("22P02"),
+        "bad int4 Bind must fail with 22P02: {msgs:?}"
+    );
+
+    let msgs = client.extended(&[execute_frame("", 0), sync_frame()]);
+    assert_eq!(
+        Client::error(&msgs).map(|(c, _)| c).as_deref(),
+        Some("26000"),
+        "Execute after a failed Bind must fail (old portal is gone): {msgs:?}"
+    );
+    assert!(Client::rows(&msgs).is_empty(), "{msgs:?}");
+
+    // A fresh Bind works again on the same connection.
+    let msgs = client.extended(&[
+        bind_frame("", "", &[], &[text_param("2")], &[]),
+        execute_frame("", 0),
+        sync_frame(),
+    ]);
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![
+            Some("2".into()),
+            Some("Asha".into()),
+            Some("Mumbai".into())
+        ]],
+        "{msgs:?}"
+    );
+    client.terminate();
+}
+
+#[test]
+fn extended_describe_missing_table_sends_only_error() {
+    // Issue 5: Describe(S) on SELECT * FROM ghost used to send
+    // ParameterDescription FIRST and then the ErrorResponse. Now
+    // the table/column check runs first, so the reply is ONLY the
+    // ErrorResponse (42P01) — no ParameterDescription before it.
+    let server = Server::start("ext-desc-ghost");
+    let (mut client, _) = Client::connect(server.port);
+    client.query("CREATE TABLE t (a)");
+
+    let msgs = client.extended(&[
+        parse_frame("", "SELECT * FROM ghost", &[]),
+        describe_frame(b'S', ""),
+        sync_frame(),
+    ]);
+    assert!(
+        !msgs
+            .iter()
+            .any(|m| matches!(m, Msg::ParameterDescription(_))),
+        "Describe(S) on a missing table must NOT send ParameterDescription first: {msgs:?}"
+    );
+    assert_eq!(
+        Client::error(&msgs).map(|(c, _)| c).as_deref(),
+        Some("42P01"),
+        "{msgs:?}"
+    );
+
+    // Control: Describe(S) on a real table still sends
+    // ParameterDescription + RowDescription.
+    let msgs = client.extended(&[
+        parse_frame("", "SELECT * FROM t", &[]),
+        describe_frame(b'S', ""),
+        sync_frame(),
+    ]);
+    assert!(
+        msgs.iter().any(|m| matches!(
+            m,
+            Msg::ParameterDescription(types) if types.is_empty()
+        )),
+        "{msgs:?}"
+    );
+    assert!(
+        msgs.iter().any(|m| matches!(
+            m,
+            Msg::RowDescription(cols, _) if cols == &["a".to_string()]
+        )),
+        "{msgs:?}"
+    );
+    client.terminate();
+}
+
+#[test]
+fn extended_block_comments_are_ignored() {
+    // Issue 6: `/* */` comments in Parse (a `$2` inside one is
+    // not a parameter) and in Simple Query (a `/* ; */` must not
+    // split, and a comment must not break the statement).
+    let server = Server::start("ext-block-comment");
+    let (mut client, _) = Client::connect(server.port);
+    seed_users(&mut client);
+
+    let msgs = client.extended(&[
+        parse_frame("", "SELECT * FROM users WHERE city = $1 /* $2 */", &[]),
+        describe_frame(b'S', ""),
+        sync_frame(),
+    ]);
+    assert!(
+        msgs.iter().any(|m| matches!(
+            m,
+            Msg::ParameterDescription(types) if types == &[25]
+        )),
+        "only $1 counts — the $2 in the block comment is not a param: {msgs:?}"
+    );
+    assert!(Client::error(&msgs).is_none(), "{msgs:?}");
+
+    let msgs = client.query("SELECT * FROM users /* comment */ WHERE city = 'Delhi'");
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("SELECT 2"), "{msgs:?}");
+
+    // "/* ; */" alone is an empty query, not two statements.
+    let msgs = client.query("/* ; */");
+    assert!(
+        msgs.iter().any(|m| matches!(m, Msg::EmptyQueryResponse)),
+        "{msgs:?}"
+    );
+    let msgs = client.query("SELECT * FROM users /* ; */");
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("SELECT 3"), "{msgs:?}");
+    client.terminate();
+}
+
+#[test]
+fn insert_literal_closing_paren_and_escaped_ident() {
+    // Issue 7 + minor: a literal ')' value must insert, and a
+    // double-quoted identifier with an escaped "" must work.
+    let server = Server::start("insert-paren");
+    let (mut client, _) = Client::connect(server.port);
+    client.query("CREATE TABLE t (id, name, city)");
+
+    let msgs = client.query("INSERT INTO t VALUES (9, ')', 'Delhi')");
+    assert_eq!(
+        Client::tag(&msgs).as_deref(),
+        Some("INSERT 0 1"),
+        "{msgs:?}"
+    );
+    let msgs = client.query("SELECT * FROM t WHERE name = ')'");
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![
+            Some("9".into()),
+            Some(")".into()),
+            Some("Delhi".into())
+        ]],
+        "{msgs:?}"
+    );
+
+    let msgs = client.query("CREATE TABLE \"a\"\"b\" (id, name)");
+    assert_eq!(
+        Client::tag(&msgs).as_deref(),
+        Some("CREATE TABLE"),
+        "{msgs:?}"
+    );
+    let msgs = client.query("INSERT INTO \"a\"\"b\" VALUES (1, 'x')");
+    assert_eq!(
+        Client::tag(&msgs).as_deref(),
+        Some("INSERT 0 1"),
+        "{msgs:?}"
+    );
+    let msgs = client.query("SELECT * FROM \"a\"\"b\"");
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![Some("1".into()), Some("x".into())]],
+        "{msgs:?}"
+    );
+    client.terminate();
+}
+
+#[test]
+fn extended_parse_rejects_more_than_32767_params() {
+    // Issue 8: a ParameterDescription count is an Int16, so 32768
+    // parameters would wrap to -32768. Parse rejects them with
+    // 54000; exactly 32767 still parses.
+    let server = Server::start("ext-param-cap");
+    let (mut client, _) = Client::connect(server.port);
+    client.query("CREATE TABLE t (id)");
+
+    let over: String = (1..=32768)
+        .map(|i| format!("id = ${i}"))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let msgs = client.extended(&[
+        parse_frame("", &format!("SELECT * FROM t WHERE {over}"), &[]),
+        sync_frame(),
+    ]);
+    assert_eq!(
+        Client::error(&msgs).map(|(c, _)| c).as_deref(),
+        Some("54000"),
+        "32768 params must fail with 54000, not wrap: {msgs:?}"
+    );
+
+    let at_cap: String = (1..=32767)
+        .map(|i| format!("id = ${i}"))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let msgs = client.extended(&[
+        parse_frame("", &format!("SELECT * FROM t WHERE {at_cap}"), &[]),
+        sync_frame(),
+    ]);
+    assert!(
+        msgs.iter().any(|m| matches!(m, Msg::ParseComplete)),
+        "32767 params must still parse: {msgs:?}"
+    );
+    assert!(Client::error(&msgs).is_none(), "{msgs:?}");
+    client.terminate();
+}
+
+/// Drive a SCRAM handshake only up to the server-first message and
+/// return it (the `r=...,s=<salt>,i=...` string). The socket is
+/// left open for the caller to close.
+fn scram_server_first(client: &mut Client, user: &str, client_nonce: &str) -> String {
+    client.stream.write_all(&startup_frame(user)).unwrap();
+    client.stream.flush().unwrap();
+    assert!(matches!(client.read_one(), Msg::AuthSasl(_)));
+    let client_first_bare = format!("n={user},r={client_nonce}");
+    client
+        .stream
+        .write_all(&sasl_initial_response(
+            "SCRAM-SHA-256",
+            format!("n,,{client_first_bare}").as_bytes(),
+        ))
+        .unwrap();
+    client.stream.flush().unwrap();
+    match client.read_one() {
+        Msg::AuthSaslContinue(server_first) => server_first,
+        other => panic!("expected AuthenticationSASLContinue, got: {other:?}"),
+    }
+}
+
+fn server_first_salt(server_first: &str) -> String {
+    server_first
+        .split(',')
+        .find_map(|p| p.strip_prefix("s=").map(str::to_string))
+        .expect("server-first must carry s=<salt>")
+}
+
+#[test]
+fn scram_fake_salt_is_deterministic_per_unknown_user() {
+    // Issue 4, end to end: two handshakes for the same unknown
+    // user must carry the SAME fake salt; a different unknown
+    // user must get a different one.
+    let server = Server::start("scram-fake-salt");
+    set_password(&server.dir, "sanjay", "correct horse battery staple");
+
+    let mut c1 = Client::connect_socket(server.port);
+    let sf1 = scram_server_first(&mut c1, "ghost", "test-client-nonce-123");
+    c1.terminate();
+    let mut c2 = Client::connect_socket(server.port);
+    let sf2 = scram_server_first(&mut c2, "ghost", "test-client-nonce-456");
+    c2.terminate();
+    let mut c3 = Client::connect_socket(server.port);
+    let sf3 = scram_server_first(&mut c3, "ghost2", "test-client-nonce-123");
+    c3.terminate();
+
+    assert_eq!(
+        server_first_salt(&sf1),
+        server_first_salt(&sf2),
+        "same unknown user must get the same fake salt: {sf1} vs {sf2}"
+    );
+    assert_ne!(
+        server_first_salt(&sf1),
+        server_first_salt(&sf3),
+        "different unknown users must get different fake salts"
+    );
+}
+
+#[test]
+fn scram_nbsp_password_logs_in_with_saslprep_form() {
+    // Issue 3, end to end: a password set with a NBSP (U+00A0)
+    // must log in when the client sends the SASLprep'd form
+    // ("pass word1"), because both sides SASLprep.
+    let server = Server::start("scram-nbsp");
+    set_password(&server.dir, "sanjay", "pass\u{a0}word1"); // NBSP between pass/word1
+
+    let mut client = Client::connect_socket(server.port);
+    let msgs = scram_login(&mut client, "sanjay", "pass word1");
+    assert!(
+        msgs.iter().any(|m| matches!(m, Msg::AuthOk)),
+        "SASLprep'd login must succeed: {msgs:?}"
+    );
+    client.terminate();
+}
+
+#[test]
+fn scram_client_first_strictness() {
+    // Minors: a duplicate n=/r= in client-first is rejected, and
+    // a 1-character client nonce is rejected — both with 08P01
+    // and the connection closed.
+    let server = Server::start("scram-strict");
+    set_password(&server.dir, "sanjay", "correct horse battery staple");
+
+    for first in [
+        "n,,n=sanjay,r=AAA12345,n=ghost,r=BBB12345",
+        "n,,n=sanjay,r=x",
+    ] {
+        let mut client = Client::connect_socket(server.port);
+        client.stream.write_all(&startup_frame("sanjay")).unwrap();
+        client.stream.flush().unwrap();
+        assert!(matches!(client.read_one(), Msg::AuthSasl(_)));
+        client
+            .stream
+            .write_all(&sasl_initial_response("SCRAM-SHA-256", first.as_bytes()))
+            .unwrap();
+        client.stream.flush().unwrap();
+        match client.read_one() {
+            Msg::ErrorResponse(code, _) => assert_eq!(code, "08P01", "{first}"),
+            other => panic!("{first} must fail with 08P01, got: {other:?}"),
+        }
+        assert!(
+            client.try_read_one().is_none(),
+            "server must close the connection after a malformed client-first: {first}"
+        );
+        client.terminate();
+    }
+}
+
+#[test]
+fn set_password_on_missing_data_dir_succeeds() {
+    // Minor: `user set-password` on a nonexistent data directory
+    // used to fail with a cryptic "No such file or directory".
+    // It now creates the directory and sets the password.
+    let dir = std::env::temp_dir().join("zeno-pgwire-test-missing-dir/sub/dir");
+    let _ = std::fs::remove_dir_all(std::env::temp_dir().join("zeno-pgwire-test-missing-dir"));
+    let bin = env!("CARGO_BIN_EXE_zeno");
+    // Password twice on stdin.
+    let mut child = Command::new(bin)
+        .args([
+            "--data",
+            dir.to_str().unwrap(),
+            "user",
+            "set-password",
+            "u1",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn zeno user set-password");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"password123\npassword123\n")
+        .unwrap();
+    let output = child.wait_with_output().expect("wait zeno user");
+    assert!(
+        output.status.success(),
+        "set-password on a missing data dir must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        dir.join("users.json").exists(),
+        "users.json must exist after set-password"
+    );
+    let _ = std::fs::remove_dir_all(std::env::temp_dir().join("zeno-pgwire-test-missing-dir"));
 }

@@ -30,11 +30,11 @@ use zeno::doc;
 use zeno::engine::Engine;
 use zeno::table::TableStore;
 
-const VERSION: &str = "0.3.0";
+const VERSION: &str = "0.4.0";
 
 fn usage() -> String {
     format!(
-        "Zeno {VERSION} — One Engine, All Data (V0.3 prototype)\n\
+        "Zeno {VERSION} — One Engine, All Data (V0.4 prototype)\n\
         \n\
         Usage: zeno [--data <dir>] <command> [args]   (default data dir: ./zeno-data)\n\
         \n\
@@ -49,7 +49,7 @@ fn usage() -> String {
         \x20 table select <name> [column=value]\n\
         \x20 table list\n\
         \n\
-        JSON document (find is a linear scan in V0.3):\n\
+        JSON document (find is a linear scan in V0.4):\n\
         \x20 doc put <collection> <id> <json>\n\
         \x20 doc get <collection> <id>\n\
         \x20 doc find <collection> <field>=<value>\n\
@@ -61,11 +61,24 @@ fn usage() -> String {
         \x20 hold <seconds>           open the engine and hold its lock for N seconds\n\
         \x20                          (diagnostic for the lock demo / tests only)\n\
         \n\
-        PostgreSQL wire protocol (V0.3, Simple Query only, trust auth):\n\
+        PostgreSQL wire protocol (V0.4, Simple + extended query, trust or SCRAM auth):\n\
         \x20 serve [--port <port>]    listen on 127.0.0.1:<port> (default 5432) and\n\
-        \x20                          answer psql / libpq clients. LOCAL PROTOTYPE\n\
-        \x20                          ONLY: any local client may connect, no password.\n\
-        \x20                          Example: zeno --data ./my-data serve --port 5433"
+        \x20                          answer psql / libpq clients (prepared statements\n\
+        \x20                          work now). LOCAL PROTOTYPE ONLY: with no users\n\
+        \x20                          configured any local client may connect, no\n\
+        \x20                          password. Example: zeno --data ./my-data serve\n\
+        \x20                          --port 5433\n\
+        \n\
+        Users (SCRAM-SHA-256 password auth for `serve`):\n\
+        \x20 user set-password <name> set a password (asked twice on stdin;\n\
+        \x20                          NOTE: it echoes as you type in this prototype —\n\
+        \x20                          use a private terminal). The password is never\n\
+        \x20                          stored; only its SCRAM verifier is kept. A\n\
+        \x20                          server re-reads users on every new connection,\n\
+        \x20                          so no restart is needed.\n\
+        \x20 user list                list users (empty = trust auth)\n\
+        \x20 user remove <name>       remove a user (removing the last user\n\
+        \x20                          switches new connections back to trust auth)"
     )
 }
 
@@ -127,6 +140,14 @@ fn run(data_dir: &Path, port: u16, args: &[String]) -> Result<(), String> {
     if cmd == "serve" {
         return zeno::pgwire::serve(data_dir, port)
             .map_err(|e| format!("cannot serve on port {port}: {e}"));
+    }
+
+    // `user` manages users.json directly and must NOT open the
+    // engine: a running server holds the data-dir lock, and the
+    // server re-reads users.json on every new connection anyway, so
+    // a password set here applies at once, with no restart.
+    if cmd == "user" {
+        return run_user(data_dir, &args[1..]);
     }
 
     let mut engine = Engine::open(data_dir).map_err(|e| format!("cannot open data dir: {e}"))?;
@@ -281,4 +302,72 @@ fn run(data_dir: &Path, port: u16, args: &[String]) -> Result<(), String> {
         other => return Err(format!("unknown command '{other}'\n\n{}", usage())),
     }
     Ok(())
+}
+
+/// Read a password line from stdin (the trailing newline is
+/// stripped; any other whitespace is part of the password).
+fn read_password_line(prompt: &str) -> Result<String, String> {
+    use std::io::BufRead;
+    print!("{prompt}");
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .map_err(|e| format!("cannot read password: {e}"))?;
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
+fn run_user(data_dir: &Path, args: &[String]) -> Result<(), String> {
+    let sub = args.first().map(String::as_str).unwrap_or("");
+    match sub {
+        "set-password" => {
+            let name = args.get(1).ok_or_else(|| {
+                "usage: zeno user set-password <username> (password is asked on stdin)".to_string()
+            })?;
+            println!("setting password for user '{name}'");
+            println!(
+                "NOTE: the password echoes as you type in this prototype — use a private terminal."
+            );
+            let first = read_password_line("Password: ")?;
+            let second = read_password_line("Repeat password: ")?;
+            if first != second {
+                return Err("passwords do not match — nothing was changed".to_string());
+            }
+            zeno::auth::set_password(data_dir, name, &first)?;
+            println!("OK  password set for '{name}' — new connections now need SCRAM-SHA-256 auth");
+            Ok(())
+        }
+        "list" => {
+            let users = zeno::auth::list_users(data_dir)?;
+            if users.is_empty() {
+                println!("(no users — trust auth: any local client may connect, no password)");
+            } else {
+                for name in users {
+                    println!("{name}");
+                }
+            }
+            Ok(())
+        }
+        "remove" => {
+            let name = args
+                .get(1)
+                .ok_or_else(|| "usage: zeno user remove <username>".to_string())?;
+            if zeno::auth::remove_user(data_dir, name)? {
+                println!("OK  user '{name}' removed");
+                if zeno::auth::list_users(data_dir)?.is_empty() {
+                    println!(
+                        "WARNING: no users left — new connections are back to trust auth                          (any local client, no password)"
+                    );
+                }
+            } else {
+                println!("user '{name}' does not exist — nothing changed");
+            }
+            Ok(())
+        }
+        other => Err(format!(
+            "unknown user command '{other}' — see `zeno --help` (set-password, list, remove)"
+        )),
+    }
 }

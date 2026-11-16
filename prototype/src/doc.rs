@@ -7,16 +7,80 @@
 // single field equals a given value. V0.1 does this as a LINEAR scan —
 // there is no GIN / secondary index yet. That is slow on big collections
 // and is stated honestly here and in the README.
+//
+// V0.11 key encoding (review finding 9): the collection and id are
+// percent-escaped before they are joined with `:`, so the key is
+// unambiguous — `%` becomes `%25` and `:` becomes `%3A`, and the
+// escape is applied to BOTH parts in `put`, `get` and `find` alike.
+// Before V0.11 the parts were joined raw, so (`a:b`, `c`) and (`a`,
+// `b:c`) both produced the key `doc:a:b:c` and one collection's
+// document could overwrite / show up in another's. The escape keeps
+// every OLD key readable: a collection/id with no `%` or `:` in it
+// encodes exactly as before (`doc:profiles:u1`), so documents
+// written by V0.10 open unchanged. Only keys that contain `%` or
+// `:` change — and those were ambiguous (broken) before, so no
+// well-defined old document is lost; a V0.10 document whose
+// collection or id contained a `:` is simply not found under the
+// new encoding, which the README states plainly.
 
 use crate::engine::Engine;
 use serde_json::Value;
 
+/// Escape one key component (`:` and `%` only — everything else,
+/// including `/`, spaces and Unicode, passes through unchanged, so
+/// old keys without those two characters encode byte-identically).
+fn escape_component(part: &str) -> String {
+    let mut out = String::with_capacity(part.len());
+    for ch in part.chars() {
+        match ch {
+            '%' => out.push_str("%25"),
+            ':' => out.push_str("%3A"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Undo `escape_component`. A `%` not followed by `25` or `3A` is
+/// left as-is (a hand-written key, never one this module wrote).
+fn unescape_component(part: &str) -> String {
+    let mut out = String::with_capacity(part.len());
+    let mut rest = part;
+    while let Some(pos) = rest.find('%') {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + 1..];
+        if let Some(code) = after.get(..2) {
+            match code {
+                "25" => {
+                    out.push('%');
+                    rest = &after[2..];
+                    continue;
+                }
+                "3A" => {
+                    out.push(':');
+                    rest = &after[2..];
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        out.push('%');
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
 fn key_prefix(collection: &str) -> String {
-    format!("doc:{collection}:")
+    format!("doc:{}:", escape_component(collection))
 }
 
 fn doc_key(collection: &str, id: &str) -> String {
-    format!("doc:{collection}:{id}")
+    format!(
+        "doc:{}:{}",
+        escape_component(collection),
+        escape_component(id)
+    )
 }
 
 pub struct DocStore;
@@ -52,9 +116,12 @@ impl DocStore {
         let prefix = key_prefix(collection);
         let mut out = Vec::new();
         for (key, doc_json) in engine.scan_prefix(&prefix) {
-            let Some(id) = key.strip_prefix(&prefix) else {
+            let Some(escaped_id) = key.strip_prefix(&prefix) else {
                 continue;
             };
+            // The id stored in the key is escaped; hand back the
+            // real id the caller stored.
+            let id = unescape_component(escaped_id);
             let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(&doc_json) else {
                 continue;
             };
@@ -68,5 +135,73 @@ impl DocStore {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// V0.11 (review finding 9): (`a:b`, `c`) and (`a`, `b:c`)
+    /// used to collide on the single key `doc:a:b:c`, so one
+    /// document overwrote / showed up in the other collection.
+    /// With escaping they are distinct keys, and `find` is
+    /// isolated per collection too.
+    #[test]
+    fn separator_collision_is_isolated() {
+        let dir = crate::unique_test_dir("zeno-doc-collision-test");
+        let mut engine = Engine::open(&dir).unwrap();
+        DocStore::put(&mut engine, "a:b", "c", r#"{"x":"first"}"#).unwrap();
+        DocStore::put(&mut engine, "a", "b:c", r#"{"x":"second"}"#).unwrap();
+        assert_eq!(
+            DocStore::get(&mut engine, "a:b", "c").as_deref(),
+            Some(r#"{"x":"first"}"#)
+        );
+        assert_eq!(
+            DocStore::get(&mut engine, "a", "b:c").as_deref(),
+            Some(r#"{"x":"second"}"#)
+        );
+        assert_eq!(DocStore::find(&mut engine, "a:b", "x", "first").len(), 1);
+        assert_eq!(DocStore::find(&mut engine, "a:b", "x", "second").len(), 0);
+        assert_eq!(DocStore::find(&mut engine, "a", "x", "second").len(), 1);
+        assert_eq!(DocStore::find(&mut engine, "a", "x", "first").len(), 0);
+        // `find` hands back the real id, not the escaped form.
+        let hits = DocStore::find(&mut engine, "a", "x", "second");
+        assert_eq!(hits[0].0, "b:c");
+        // A `%` in a name escapes too, and does not collide with
+        // an already-escaped-looking name.
+        DocStore::put(&mut engine, "p%q", "1", r#"{"x":"pct"}"#).unwrap();
+        DocStore::put(&mut engine, "p", "%q1", r#"{"x":"other"}"#).unwrap();
+        assert_eq!(
+            DocStore::get(&mut engine, "p%q", "1").as_deref(),
+            Some(r#"{"x":"pct"}"#)
+        );
+        assert_eq!(
+            DocStore::get(&mut engine, "p", "%q1").as_deref(),
+            Some(r#"{"x":"other"}"#)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// V0.11 (review finding 9): a document written by V0.10
+    /// under the raw key `doc:profiles:u1` (no `%` or `:` in the
+    /// parts) encodes byte-identically under the new scheme, so
+    /// it still reads — no migration is needed for such keys.
+    #[test]
+    fn legacy_keys_without_separator_still_read() {
+        let dir = crate::unique_test_dir("zeno-doc-legacy-test");
+        let mut engine = Engine::open(&dir).unwrap();
+        engine
+            .put_internal("doc:profiles:u1", r#"{"name":"Sanjay"}"#)
+            .unwrap();
+        assert_eq!(
+            DocStore::get(&mut engine, "profiles", "u1").as_deref(),
+            Some(r#"{"name":"Sanjay"}"#)
+        );
+        assert_eq!(
+            DocStore::find(&mut engine, "profiles", "name", "Sanjay").len(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

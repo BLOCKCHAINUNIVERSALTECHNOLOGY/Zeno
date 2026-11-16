@@ -56,7 +56,7 @@
 #      tables: INNER JOIN, LEFT JOIN (Meera has no orders — a
 #      real NULL row), GROUP BY + SUM/COUNT with HAVING, and an
 #      IN-subquery, with the exact numbers printed.
-#  16. SELECT-LIST SUBQUERIES + POWER-LOSS RECOVERY (V0.10) —
+#  16. SELECT-LIST SUBQUERIES + PROCESS-CRASH RECOVERY (V0.10) —
 #      a correlated subquery (one value per user), an
 #      uncorrelated subquery (the same value in every row),
 #      GROUP BY with both, an honest 21000 error — then kill -9
@@ -1228,14 +1228,14 @@ kill $SERVER4 || true
 wait $SERVER4 2>/dev/null || true
 rm -rf ./demo-data-v9
 
-#  16. SELECT-LIST SUBQUERIES + POWER-LOSS RECOVERY (V0.10) —
+#  16. SELECT-LIST SUBQUERIES + PROCESS-CRASH RECOVERY (V0.10) —
 #      users + orders: a correlated subquery (one value per user),
 #      an uncorrelated subquery (the same value in every row),
 #      a GROUP BY query with both, an honest 21000 error — then
 #      kill -9 the server mid-life (no graceful shutdown), append
 #      a torn line to wal.log, restart, and show every committed
 #      row is back (the uncommitted one is not).
-say "16. SELECT-LIST SUBQUERIES + POWER-LOSS RECOVERY (V0.10)"
+say "16. SELECT-LIST SUBQUERIES + PROCESS-CRASH RECOVERY (V0.10)"
 echo "(correlated MAX per user: Sanjay 250, Asha 50, Ravi 300,"
 echo " Meera NULL — she has no orders. Uncorrelated MAX is 300"
 echo " in every row. Then kill -9, a torn WAL line, and restart.)"
@@ -1399,11 +1399,53 @@ print("   (5 users, 6 orders, totals 350 / 50 / 450 / NULL / 400 —")
 print("    every committed row is back; Neha (id 6, uncommitted) is gone)")
 s.sendall(b"X" + struct.pack("!I", 4))
 s.close()
-print("V0.10 power-loss demo done")
+print("V0.10 process-crash recovery demo done")
 PYEOF
 kill $SERVER4 || true
 wait $SERVER4 2>/dev/null || true
 rm -rf ./demo-data-v10
+
+#  17. CRASH-ORDER RECOVERY (V0.11) —
+#      put keep1/keep2/gone, delete gone, flush twice (2 SSTables) —
+#      then crash a `compact` right AFTER the manifest commit
+#      (ZENO_CRASH_AFTER_MANIFEST=1, exit 137 = simulated kill -9):
+#      the merged table is committed, the old files are still on
+#      disk — reopen and show committed rows present, the deleted
+#      row gone — then a clean compact leaves 1 SSTable.
+say "17. CRASH-ORDER RECOVERY (V0.11)"
+echo "(keep1/keep2 stay, 'gone' is deleted. A compact crashed right"
+echo " after its manifest commit leaves old SSTable files on disk —"
+echo " reopen must still show exactly one generation.)"
+rm -rf ./demo-data-v11
+$ZENO --data ./demo-data-v11 put keep1 one
+$ZENO --data ./demo-data-v11 put keep2 two
+$ZENO --data ./demo-data-v11 put gone three
+$ZENO --data ./demo-data-v11 del gone
+$ZENO --data ./demo-data-v11 flush
+$ZENO --data ./demo-data-v11 put keep1 one
+$ZENO --data ./demo-data-v11 flush
+echo "-- before the crashed compact (2 SSTables + manifest):"
+ls ./demo-data-v11/sst-*.sst
+cat ./demo-data-v11/sst-manifest.json; echo
+echo "-- compact, crashed right AFTER the manifest commit:"
+ZENO_CRASH_AFTER_MANIFEST=1 $ZENO --data ./demo-data-v11 compact || echo "(exit code: $? — 137 = simulated kill -9, right after the commit)"
+echo "-- after the crash: old SSTable files are STILL on disk, manifest names only the new one:"
+ls ./demo-data-v11/sst-*.sst
+cat ./demo-data-v11/sst-manifest.json; echo
+echo "-- reopen after the crash (exactly one generation must be visible):"
+$ZENO --data ./demo-data-v11 get keep1
+$ZENO --data ./demo-data-v11 get keep2
+$ZENO --data ./demo-data-v11 get gone || echo "(gone is still gone — the deleted row did not come back)"
+$ZENO --data ./demo-data-v11 stats
+echo "-- a clean compact now finishes the cleanup (1 SSTable left):"
+$ZENO --data ./demo-data-v11 compact
+ls ./demo-data-v11/sst-*.sst
+cat ./demo-data-v11/sst-manifest.json; echo
+$ZENO --data ./demo-data-v11 get keep1
+$ZENO --data ./demo-data-v11 get keep2
+$ZENO --data ./demo-data-v11 get gone || echo "(gone is still gone)"
+rm -rf ./demo-data-v11
+echo "V0.11 crash-order demo done"
 
 echo
 echo "PostgreSQL demo done. Try it yourself with psql (on a machine that has it):"

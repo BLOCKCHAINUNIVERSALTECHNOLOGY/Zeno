@@ -1,4 +1,4 @@
-# Zeno — One Engine, All Data (V0.10 prototype)
+# Zeno — One Engine, All Data (V0.11 prototype)
 
 > **Zeno is a hybrid SQL + JSON database in Rust — not ZenoDB (Lantern, Go
 > time-series) and not ZenDB.** The name was chosen knowing those exist.
@@ -11,12 +11,15 @@ documents**. It is written in Rust using `std` + `serde` +
 `rustls` (TLS 1.2/1.3, `ring` provider) + `rcgen` (self-signed
 certificate generation) for `serve --tls` — and `ctrlc`
 (SIGINT/SIGTERM handling) for the graceful shutdown — no heavy
-dependencies, no external database engine. V0.10 adds **scalar
-subqueries in the SELECT list (correlated and uncorrelated),
-a qualified column as a WHERE right-hand side, and an
-automated kill -9 power-loss recovery test** — on top of the
-V0.9 JOINs, WHERE subqueries and GROUP BY + aggregates (see
-"What is new in V0.10" and "What is new in V0.9").
+dependencies, no external database engine. V0.11 is the
+**correctness-and-durability release**: a durable
+compaction/vacuum commit protocol, WAL namespace durability,
+absolute deadlines for slow clients, real SQL NULLs, unambiguous
+document keys, and 42703 for unknown WHERE columns — on top of
+the V0.10 SELECT-list subqueries (see "What is new in V0.11"
+and "What is new in V0.10"). **No new SQL features, no hash
+join, no benchmark comparison in this version — it is about
+being right, not being fast.**
 
 > **⚠️ LOCAL PROTOTYPE ONLY. With no users configured, `zeno serve`
 > accepts EVERY local client with NO password (trust auth) and
@@ -29,6 +32,150 @@ V0.9 JOINs, WHERE subqueries and GROUP BY + aggregates (see
 > shared machine, and never use it in production. Anyone on the
 > same machine can read and change all your data. See "Password
 > auth (SCRAM-SHA-256)" and "TLS" below.**
+
+## What is new in V0.11
+
+- **Durable compaction/vacuum commit protocol (review finding 1,
+  the most important fix).** Compaction and vacuum now commit
+  through an SSTable manifest (`sst-manifest.json` in the data
+  directory): (1) the merged SSTable is written + synced, (2) the
+  manifest is atomically committed to name ONLY the new table,
+  (3) only then are the old files deleted — every unlink error
+  and the final directory sync propagate as the operation's error
+  instead of being discarded. A crash before step 2 reopens the
+  OLD generation (the new file is an ignored orphan); a crash
+  after step 2 reopens the NEW generation (old files still on disk
+  are ignored, because they are not in the manifest). Either way
+  the reopened database is exactly one generation — a deleted key
+  can never come back. The delete pass removes every non-live
+  SSTable file in the directory, so orphans left by a crashed
+  compaction are cleaned up by the next one. A corrupt SSTable —
+  live or orphan — is still quarantined, never silently skipped;
+  a manifest-listed file that is missing warns loudly instead of
+  refusing the whole open (quarantine policy: a bad SSTable must
+  never wedge the database). Crash-order regression tests
+  (`v11_compact_crash_after_new_table_reopens_old_generation`,
+  `v11_compact_crash_after_manifest_reopens_new_generation`,
+  `v11_vacuum_crash_after_manifest_reopens_new_generation`)
+  crash a real CLI `compact` / `vacuum` at each stage (test-only
+  hooks `ZENO_CRASH_AFTER_NEW_TABLE` /
+  `ZENO_CRASH_AFTER_MANIFEST`, exit 137 = simulated kill -9)
+  and reopen: committed rows present, deleted rows gone, every
+  time. A directory with no manifest is a pre-V0.11 database:
+  every SSTable is live, as before — the first flush writes a
+  manifest.
+- **WAL namespace durability (finding 2).** `Wal::open` fsyncs
+  the parent directory when it creates a new WAL file, and
+  `Wal::clear` fsyncs it after deleting the old one — so the
+  pathname of an acknowledged write's WAL file is durable, not
+  just its contents. A power loss can no longer lose the
+  directory entry while no SSTable copy exists yet. Regression
+  test: `v11_wal_rotation_after_flush_survives_reopen` plus a
+  WAL rotation test (`clear_then_reopen_does_not_resurrect_old_records`).
+  Honest limit: a directory fsync cannot be observed from inside
+  a test — a real power cut is still not reproducible here — so
+  these tests prove the rotation semantics and the reopen
+  behaviour, not the fsync itself.
+- **Slow-drip clients cannot hold a connection slot forever
+  (findings 3 + 4).** The handshake and every frame now have an
+  ABSOLUTE deadline (60 s each by default): the socket read
+  timeout used to apply per `read()` call, so a client sending
+  one byte every 59 s never tripped it and held its slot (and
+  thread) indefinitely. A `DeadlineReader` checks the deadline on
+  every read — a frame that dribbles is closed at most one budget
+  after its first byte, and its slot is freed. The budget starts
+  at the frame's first byte, so a legitimately idle connection is
+  not cut off between queries; the 60 s socket timeout still
+  bounds the idle wait for that first byte. Overrides (diagnostic
+  / test hooks): `ZENO_HANDSHAKE_TIMEOUT_SECS`,
+  `ZENO_FRAME_TIMEOUT_SECS`. Over-limit refusals no longer run
+  inline in the accept loop: a slow handshaker used to stall
+  acceptance of new clients; the refusal now runs on its own
+  short-lived, best-effort thread. Regression tests:
+  `deadline_reader_closes_a_slow_drip_client` (unit) and
+  `v11_slow_drip_frame_frees_its_slot` (a real server with
+  `--max-connections 1`: the drip holds the only slot, then the
+  slot frees up after the deadline). Honest limit: a single
+  blocked `read()` can still wait out the socket timeout, and
+  the TLS handshake itself is not wrapped — only the pgwire
+  handshake after it.
+- **Bare `NULL` is a real SQL NULL (finding 8).** `INSERT INTO t
+  VALUES (1, NULL)` stores a real NULL (JSON `null` on disk, DataRow
+  length -1 on the wire) — before V0.11 it stored the text "NULL".
+  `WHERE city = NULL` never matches, for any operator (PostgreSQL
+  semantics); `UPDATE ... SET city = NULL` stores NULL; `SELECT *`
+  reads a stored NULL as NULL, not as `""`; `COUNT(col)` skips
+  NULLs. A quoted `'NULL'` is still the text "NULL". Regression
+  tests: parser (`bare_null_is_a_real_null_and_quoted_null_is_text`)
+  and wire (`v11_bare_null_stores_real_null_and_quoted_null_is_text`).
+  Known gap: a bound NULL parameter (`$1` bound to NULL over the
+  extended protocol) still arrives as an empty string, not as SQL
+  NULL — the literal `NULL` keyword is the only NULL source so far.
+  `IS NULL` syntax is still unsupported (0A000).
+- **Document keys cannot collide any more (finding 9).**
+  Collection and id are percent-escaped (`:` → `%3A`, `%` →
+  `%25`) before being joined, in `put`, `get` and `find` alike —
+  (`a:b`, `c`) and (`a`, `b:c`) are different keys now, and `find`
+  is isolated per collection. Compatibility: a collection/id with
+  no `%` or `:` encodes byte-identically to V0.10, so documents
+  written by V0.10 still read with no migration. Only keys that
+  contain `%` or `:` change — those were ambiguous (broken)
+  before, so no well-defined old document is lost; a V0.10
+  document whose collection or id contained a `:` is simply not
+  found under the new encoding. Regression tests:
+  `separator_collision_is_isolated`,
+  `legacy_keys_without_separator_still_read`.
+- **Unknown WHERE column is 42703 (finding 13).** `SELECT * FROM
+  t WHERE emali = 'x'` used to look like a valid zero-row result
+  (the V0.3 behaviour); it now fails with 42703 — validated up
+  front, so it errors even over an EMPTY table. UPDATE / DELETE
+  with an unknown WHERE column are 42703 too. Regression test:
+  `v11_unknown_where_column_is_42703`.
+- **CI + toolchain (finding 11).** Draft files live in
+  `prototype/ci/` (they do nothing there): `.github/workflows/ci.yml`
+  (`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test --locked`, release build + test) and
+  `rust-toolchain.toml` (pinned to 1.99.1). On push they move to the
+  repo root (workflows only run from there). `Cargo.toml` declares
+  the MSRV: `rust-version = "1.87"` — the code already uses
+  `is_multiple_of` (stable since 1.87) in 8 places, so 1.87 is the
+  true minimum, not 1.85.
+- **Unique test temp dirs (finding 12).** Engine/pgwire
+  integration tests and the unit-test helpers no longer share
+  fixed temp paths: every test directory is unique per call
+  (process id + nanoseconds + counter, `unique_test_dir` in
+  `src/lib.rs`), so two concurrent runs of the same test binary
+  can never delete each other's data.
+- **Docs (findings 5, 6, 7, 10, 14).** The root README and
+  `docs/DESIGN.md` are NOT edited in this version (they live in
+  the repo root) — corrected drafts are in `prototype/docs-draft/`
+  (`root-README.md`, `DESIGN.md`) and move to the root on push:
+  current V0.11 state, `cd prototype` quick-start, the real CLI,
+  the design draft marked as proposal/future with an explicit
+  "Aaj ki haalat (V0.11)" under every section where it differs
+  from the implementation. Inside the prototype: this README's
+  broken design link now points at `../docs/DESIGN.md`; the
+  "power-loss recovery test" is renamed **"process-crash
+  recovery"** everywhere (a kill -9 is a process crash, not a
+  power cut — a real power-loss test still does not exist); and
+  `docs/V1-READINESS.md` now carries one authoritative V1
+  acceptance list, with every item marked release blocker,
+  post-V1, or excluded.
+- **Still pending after V0.11 (Phase 2/3 work, not this
+  version):** disk-backed SSTable blocks/cache (SSTables are
+  still fully loaded into memory on open), group commit, the
+  baseline benchmark (Zeno-only measurements; no PostgreSQL /
+  MongoDB comparison), and the remaining V1 items in
+  `docs/V1-READINESS.md` (2PC, more isolation levels, secondary
+  indexes, DDL in transactions, `psql` verification, independent
+  audit). No new SQL features in V0.11: FROM-subqueries, RIGHT /
+  FULL JOIN, UNION, OR, LIKE, hash joins and LIMIT pushdown are
+  all still pending, exactly as before.
+- **Demo:** `demo.sh` section 17 shows the crash-order recovery
+  live — a `compact` crashed right after the manifest commit
+  (exit 137), old SSTable files still on disk, reopen: committed
+  rows present, deleted rows gone; then a clean compact finishes
+  the cleanup.
 
 ## What is new in V0.10
 
@@ -97,7 +244,7 @@ V0.9 JOINs, WHERE subqueries and GROUP BY + aggregates (see
   changed that: a WHERE subquery that references the statement
   containing it, or an ancestor statement, is now evaluated
   once per row, against that row (see "Review fixes" below).
-- **Power-loss recovery test (kill -9).** A new regression
+- **Process-crash recovery test (kill -9).** A new regression
   test (`v10_power_loss_kill9_committed_rows_survive`) starts
   a real server, writes committed rows (5 users, 6 orders —
   all still in the WAL, below the 64-entry flush), opens a
@@ -171,7 +318,7 @@ V0.9 JOINs, WHERE subqueries and GROUP BY + aggregates (see
   TLS tests still pass as part of the suite (294 tests total:
   133 unit + 43 engine + 118 pgwire). `docs/V1-READINESS.md`
   is updated for V0.10 (SELECT-list subqueries and the
-  power-loss test are done; RIGHT / FULL JOIN, FROM-subquery,
+  process-crash recovery test is done; RIGHT / FULL JOIN, FROM-subquery,
   UNION, OR, LIKE and hash join are still pending).
 
 ## What is new in V0.9
@@ -378,7 +525,7 @@ V0.9 JOINs, WHERE subqueries and GROUP BY + aggregates (see
   finds nothing) — the checklist says so plainly, and no
   estimated or guessed comparison number appears anywhere.
   `docs/V1-READINESS.md` lists everything still missing
-  before V1.0 (psql verification, power-loss test, JOIN,
+  before V1.0 (psql verification, process-crash recovery test, JOIN,
   2PC, production hardening, benchmarks vs PostgreSQL/MongoDB)
   with an honest done / pending status per item.
 - Version is now **0.8.0** (Cargo.toml, CLI, README).
@@ -1384,7 +1531,7 @@ Each has a regression test (see "Tests").
   V0.9 JOINs / subqueries / GROUP BY are done (see "What is new
   in V0.7" and "What is new in V0.9"), and V0.10 SELECT-list
   subqueries (correlated and uncorrelated) plus the kill -9
-  power-loss test are done too (see "What is new in V0.10").
+  process-crash recovery test is done too (see "What is new in V0.10").
 - **Not production-ready.** No independent audit. A Zeno-only
   benchmark exists (`zeno bench`, see "What is new in V0.8")
   but there is still no benchmark against PostgreSQL or
@@ -1592,7 +1739,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-- 133 unit tests (the 99 from V0.6, plus 16 parser ones (15
+- 138 unit tests (the 99 from V0.6, plus 16 parser ones (15
   from V0.7, plus 1 net new in V0.9: the old "JOIN / GROUP BY /
   aggregates / subqueries as not supported" test became two —
   JOIN / LEFT JOIN / GROUP BY / aggregates / IN + NOT IN +
@@ -1624,8 +1771,14 @@ cargo test
   V0.10: JOIN / LEFT JOIN / GROUP BY / aggregate / subquery
   parsing, HAVING without GROUP BY, qualified star +
   SELECT-list subquery parsing, the 64-level subquery-nesting
-  cap (54001), and the IS NULL message)
-- 43 integration tests in `tests/engine_tests.rs` (the 23 from
+  cap (54001), and the IS NULL message) — plus 5 V0.11 ones:
+  a slow-drip reader is closed by its deadline
+  (`deadline_reader_closes_a_slow_drip_client`), document-key
+  separator collisions are isolated and legacy keys without a
+  separator still read, clearing the WAL does not resurrect old
+  records, and a bare `NULL` is a real NULL while quoted
+  `'NULL'` stays text
+- 47 integration tests in `tests/engine_tests.rs` (the 23 from
   V0.5, plus 7 V0.6 ones: commit makes writes visible /
   rollback hides them, snapshot isolation hides later commits,
   write-write conflict aborts the second committer, table
@@ -1646,8 +1799,13 @@ cargo test
   commit marker), so the corrupt lines the tests append land
   on lines 3 and 5 instead of 2 and 3 — plus 2 V0.8 review-fix
   ones: `zeno --version` exits 0 and creates no data dir, and an
-  unknown command fails without creating a data dir.
-- 118 integration tests in `tests/pgwire_tests.rs` (the 62 from
+  unknown command fails without creating a data dir — plus
+  4 V0.11 ones: compaction crashed after the new table reopens
+  the old generation, compaction crashed after the manifest
+  reopens the new generation, vacuum crashed after the manifest
+  reopens the new generation, and WAL rotation after a flush
+  survives a reopen.
+- 121 integration tests in `tests/pgwire_tests.rs` (the 62 from
   V0.6, plus 17 V0.7 ones: savepoint rollback keeps earlier
   writes and drops later ones (and the savepoint survives a
   ROLLBACK TO), savepoint release + unknown-name 3B001 +
@@ -1694,14 +1852,19 @@ cargo test
   is not blocked by a slow SELECT — plus 7 V0.10 ones:
   SELECT-list subqueries (uncorrelated evaluated once,
   correlated per row, with GROUP BY, error codes, extended
-  protocol, timeout, kill -9 power loss) — plus 4 V0.10
+  protocol, timeout, kill -9 process-crash recovery) — plus 4 V0.10
   review-fix ones: a big cross product does not kill the
   server, a nested subquery reads the grand-outer row, a
   correlated WHERE subquery is evaluated per row, LIMIT 0
-  skips a failing subquery.
-- 294 tests total, all passing — 133 unit + 43 engine + 118
+  skips a failing subquery — plus 3 V0.11 ones: a bare NULL
+  stores as a real NULL (and quoted 'NULL' stays text, UPDATE
+  SET NULL stores NULL, DELETE WHERE NULL matches 0 rows), an
+  unknown WHERE column is 42703 (SELECT over an empty table,
+  UPDATE, DELETE), and a slow-drip frame frees its connection
+  slot.
+- 306 tests total, all passing — 138 unit + 47 engine + 121
   pgwire. The counts are the debug profile (`cargo test`); the
-  release profile (`cargo test --release`) runs the same 294
+  release profile (`cargo test --release`) runs the same 306
   and is green too. When the counts change, this section
   changes with them — the numbers above were verified against
   `cargo test` and `cargo test --release` for this version.
@@ -1745,5 +1908,5 @@ demo.sh        end-to-end demo incl. restart / crash-recovery proof + V0.2 lock/
 ## License
 
 Apache-2.0. See the design doc
-`../Zeno-design-hindi.md` for the full plan (V1 scope, funding path,
+`../docs/DESIGN.md` for the full plan (V1 scope, funding path,
 and the honest limits).

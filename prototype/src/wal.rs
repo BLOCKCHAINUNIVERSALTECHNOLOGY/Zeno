@@ -51,6 +51,7 @@
 // The line number of every corrupt line is recorded, so the open-time
 // warning says exactly which line(s) were bad instead of just a count.
 
+use crate::sstable::sync_dir;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -183,8 +184,24 @@ pub struct Wal {
 
 impl Wal {
     /// Open (creating if needed) the WAL at `path`.
+    ///
+    /// V0.11 (review finding 2): when the file is NEWLY created,
+    /// its parent directory is fsynced before returning, so the
+    /// new pathname itself is durable — not just the file's
+    /// contents. Without this, a power loss could lose the
+    /// directory entry of an acknowledged write's WAL file while
+    /// its SSTable copy does not exist yet. The sync is done
+    /// once, at creation (every later append only fsyncs the
+    /// file, as before); an error propagates instead of being
+    /// discarded.
     pub fn open(path: &Path) -> std::io::Result<Self> {
+        let existed = path.exists();
         let file = OpenOptions::new().create(true).append(true).open(path)?;
+        if !existed {
+            if let Some(parent) = path.parent() {
+                sync_dir(parent)?;
+            }
+        }
         Ok(Self {
             path: path.to_path_buf(),
             file,
@@ -241,8 +258,19 @@ impl Wal {
 
     /// Delete the WAL file (called after a memtable flush, when every
     /// record in it is safely inside an SSTable).
+    ///
+    /// V0.11 (review finding 2): the removal is a namespace change
+    /// too, so the parent directory is fsynced afterwards and the
+    /// error propagates — a crash must not resurrect the old WAL
+    /// file (and replay its records a second time) after the
+    /// rotation. `flush()` re-creates the WAL right after this,
+    /// and that creation syncs the directory again.
     pub fn clear(&self) -> std::io::Result<()> {
-        std::fs::remove_file(&self.path)
+        std::fs::remove_file(&self.path)?;
+        if let Some(parent) = self.path.parent() {
+            sync_dir(parent)?;
+        }
+        Ok(())
     }
 }
 
@@ -265,10 +293,7 @@ mod tests {
     use super::*;
 
     fn tmp_path(name: &str) -> PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!("zeno-wal-test-{name}.log"));
-        let _ = std::fs::remove_file(&p);
-        p
+        crate::unique_test_path(&format!("zeno-wal-test-{name}"))
     }
 
     #[test]
@@ -450,6 +475,35 @@ mod tests {
         assert_eq!(replayed.records[0].key, "k1");
         assert_eq!(replayed.records[1].key, "k2");
         assert_eq!(replayed.corrupt_lines, 2, "both bad lines must be counted");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// V0.11 (review finding 2): a WAL rotation — `clear()` then
+    /// a fresh `open()` — must not resurrect the old generation's
+    /// records on replay. `clear()` removes the file and syncs
+    /// the parent directory; the fresh `open()` creates a new
+    /// file and syncs the directory again, so the new pathname
+    /// itself is durable, not just its contents. (That a directory
+    /// fsync happened cannot be observed from inside a test — a
+    /// power cut is not reproducible here — so this test proves
+    /// the rotation semantics, and the crash-order integration
+    /// tests prove the reopen behaviour end to end.)
+    #[test]
+    fn clear_then_reopen_does_not_resurrect_old_records() {
+        let path = tmp_path("rotation");
+        {
+            let mut wal = Wal::open(&path).unwrap();
+            wal.append(&WalRecord::put("old", "gone")).unwrap();
+            wal.clear().unwrap();
+            assert!(!path.exists(), "clear must remove the WAL file");
+        }
+        {
+            let mut wal = Wal::open(&path).unwrap();
+            wal.append(&WalRecord::put("new", "here")).unwrap();
+        }
+        let records = Wal::replay(&path);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].key, "new");
         let _ = std::fs::remove_file(&path);
     }
 }

@@ -41,21 +41,32 @@ pub enum FilterOp {
 /// because a missing value is not a value at all (this keeps the
 /// V0.6 behaviour, where a filter on an unknown column matched
 /// nothing, instead of silently matching everything under `!=`).
+/// The value is `None` for a SQL NULL literal (V0.11): a
+/// comparison against NULL is never true in PostgreSQL, so a NULL
+/// condition matches no row, for every operator — including `!=`.
+/// (The SQL layer validates unknown columns as 42703 before a
+/// filter is built; this struct is the last line of defence.)
 #[derive(Debug, Clone, Default)]
 pub struct RowFilter {
-    pub conditions: Vec<(String, FilterOp, String)>,
+    pub conditions: Vec<(String, FilterOp, Option<String>)>,
 }
 
 impl RowFilter {
     /// The V0.6 single-condition filter: `column = value`.
     pub fn one(column: &str, value: &str) -> Self {
         Self {
-            conditions: vec![(column.to_string(), FilterOp::Eq, value.to_string())],
+            conditions: vec![(column.to_string(), FilterOp::Eq, Some(value.to_string()))],
         }
     }
 
     pub fn matches(&self, row: &BTreeMap<String, String>) -> bool {
         self.conditions.iter().all(|(col, op, want)| {
+            // A NULL literal never matches (see the struct docs),
+            // and neither does a column the row does not carry
+            // (a stored NULL is absent from the row map).
+            let Some(want) = want else {
+                return false;
+            };
             let Some(got) = row.get(col) else {
                 return false;
             };
@@ -174,10 +185,24 @@ fn row_key(table: &str, row_id: u64) -> String {
     format!("table:{table}:{row_id:020}")
 }
 
-fn row_to_json(row: BTreeMap<String, String>) -> String {
+/// A row as JSON text. `None` is a SQL NULL: it is written as an
+/// explicit JSON `null`, so the stored row says the column IS null
+/// rather than merely missing. The scan path (`scan_rows`) keeps
+/// only JSON strings, so a null column is absent from the in-memory
+/// row map — and the SQL layer reads an absent in-scope column as
+/// NULL (see `query::resolve_with_outer`).
+fn row_to_json(row: BTreeMap<String, Option<String>>) -> String {
     let obj: Map<String, Value> = row
         .into_iter()
-        .map(|(k, v)| (k, Value::String(v)))
+        .map(|(k, v)| {
+            (
+                k,
+                match v {
+                    Some(s) => Value::String(s),
+                    None => Value::Null,
+                },
+            )
+        })
         .collect();
     serde_json::to_string(&Value::Object(obj)).expect("row is valid JSON")
 }
@@ -337,12 +362,13 @@ impl TableStore {
     }
 
     /// Insert one row. `values` must match the table's columns in order.
-    /// Returns the new row id.
+    /// Returns the new row id. A value of `None` is a SQL NULL
+    /// (V0.11): the column is stored as JSON `null`.
     pub fn insert(
         &mut self,
         engine: &mut Engine,
         name: &str,
-        values: Vec<String>,
+        values: Vec<Option<String>>,
     ) -> Result<u64, String> {
         self.insert_inner(engine, None, name, values)
     }
@@ -358,7 +384,7 @@ impl TableStore {
         engine: &mut Engine,
         txn: u64,
         name: &str,
-        values: Vec<String>,
+        values: Vec<Option<String>>,
     ) -> Result<u64, String> {
         self.insert_inner(engine, Some(txn), name, values)
     }
@@ -368,7 +394,7 @@ impl TableStore {
         engine: &mut Engine,
         txn: Option<u64>,
         name: &str,
-        values: Vec<String>,
+        values: Vec<Option<String>>,
     ) -> Result<u64, String> {
         let columns = self
             .registry
@@ -384,9 +410,9 @@ impl TableStore {
                 values.len()
             ));
         }
-        let mut row = Map::new();
+        let mut row: BTreeMap<String, Option<String>> = BTreeMap::new();
         for (col, val) in columns.iter().zip(values.iter()) {
-            row.insert(col.clone(), Value::String(val.clone()));
+            row.insert(col.clone(), val.clone());
         }
         // Reserve the row id AND persist it BEFORE the row itself is
         // written. A crash between the two used to reuse the same id
@@ -400,7 +426,7 @@ impl TableStore {
         };
         self.save().map_err(|e| e.to_string())?;
         let key = row_key(name, row_id);
-        let value = serde_json::to_string(&Value::Object(row)).expect("row is valid JSON");
+        let value = row_to_json(row);
         match txn {
             Some(txn) => engine.txn_put(txn, &key, &value)?,
             None => engine
@@ -512,7 +538,13 @@ impl TableStore {
         filter: Option<(&str, &str)>,
     ) -> Result<usize, String> {
         let filter = filter.map(|(c, v)| RowFilter::one(c, v));
-        self.update_many_filtered(engine, None, name, &[(set_col, set_val)], filter.as_ref())
+        self.update_many_filtered(
+            engine,
+            None,
+            name,
+            &[(set_col, Some(set_val))],
+            filter.as_ref(),
+        )
     }
 
     /// UPDATE inside transaction `txn` (V0.6).
@@ -530,20 +562,22 @@ impl TableStore {
             engine,
             Some(txn),
             name,
-            &[(set_col, set_val)],
+            &[(set_col, Some(set_val))],
             filter.as_ref(),
         )
     }
 
     /// UPDATE with several SET assignments and a multi-condition
     /// filter (V0.7): `UPDATE name SET a = 1, b = 2 WHERE ...`.
-    /// Every SET column must exist (42703 otherwise).
+    /// Every SET column must exist (42703 otherwise). A SET value
+    /// of `None` is a SQL NULL (V0.11): the column is stored as
+    /// JSON `null`.
     pub fn update_many_filtered(
         &mut self,
         engine: &mut Engine,
         txn: Option<u64>,
         name: &str,
-        sets: &[(&str, &str)],
+        sets: &[(&str, Option<&str>)],
         filter: Option<&RowFilter>,
     ) -> Result<usize, String> {
         self.update_inner(engine, txn, name, sets, filter)
@@ -554,7 +588,7 @@ impl TableStore {
         engine: &mut Engine,
         txn: Option<u64>,
         name: &str,
-        sets: &[(&str, &str)],
+        sets: &[(&str, Option<&str>)],
         filter: Option<&RowFilter>,
     ) -> Result<usize, String> {
         let columns = self
@@ -589,14 +623,22 @@ impl TableStore {
             Some(txn) => self.select_txn_filtered(engine, txn, name, filter)?,
             None => self.select_filtered(engine, name, filter)?,
         };
+        // Rows come back as text-only maps (a stored NULL column
+        // is absent); lift them to nullable cells so a SET NULL
+        // can be recorded, then write them back as JSON nulls.
+        let apply_sets = |row: BTreeMap<String, String>| {
+            let mut cells: BTreeMap<String, Option<String>> =
+                row.into_iter().map(|(k, v)| (k, Some(v))).collect();
+            for (set_col, set_val) in sets {
+                cells.insert(set_col.to_string(), set_val.map(|v| v.to_string()));
+            }
+            row_to_json(cells)
+        };
         match txn {
             Some(txn) => {
                 let mut updated = 0;
-                for (row_id, mut row) in rows {
-                    for (set_col, set_val) in sets {
-                        row.insert(set_col.to_string(), set_val.to_string());
-                    }
-                    let value = row_to_json(row);
+                for (row_id, row) in rows {
+                    let value = apply_sets(row);
                     engine.txn_put(txn, &row_key(name, row_id), &value)?;
                     updated += 1;
                 }
@@ -606,12 +648,7 @@ impl TableStore {
             None => {
                 let writes: Vec<(String, Option<String>)> = rows
                     .into_iter()
-                    .map(|(row_id, mut row)| {
-                        for (set_col, set_val) in sets {
-                            row.insert(set_col.to_string(), set_val.to_string());
-                        }
-                        (row_key(name, row_id), Some(row_to_json(row)))
-                    })
+                    .map(|(row_id, row)| (row_key(name, row_id), Some(apply_sets(row))))
                     .collect();
                 let updated = writes.len();
                 engine
@@ -731,11 +768,7 @@ mod tests {
     use super::*;
 
     fn tmp_dir(name: &str) -> PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!("zeno-table-test-{name}"));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        p
+        crate::unique_test_dir(&format!("zeno-table-test-{name}"))
     }
 
     #[test]
@@ -800,10 +833,16 @@ mod tests {
             .create_table("t", vec!["a".into(), "b".into()])
             .unwrap();
         tables
-            .insert(&mut engine, "t", vec!["1".into(), "x".into()])
+            .insert(&mut engine, "t", vec![Some("1".into()), Some("x".into())])
             .unwrap();
         let err = tables
-            .update_many_filtered(&mut engine, None, "t", &[("a", "1"), ("a", "2")], None)
+            .update_many_filtered(
+                &mut engine,
+                None,
+                "t",
+                &[("a", Some("1")), ("a", Some("2"))],
+                None,
+            )
             .unwrap_err();
         assert!(err.contains("set twice"), "{err}");
         let rows = tables.select(&mut engine, "t", None).unwrap();
@@ -826,7 +865,11 @@ mod tests {
             .create_table("t", vec!["id".into(), "city".into()])
             .unwrap();
         tables
-            .insert(&mut engine, "t", vec!["1".into(), "Delhi".into()])
+            .insert(
+                &mut engine,
+                "t",
+                vec![Some("1".into()), Some("Delhi".into())],
+            )
             .unwrap();
         // Forge two bad rows straight into the engine (the
         // internal path — the public `put` now refuses `table:`

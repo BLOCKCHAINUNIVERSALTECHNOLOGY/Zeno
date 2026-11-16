@@ -382,8 +382,8 @@ fn validate_column_with_outer(
 /// that names no table, or a qualified column that does not
 /// exist, is 42703; an ambiguous unqualified name is 42702; an
 /// unknown unqualified name is `NotFound` (the caller decides
-/// what that means — in WHERE on one table it matches no row,
-/// the V0.3 behaviour; everywhere else it is 42703).
+/// what that means — in WHERE it is 42703 since V0.11, review
+/// finding 13; everywhere else it is 42703 too).
 /// With an outer context (V0.10), a reference that matches
 /// nothing in this row's scope falls through to the outer
 /// row(s) — the correlated-subquery case. An inner match always
@@ -409,19 +409,13 @@ fn outer_value(ctx: &OuterCtx<'_>, table_key: &str, col_name: &str) -> Result<Re
                     ),
                 ))
             } else {
-                // A plain outer row lacks the key only when its
-                // scope says the column exists but the row was
-                // written before the column did — Zeno has no
-                // ADD COLUMN, so that cannot happen; it is
-                // XX000 (an internal error), not a silent ""
-                // that would hide a bug.
-                Err(sql_err(
-                    "XX000",
-                    format!(
-                        "internal error: outer row for table '{table_key}' has no value for \
-                         column '{col_name}'"
-                    ),
-                ))
+                // A plain outer row lacks the key only when the
+                // column holds a stored NULL (V0.11: the table
+                // store drops JSON nulls from the row map, so a
+                // NULL column has no key in the joined row) — that
+                // reads as NULL, not as an error. (Zeno has no ADD
+                // COLUMN, so no other case can produce this.)
+                Ok(Resolve::Found(None))
             }
         }
     }
@@ -444,12 +438,15 @@ fn resolve_with_outer(
                 }
                 return Ok(match row.get(&(q.clone(), col.name.clone())) {
                     // A LEFT JOIN miss is stored as an explicit
-                    // NULL; a row that simply lacks the key (a row
-                    // written before the column existed) reads as
-                    // "" — the pre-V0.9 behaviour for a missing
-                    // column value.
+                    // NULL; a row that simply lacks the key reads
+                    // as NULL too (V0.11): there is no ADD COLUMN,
+                    // so a column in scope that a stored row lacks
+                    // can only be a JSON null written by an
+                    // `INSERT ... NULL` (the table store drops
+                    // nulls from the row map — see `table.rs`).
+                    // Before V0.11 this read as `""`.
                     Some(v) => Resolve::Found(v.clone()),
-                    None => Resolve::Found(Some(String::new())),
+                    None => Resolve::Found(None),
                 });
             }
             // The qualifier names no table in this scope: try
@@ -490,8 +487,10 @@ fn resolve_with_outer(
             }
             match found {
                 Some(t) => Ok(match row.get(&(t.key.clone(), col.name.clone())) {
+                    // See the qualified arm above: a missing key
+                    // for a column in scope is a stored NULL.
                     Some(v) => Resolve::Found(v.clone()),
-                    None => Resolve::Found(Some(String::new())),
+                    None => Resolve::Found(None),
                 }),
                 None => {
                     let mut level = outer;
@@ -522,11 +521,15 @@ fn resolve_with_outer(
     }
 }
 
-/// A parsed literal as stored text. An unbound `$n` is a syntax
+/// A parsed literal as a cell. An unbound `$n` is a syntax
 /// error, not data (same rule as `pgwire::resolve_value`).
-fn literal(value: &Value) -> Result<String, SqlError> {
+/// A bare `NULL` is the cell `None` (V0.11, review finding 8):
+/// any comparison against it is false, so `WHERE c = NULL`
+/// matches no row, exactly like PostgreSQL.
+fn literal(value: &Value) -> Result<Cell, SqlError> {
     match value {
-        Value::Text(text) => Ok(text.clone()),
+        Value::Text(text) => Ok(Some(text.clone())),
+        Value::Null => Ok(None),
         Value::Param(n) => Err(sql_err(
             "42601",
             format!("parameter ${n} has no bound value — Bind the statement before executing it"),
@@ -800,6 +803,22 @@ fn execute_select_snapshot_deadline(
         ));
     };
     let scope = Scope::of_snapshot(snapshot, stmt)?;
+
+    // V0.11 (review finding 13): WHERE columns are validated up
+    // front — existence (42703) and ambiguity (42702) — so a typo
+    // fails the statement even over an EMPTY table, where the
+    // per-row WHERE loop below would never run and the mistake
+    // would look like a valid zero-row result. (GROUP BY / HAVING
+    // / ORDER BY already validated up front for the same reason.)
+    // A reference that matches nothing here may still be an outer
+    // column of a correlated subquery — `validate_column_with_outer`
+    // falls through to the outer scope(s) before erroring.
+    for cond in conditions {
+        validate_column_with_outer(&scope, &cond.column, outer)?;
+        if let crate::parser::CondRhs::Column(rhs) = &cond.rhs {
+            validate_column_with_outer(&scope, rhs, outer)?;
+        }
+    }
 
     // Is this an aggregate query? Any aggregate in the SELECT
     // list, GROUP BY, HAVING, or ORDER BY makes it one.
@@ -1558,14 +1577,12 @@ fn eval_condition(
 ) -> Result<bool, SqlError> {
     let value = match resolve_with_outer(row, scope, &cond.column, outer)? {
         Resolve::Found(v) => v,
-        // One table, unknown column: matches no row (the V0.3
-        // behaviour — a filter on a column the table does not
-        // have filters everything out instead of erroring).
-        // Several tables: the column must exist somewhere.
+        // V0.11 (review finding 13): an unknown column is 42703
+        // on one table too — a typo like `WHERE emali = ...`
+        // used to look like a valid zero-row result (the V0.3
+        // behaviour). Row filtering runs only after the scope
+        // check, so this error fires even over an empty table.
         Resolve::NotFound => {
-            if scope.tables.len() == 1 {
-                return Ok(false);
-            }
             return Err(sql_err(
                 "42703",
                 format!("column '{}' does not exist", cond.column.name),
@@ -1582,13 +1599,11 @@ fn eval_condition(
         }
     };
     match &cond.rhs {
-        CondRhs::Value(v) => Ok(cmp_cells(&value, &Some(literal(v)?), cond.op)),
+        CondRhs::Value(v) => Ok(cmp_cells(&value, &literal(v)?, cond.op)),
         CondRhs::Column(col) => {
             // A qualified column on the right-hand side
             // (V0.10): `orders.user_id = users.id`. An unknown
-            // column is 42703 — a reference is not a literal,
-            // so the single-table "matches nothing" rule for
-            // the left-hand side does not apply to it.
+            // column is 42703 — a reference is not a literal.
             let other = match resolve_with_outer(row, scope, col, outer)? {
                 Resolve::Found(v) => v,
                 Resolve::NotFound => {
@@ -1941,9 +1956,11 @@ fn execute_plain(
                 .iter()
                 .flat_map(|t| {
                     t.columns.iter().map(|c| {
-                        row.get(&(t.key.clone(), c.clone()))
-                            .cloned()
-                            .unwrap_or_else(|| Some(String::new()))
+                        // A column the row lacks is a stored NULL
+                        // (V0.11): the table store drops JSON nulls
+                        // from the row map. Before V0.11 this read
+                        // as `""`.
+                        row.get(&(t.key.clone(), c.clone())).cloned().flatten()
                     })
                 })
                 .collect(),
@@ -1978,10 +1995,10 @@ fn execute_plain(
                                 .find(|t| t.key == *qualifier)
                                 .expect("qualified star table is in scope");
                             for c in &table.columns {
+                                // See the `*` arm above: a missing
+                                // key is a stored NULL, not `""`.
                                 out.push(
-                                    row.get(&(qualifier.clone(), c.clone()))
-                                        .cloned()
-                                        .unwrap_or_else(|| Some(String::new())),
+                                    row.get(&(qualifier.clone(), c.clone())).cloned().flatten(),
                                 );
                             }
                         }
@@ -2373,7 +2390,7 @@ fn execute_aggregate(
                     ));
                 }
             };
-            if !cmp_cells(&got, &Some(literal(&cond.value)?), cond.op) {
+            if !cmp_cells(&got, &literal(&cond.value)?, cond.op) {
                 keep = false;
                 break;
             }

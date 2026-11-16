@@ -1201,7 +1201,7 @@ mod tests {
 
     #[test]
     fn set_password_never_stores_the_password() {
-        let dir = std::env::temp_dir().join("zeno-auth-test");
+        let dir = crate::unique_test_dir("zeno-auth-test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         set_password(&dir, "sanjay", "correct horse battery staple").unwrap();
@@ -1235,7 +1235,7 @@ mod tests {
 
     #[test]
     fn set_password_rejects_bad_inputs() {
-        let dir = std::env::temp_dir().join("zeno-auth-test-bad");
+        let dir = crate::unique_test_dir("zeno-auth-test-bad");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         assert!(set_password(&dir, "u", "").is_err());
@@ -1247,7 +1247,7 @@ mod tests {
 
     #[test]
     fn corrupt_users_file_fails_closed() {
-        let dir = std::env::temp_dir().join("zeno-auth-test-corrupt");
+        let dir = crate::unique_test_dir("zeno-auth-test-corrupt");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(USERS_FILE), "{not json").unwrap();
@@ -1309,7 +1309,7 @@ mod tests {
 
     #[test]
     fn set_password_requires_at_least_8_characters() {
-        let dir = std::env::temp_dir().join("zeno-auth-test-minlen");
+        let dir = crate::unique_test_dir("zeno-auth-test-minlen");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // 1-char and 7-char passwords are rejected with a clear error.
@@ -1327,18 +1327,18 @@ mod tests {
     fn set_password_creates_a_missing_data_dir() {
         // A nonexistent data dir used to fail with a cryptic
         // "No such file or directory" from the users.json write.
-        let dir = std::env::temp_dir().join("zeno-auth-test-mkdir/nested/dir");
-        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("zeno-auth-test-mkdir"));
+        let base = crate::unique_test_dir("zeno-auth-test-mkdir");
+        let dir = base.join("nested/dir");
         set_password(&dir, "u", "password123").unwrap();
         assert!(dir.join(USERS_FILE).exists());
-        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("zeno-auth-test-mkdir"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
     #[cfg(unix)]
     fn users_json_is_mode_0600_regardless_of_umask() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join("zeno-auth-test-mode");
+        let dir = crate::unique_test_dir("zeno-auth-test-mode");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         set_password(&dir, "alice", "password123").unwrap();
@@ -1384,7 +1384,7 @@ mod tests {
         // A password set with a NBSP must verify when the client
         // sends the SASLprep'd form ("a b"), and the stored
         // verifier must be exactly the verifier for "a b".
-        let dir = std::env::temp_dir().join("zeno-auth-test-saslprep");
+        let dir = crate::unique_test_dir("zeno-auth-test-saslprep");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // 10 characters after prep: "pass word1".
@@ -1415,7 +1415,7 @@ mod tests {
 
     #[test]
     fn fake_salt_is_deterministic_per_username() {
-        let dir = std::env::temp_dir().join("zeno-auth-test-fakesalt");
+        let dir = crate::unique_test_dir("zeno-auth-test-fakesalt");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let first = fake_credentials(&dir, "ghost").unwrap();
@@ -1617,7 +1617,7 @@ mod tests {
         // delete the winner's file mid-write, so threads could
         // disagree (or error) about the secret.
         use std::sync::{Arc, Barrier};
-        let dir = std::env::temp_dir().join("zeno-auth-test-fakesalt-race");
+        let dir = crate::unique_test_dir("zeno-auth-test-fakesalt-race");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let dir = Arc::new(dir);

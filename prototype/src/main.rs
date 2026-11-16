@@ -30,7 +30,7 @@ use zeno::doc;
 use zeno::engine::Engine;
 use zeno::table::TableStore;
 
-const VERSION: &str = "0.10.0";
+const VERSION: &str = "0.11.0";
 
 fn usage() -> String {
     format!(
@@ -380,7 +380,11 @@ fn run(
                 }
                 "insert" => {
                     need(args, 4, "table name and values")?;
-                    let values: Vec<String> = args[3].split(',').map(str::to_string).collect();
+                    // CLI values are always text (a literal "NULL"
+                    // on the command line stays the text "NULL" —
+                    // SQL NULL only comes from the SQL parser).
+                    let values: Vec<Option<String>> =
+                        args[3].split(',').map(|v| Some(v.to_string())).collect();
                     let id = tables.insert(&mut engine, &args[2], values)?;
                     println!("OK  inserted row {} into '{}'", id, args[2]);
                 }

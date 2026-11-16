@@ -29,7 +29,9 @@
 
 use crate::lock::DirLock;
 use crate::memtable::MemTable;
-use crate::sstable::{parse_sstable_id, sstable_path, sync_dir, SsTable};
+use crate::sstable::{
+    parse_sstable_id, read_manifest, sstable_path, sync_dir, write_manifest, SsTable,
+};
 use crate::txn::{
     decode_chain_limited, dedupe_chain, encode_chain, is_version_visible, looks_like_envelope,
     newest_version, resolve_visible, CommitError, Snapshot, Txn, TxnConflict, Version, LEGACY_XID,
@@ -267,7 +269,9 @@ impl Engine {
         // Load existing SSTables, newest first. Leftover `*.tmp` files
         // are half-written SSTables from a crash mid-flush: the atomic
         // rename in `SsTable::write` means the final name was never
-        // reached, so they are safe to delete.
+        // reached, so they are safe to delete. (This also removes a
+        // leftover `sst-manifest.json.tmp` — a half-written manifest
+        // from a crash mid-commit.)
         let mut ids: Vec<u64> = Vec::new();
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
@@ -285,11 +289,60 @@ impl Engine {
         }
         ids.sort_unstable();
         let next_sst_id = ids.last().map_or(1, |id| id + 1);
+        // V0.11 manifest (review finding 1): when a manifest exists,
+        // ONLY the ids it names are live. Every other `sst-*.sst`
+        // file on disk is an orphan — a new table from a compaction
+        // that crashed before its manifest commit, or an old table
+        // from one that crashed after it — and is ignored, never
+        // loaded, so a deleted key can never come back through it.
+        // No manifest = a pre-V0.11 directory: every SSTable is
+        // live, as before. The id bound for `next_sst_id` above
+        // still counts orphans, so an id is never reused.
+        let live_ids: Option<BTreeSet<u64>> =
+            read_manifest(dir)?.map(|live| live.into_iter().collect());
+        if let Some(live) = &live_ids {
+            for id in live {
+                if !ids.contains(id) {
+                    // A manifest-listed file that is gone is a
+                    // damaged generation, not a reason to refuse
+                    // the whole open: the quarantine policy below
+                    // is "a bad SSTable must never wedge the
+                    // database", and this is the same case (the
+                    // file may have been quarantined away by an
+                    // earlier open — its data is unavailable
+                    // either way). Warn loudly and carry on with
+                    // the tables that are there.
+                    eprintln!(
+                        "warning: SSTable manifest names sst-{id:06}.sst but the file is missing \
+                         in {}; its data is unavailable, opening with the remaining tables",
+                        dir.display()
+                    );
+                }
+            }
+        }
         let mut sstables = Vec::new();
         for id in ids.iter().rev() {
+            let is_orphan = live_ids.as_ref().is_some_and(|live| !live.contains(id));
             let path = sstable_path(dir, *id);
             match SsTable::open(&path, *id) {
-                Ok(table) => sstables.push(table),
+                Ok(table) => {
+                    if is_orphan {
+                        // A well-formed orphan: a compaction that
+                        // crashed before its manifest commit (or
+                        // after it, for an old table). Its data is
+                        // already in the live generation (or was
+                        // never committed), so drop it — never
+                        // load it, or a deleted key could come
+                        // back through it.
+                        eprintln!(
+                            "warning: ignoring orphan SSTable {} (not in the manifest — left by \
+                             a crashed compaction); its data is not loaded",
+                            path.display()
+                        );
+                    } else {
+                        sstables.push(table);
+                    }
+                }
                 // A corrupt SSTable must not make the whole database
                 // unopenable. Quarantine it (rename to a numbered
                 // `.corrupt.N`, so it is never re-parsed as a live
@@ -297,7 +350,10 @@ impl Engine {
                 // quarantine is never overwritten) and keep going: the
                 // WAL and the other SSTables are still recoverable.
                 // The quarantined file is kept on disk for inspection,
-                // not deleted.
+                // not deleted. This applies to orphans too: a corrupt
+                // file sitting in the data directory is quarantined
+                // rather than silently ignored, so it can be
+                // inspected instead of rotting unnoticed.
                 Err(e) => match crate::quarantine::quarantine_file(dir, &path) {
                     Ok(quarantine) => eprintln!(
                         "warning: quarantined corrupt SSTable {} to {} ({e}); \
@@ -756,6 +812,17 @@ impl Engine {
         self.next_sst_id += 1;
         let path = sstable_path(&self.dir, id);
         let table = SsTable::write(&path, id, &delta)?;
+        // V0.11 (review finding 1): commit the new table in the
+        // manifest BEFORE the WAL is cleared and the memtable is
+        // dropped. If this write fails, the flush fails with the
+        // WAL and memtable untouched — the new SSTable is an
+        // orphan on disk (ignored on the next open, or loaded
+        // harmlessly in a legacy directory: the flush delta is
+        // deduped by `xmin`, so replaying the WAL over it cannot
+        // duplicate a version).
+        let mut live: Vec<u64> = self.sstables.iter().map(|t| t.id).collect();
+        live.push(id);
+        write_manifest(&self.dir, &live)?;
         self.sstables.insert(0, table); // newest first
         self.memtable.clear();
         self.wal.clear()?; // old WAL records are now durable in the SSTable
@@ -795,6 +862,55 @@ impl Engine {
         Ok(())
     }
 
+    /// Test-only crash hook (V0.11, review finding 1): if the
+    /// environment variable named here is set to `"1"`, exit at
+    /// once with code 137 — exactly as if the process had been
+    /// killed with SIGKILL: no destructors run, no `Drop`, no
+    /// meta save, files stay exactly as they are at this stage.
+    /// The crash-order integration tests set
+    /// `ZENO_CRASH_AFTER_NEW_TABLE` (crash after the merged
+    /// SSTable is written + synced, before the manifest commit)
+    /// or `ZENO_CRASH_AFTER_MANIFEST` (crash after the manifest
+    /// commit, before the old files are deleted) around a CLI
+    /// `compact` / `vacuum` and then reopen: either way the
+    /// reopened database is exactly one generation — committed
+    /// data present, deleted data gone. Never set in production;
+    /// the hook is inert unless the variable is set.
+    fn crash_hook(var: &str) {
+        if std::env::var(var).map(|v| v == "1").unwrap_or(false) {
+            eprintln!("zeno: test crash hook {var} set — exiting 137 now (simulated kill -9)");
+            std::process::exit(137);
+        }
+    }
+
+    /// Delete every SSTable file in the data directory except
+    /// `keep` (the newly committed table). This is the delete pass
+    /// of compaction/vacuum (V0.11, review finding 1): it removes
+    /// the old generation AND any orphan files an earlier crashed
+    /// compaction left behind — the delete list comes from the
+    /// directory, not from the in-memory table list, because the
+    /// in-memory list never saw the orphans. Every unlink error
+    /// propagates: a leftover old file must be reported, never
+    /// silently kept. (Keeping one would still be harmless while
+    /// the manifest excludes it, but the operator must know the
+    /// cleanup did not finish.) The engine holds the data-dir
+    /// lock, so no other process can be writing SSTables here.
+    fn delete_old_sstables(&self, keep: u64) -> std::io::Result<()> {
+        for entry in fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if let Some(id) = parse_sstable_id(name) {
+                if id != keep {
+                    fs::remove_file(entry.path())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Merge all SSTables (plus the memtable, flushed first) into ONE
     /// SSTable, dropping overwritten values and tombstones. After this,
     /// a deleted key is physically gone — a read can no longer find it
@@ -808,6 +924,15 @@ impl Engine {
     /// protect: compaction refuses to run while any transaction
     /// is active (the server never calls it; the CLI runs it in a
     /// one-shot process with no transactions at all).
+    ///
+    /// V0.11 durable commit protocol (review finding 1): the new
+    /// table is written + synced, then the manifest is committed
+    /// to name ONLY the new table, and ONLY then are the old
+    /// files deleted — every unlink error and the final directory
+    /// sync propagate as the compaction's error instead of being
+    /// discarded. A crash at any stage reopens to exactly one
+    /// generation (see `crash_hook` and the manifest docs in
+    /// `sstable.rs`).
     pub fn compact(&mut self) -> std::io::Result<usize> {
         if !self.active_txns.is_empty() {
             return Err(std::io::Error::new(
@@ -846,16 +971,22 @@ impl Engine {
             })
             .collect();
 
-        // Write the merged table, then delete the old files.
+        // Write the merged table, commit it in the manifest, and
+        // only then delete the old files (V0.11 protocol — see the
+        // `compact` docs above). The manifest commit is the point
+        // of no return: after it, a crash leaves the old files on
+        // disk but out of the manifest, so the next open ignores
+        // them; before it, a crash leaves the new file orphaned
+        // and the old generation live.
         let id = self.next_sst_id;
         self.next_sst_id += 1;
         let path = sstable_path(&self.dir, id);
         let new_table = SsTable::write(&path, id, &live)?;
-        for old in &self.sstables {
-            let _ = fs::remove_file(&old.path);
-        }
-        // Best effort: make the removal of the old files durable.
-        let _ = sync_dir(&self.dir);
+        Self::crash_hook("ZENO_CRASH_AFTER_NEW_TABLE");
+        write_manifest(&self.dir, &[id])?;
+        Self::crash_hook("ZENO_CRASH_AFTER_MANIFEST");
+        self.delete_old_sstables(id)?;
+        sync_dir(&self.dir)?;
         self.sstables = vec![new_table];
         // No transaction is live (checked above), so every id
         // below `next_txn_id` is covered by the watermark now:
@@ -966,10 +1097,11 @@ impl Engine {
         self.next_sst_id += 1;
         let path = sstable_path(&self.dir, id);
         let new_table = SsTable::write(&path, id, &live)?;
-        for old in &self.sstables {
-            let _ = fs::remove_file(&old.path);
-        }
-        let _ = sync_dir(&self.dir);
+        Self::crash_hook("ZENO_CRASH_AFTER_NEW_TABLE");
+        write_manifest(&self.dir, &[id])?;
+        Self::crash_hook("ZENO_CRASH_AFTER_MANIFEST");
+        self.delete_old_sstables(id)?;
+        sync_dir(&self.dir)?;
         self.sstables = vec![new_table];
         self.meta.vacuums += 1;
         Ok(VacuumReport {

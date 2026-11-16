@@ -90,6 +90,114 @@ const READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// hold its thread forever either.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Absolute budget for the whole handshake (StartupMessage +
+/// SCRAM exchange), from the moment the connection is accepted:
+/// 60 seconds by default. `ZENO_HANDSHAKE_TIMEOUT_SECS` overrides
+/// it (diagnostic/test hook, like `ZENO_TXN_IDLE_TIMEOUT_SECS`).
+/// This is an ABSOLUTE deadline, not a per-read timeout — see
+/// `DeadlineReader`.
+pub(crate) fn handshake_timeout() -> Duration {
+    std::env::var("ZENO_HANDSHAKE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(60))
+}
+
+/// Absolute budget for ONE frontend message (frame), from its
+/// first byte: 60 seconds by default. `ZENO_FRAME_TIMEOUT_SECS`
+/// overrides it (diagnostic/test hook). A new frame gets a fresh
+/// budget, so a legitimately idle connection is NOT cut off while
+/// it waits between queries — the budget only starts when the
+/// frame's first byte arrives, and the 60 s socket read timeout
+/// still bounds the idle wait for that first byte, as before.
+pub(crate) fn frame_timeout() -> Duration {
+    std::env::var("ZENO_FRAME_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(60))
+}
+
+/// A reader that enforces an ABSOLUTE deadline (V0.11, review
+/// finding 3). The old code set a 60 s read timeout on the socket,
+/// but a socket timeout applies PER `read()` call — a client that
+/// dribbled one byte every 59 s never tripped it and held its
+/// connection slot (and thread) forever, starving the other 19
+/// slots. This wrapper checks the deadline on EVERY `read()`:
+/// once the budget is spent, the next read fails with `TimedOut`
+/// no matter how recently a byte arrived, so a slow-drip client
+/// is closed at most one budget after its frame started and its
+/// slot is freed.
+///
+/// Two modes: an absolute deadline (`with_deadline`, used for the
+/// handshake — the whole handshake must finish by one instant
+/// counted from accept), or a lazily-started budget
+/// (`reset_budget` + `start_frame`, used for frames — the budget
+/// starts at the frame's first byte, so idle time between frames
+/// does not consume it).
+///
+/// Honest limit: a single `read()` call can still block up to the
+/// socket's own read timeout (60 s) if the client goes silent
+/// mid-frame after the last byte — the deadline is checked
+/// between reads, not inside one blocked syscall. A client that
+/// keeps sending bytes, however slowly, is cut off at the
+/// deadline; a client that sends one byte and then goes quiet is
+/// cut off by the socket timeout instead. The TLS handshake
+/// itself (inside `tls::handshake_tls`) is not wrapped — only the
+/// pgwire handshake after it is.
+pub(crate) struct DeadlineReader<R: Read> {
+    inner: R,
+    /// Absolute instant after which reads fail, or `None` when
+    /// no deadline is armed (the budget starts on the next byte).
+    deadline: Option<Instant>,
+    /// Budget armed on the first byte read while no deadline is set.
+    budget: Duration,
+}
+
+impl<R: Read> DeadlineReader<R> {
+    /// A reader whose reads fail after the absolute `deadline`.
+    pub(crate) fn with_deadline(inner: R, deadline: Instant) -> Self {
+        Self {
+            inner,
+            deadline: Some(deadline),
+            budget: Duration::from_secs(0),
+        }
+    }
+
+    /// Arm a fresh per-frame budget: the deadline is cleared, so
+    /// the next byte read starts a new budget from that moment.
+    /// Call once per frame, before reading it.
+    pub(crate) fn start_frame(&mut self) {
+        self.deadline = None;
+    }
+
+    /// Replace the budget (and clear any armed deadline), e.g.
+    /// when the handshake ends and per-frame budgets begin.
+    pub(crate) fn reset_budget(&mut self, budget: Duration) {
+        self.budget = budget;
+        self.deadline = None;
+    }
+}
+
+impl<R: Read> Read for DeadlineReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if let Some(deadline) = self.deadline {
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "deadline exceeded: the client sent data too slowly",
+                ));
+            }
+        }
+        let n = self.inner.read(buf)?;
+        if n > 0 && self.deadline.is_none() {
+            self.deadline = Some(Instant::now() + self.budget);
+        }
+        Ok(n)
+    }
+}
+
 /// Protocol version 3.0, as sent in the StartupMessage.
 const PROTOCOL_V3: i32 = 196608; // 3 << 16
 /// First-message code asking for SSL; we always answer 'N'.
@@ -338,7 +446,7 @@ pub fn serve(data_dir: &Path, port: u16, opts: &ServeOptions) -> std::io::Result
     }));
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     println!(
-        "zeno 0.10.0 listening on 127.0.0.1:{} (data dir: {})",
+        "zeno 0.11.0 listening on 127.0.0.1:{} (data dir: {})",
         port,
         data_dir.display()
     );
@@ -449,14 +557,23 @@ pub fn serve(data_dir: &Path, port: u16, opts: &ServeOptions) -> std::io::Result
                 // Connection limit: increment FIRST, then check, so
                 // two accepts racing each other cannot both slip
                 // past the cap. Over the limit the connection is
-                // refused inline (no thread) — see
-                // `refuse_over_limit` (m6): an SSLRequest is
-                // answered 'N' first, then the 53300 ErrorResponse,
-                // so libpq reads a valid negotiation answer.
+                // refused on its own short-lived thread, NOT inline
+                // (V0.11, review finding 4): `refuse_over_limit`
+                // reads from the client, so doing it here would let
+                // one slow handshaker stall the accept loop and
+                // starve new clients. The refusal is best-effort:
+                // if the thread cannot even spawn, the socket is
+                // just dropped (the client sees a close, not a
+                // hang) and the loop keeps accepting.
                 let count = active.fetch_add(1, Ordering::SeqCst) + 1;
                 if count > opts.max_connections {
                     active.fetch_sub(1, Ordering::SeqCst);
-                    refuse_over_limit(stream, opts.max_connections);
+                    let max = opts.max_connections;
+                    if let Err(e) = std::thread::Builder::new().spawn(move || {
+                        refuse_over_limit(stream, max);
+                    }) {
+                        eprintln!("pgwire: could not spawn refusal thread: {e}");
+                    }
                     continue;
                 }
                 let peer_ip = stream
@@ -836,8 +953,15 @@ fn handle_connection(
     tls_config: Option<Arc<rustls::ServerConfig>>,
     peer_ip: String,
 ) -> std::io::Result<()> {
+    // V0.11 (review finding 3): the whole handshake — from the
+    // first byte of the first message to the end of SCRAM — must
+    // finish by this instant. The first 8 bytes are read through
+    // a `DeadlineReader` armed with it, and `handle_client` gets
+    // the same instant for the rest of the handshake.
+    let handshake_deadline = Instant::now() + handshake_timeout();
     let mut first = [0u8; 8];
-    match stream.read_exact(&mut first) {
+    let mut first_reader = DeadlineReader::with_deadline(stream.try_clone()?, handshake_deadline);
+    match first_reader.read_exact(&mut first) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
         Err(e)
@@ -849,6 +973,7 @@ fn handle_connection(
         }
         Err(e) => return Err(e),
     }
+    drop(first_reader);
     let code = i32::from_be_bytes([first[4], first[5], first[6], first[7]]);
     match code {
         SSL_REQUEST_CODE => match tls_config {
@@ -856,7 +981,15 @@ fn handle_connection(
                 stream.write_all(b"S")?;
                 stream.flush()?;
                 let (reader, writer) = tls::handshake_tls(stream, config)?;
-                return handle_client(reader, writer, shared, conn_id, peer_ip, false);
+                return handle_client(
+                    reader,
+                    writer,
+                    shared,
+                    conn_id,
+                    peer_ip,
+                    false,
+                    handshake_deadline,
+                );
             }
             None => {
                 stream.write_all(b"N")?; // no TLS configured for this server
@@ -868,7 +1001,15 @@ fn handle_connection(
                 // 'N' (clients saw `4e 4e 52 ...`). The next bytes
                 // on the socket are the StartupMessage itself.
                 let reader = BufReader::new(stream.try_clone()?);
-                return handle_client(reader, stream, shared, conn_id, peer_ip, false);
+                return handle_client(
+                    reader,
+                    stream,
+                    shared,
+                    conn_id,
+                    peer_ip,
+                    false,
+                    handshake_deadline,
+                );
             }
         },
         GSSENC_REQUEST_CODE => {
@@ -887,6 +1028,7 @@ fn handle_connection(
                 conn_id,
                 peer_ip,
                 tls_config.is_some(),
+                handshake_deadline,
             );
         }
         _ => {
@@ -909,7 +1051,15 @@ fn handle_connection(
     // the StartupMessage (or CancelRequest) — chain them back in
     // front of the socket so the handshake sees the whole message.
     let reader = Cursor::new(first.to_vec()).chain(BufReader::new(stream.try_clone()?));
-    handle_client(reader, stream, shared, conn_id, peer_ip, false)
+    handle_client(
+        reader,
+        stream,
+        shared,
+        conn_id,
+        peer_ip,
+        false,
+        handshake_deadline,
+    )
 }
 
 // ---------------------------------------------------------------------
@@ -1090,7 +1240,7 @@ pub(crate) fn command_complete(writer: &mut impl Write, tag: &str) -> std::io::R
 // ---------------------------------------------------------------------
 
 fn handle_client<R: Read, W: Write>(
-    mut reader: R,
+    reader: R,
     mut writer: W,
     shared: Arc<Mutex<Shared>>,
     conn_id: u32,
@@ -1099,11 +1249,18 @@ fn handle_client<R: Read, W: Write>(
     // `--tls` server: the channel is still plaintext, so the
     // startup below must refuse a plain login (M1).
     tls_required: bool,
+    // Absolute instant by which the whole handshake must finish
+    // (V0.11, review finding 3 — counted from accept, passed in
+    // by `handle_connection`).
+    handshake_deadline: Instant,
 ) -> std::io::Result<()> {
     let (data_dir, limiter) = {
         let guard = recover_lock(&shared);
         (guard.data_dir.clone(), Arc::clone(&guard.rate_limiter))
     };
+    // The handshake runs under the absolute deadline; afterwards
+    // the same reader switches to a fresh budget per frame.
+    let mut reader = DeadlineReader::with_deadline(reader, handshake_deadline);
     // A read timeout during the handshake is a quiet client, not a
     // server error: close this connection cleanly, keep serving.
     if let Err(e) = startup_handshake(
@@ -1121,6 +1278,7 @@ fn handle_client<R: Read, W: Write>(
         }
         return Err(e);
     }
+    reader.reset_budget(frame_timeout());
 
     // Per-connection transaction session (V0.6) plus the
     // extended-protocol state for this connection (prepared
@@ -1191,7 +1349,7 @@ impl Drop for ConnSession {
 /// Terminate, timeout, error, AND panic, which a rollback
 /// written after this loop returns could not cover.
 fn client_loop<R: Read, W: Write>(
-    mut reader: &mut R,
+    reader: &mut DeadlineReader<R>,
     mut writer: &mut W,
     shared: &Arc<Mutex<Shared>>,
     conn_id: u32,
@@ -1202,7 +1360,12 @@ fn client_loop<R: Read, W: Write>(
     let mut ext = ExtendedState::new();
 
     loop {
-        let msg = match read_message(&mut reader) {
+        // V0.11 (review finding 3): a fresh absolute budget for
+        // this frame, starting at its first byte — a client that
+        // dribbles a frame out byte by byte is closed at most one
+        // budget after the frame started, and its slot is freed.
+        reader.start_frame();
+        let msg = match read_message(reader) {
             Ok(m) => m,
             Err(e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
@@ -1858,7 +2021,7 @@ pub(crate) fn classify_statement(tokens: &[Token]) -> Result<StmtKind, SqlError>
         "DROP" | "ALTER" | "SET" | "SHOW" | "GRANT" | "REVOKE" | "TRUNCATE" | "COPY"
         | "EXPLAIN" => Err(sql_err(
             "0A000",
-            format!("{first} is not supported in Zeno 0.10.0 (only CREATE TABLE, INSERT, UPDATE, SELECT, DELETE, VACUUM, BEGIN, COMMIT, ROLLBACK, SAVEPOINT, RELEASE SAVEPOINT, ROLLBACK TO SAVEPOINT)"),
+            format!("{first} is not supported in Zeno 0.11.0 (only CREATE TABLE, INSERT, UPDATE, SELECT, DELETE, VACUUM, BEGIN, COMMIT, ROLLBACK, SAVEPOINT, RELEASE SAVEPOINT, ROLLBACK TO SAVEPOINT)"),
         )),
         "" => Ok(StmtKind::Empty),
         other => Err(sql_err(
@@ -2107,19 +2270,50 @@ fn execute_parsed(
     }
 }
 
-/// A parsed value as stored text. A `$n` placeholder that
-/// survived substitution (a prepared statement executed without
-/// Bind, which cannot happen through the wire protocol) is a
-/// syntax error, not data — storing the literal "$1" would be a
-/// silent corruption of the row.
-fn resolve_value(value: &ParsedValue) -> Result<String, SqlError> {
+/// A parsed value as a stored cell. `None` is a SQL NULL (V0.11):
+/// a bare `NULL` stores as a real NULL, and a quoted `'NULL'` is
+/// still the text "NULL" (the parser only produces `Null` for the
+/// bare word). A `$n` placeholder that survived substitution (a
+/// prepared statement executed without Bind, which cannot happen
+/// through the wire protocol) is a syntax error, not data — storing
+/// the literal "$1" would be a silent corruption of the row.
+fn resolve_value(value: &ParsedValue) -> Result<Option<String>, SqlError> {
     match value {
-        ParsedValue::Text(text) => Ok(text.clone()),
+        ParsedValue::Text(text) => Ok(Some(text.clone())),
+        ParsedValue::Null => Ok(None),
         ParsedValue::Param(n) => Err(sql_err(
             "42601",
             format!("parameter ${n} has no bound value — Bind the statement before executing it"),
         )),
     }
+}
+
+/// A WHERE column that is not in the table's registry columns is
+/// 42703 (V0.11, review finding 13 — the same rule as SELECT).
+/// Called by UPDATE / DELETE before the filter runs, so a typo
+/// fails the statement instead of silently matching no rows.
+/// A qualified column naming another table is rejected by
+/// `to_filter` already; this only checks the bare name.
+fn check_where_columns_exist(
+    tables: &TableStore,
+    table: &str,
+    conditions: &[crate::parser::Condition],
+) -> Result<(), SqlError> {
+    let Some(columns) = tables.columns(table) else {
+        return Err(sql_err("42P01", format!("no such table '{table}'")));
+    };
+    for cond in conditions {
+        if !columns.iter().any(|c| c == &cond.column.name) {
+            return Err(sql_err(
+                "42703",
+                format!(
+                    "column '{}' does not exist in table '{table}'",
+                    cond.column.name
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A parsed WHERE (AND-joined conditions) as a `RowFilter` for
@@ -2151,10 +2345,10 @@ fn to_filter(table: &str, conditions: &[crate::parser::Condition]) -> Result<Row
                 match &cond.rhs {
                     crate::parser::CondRhs::Column(_) => {
                         "a column-to-column comparison is not supported in UPDATE / DELETE \
-                         in Zeno 0.10.0 — use a literal value"
+                         in Zeno 0.11.0 — use a literal value"
                     }
                     _ => {
-                        "subqueries are not supported in UPDATE / DELETE in Zeno 0.10.0 — \
+                        "subqueries are not supported in UPDATE / DELETE in Zeno 0.11.0 — \
                          use a literal value"
                     }
                 },
@@ -2197,7 +2391,7 @@ fn exec_create_ast(
     if session.txn.is_some() {
         return Err(sql_err(
             "0A000",
-            "CREATE TABLE is not supported inside a transaction in Zeno 0.10.0 \
+            "CREATE TABLE is not supported inside a transaction in Zeno 0.11.0 \
              (DDL is not versioned — run it outside a transaction, after COMMIT or ROLLBACK)",
         ));
     }
@@ -2243,7 +2437,7 @@ fn exec_insert_ast(
     // registry column order (validating the column list here,
     // before any row is written — a bad column must fail the
     // whole statement, not half of it).
-    let mut full_rows: Vec<Vec<String>> = Vec::with_capacity(rows.len());
+    let mut full_rows: Vec<Vec<Option<String>>> = Vec::with_capacity(rows.len());
     match columns {
         Some(list) => {
             for col in list {
@@ -2257,13 +2451,14 @@ fn exec_insert_ast(
             if list.len() != registry_columns.len() {
                 // A column list that names only some columns
                 // would leave the rest unspecified — Zeno has no
-                // NULLs and no defaults, so every column must be
-                // given exactly once.
+                // defaults, so every column must be given exactly
+                // once (write NULL for a column with no value).
                 return Err(sql_err(
                     "42601",
                     format!(
                         "INSERT column list has {} columns but table '{name}' has {} — \
-                         every column must be listed exactly once (Zeno has no NULLs or defaults)",
+                         every column must be listed exactly once (Zeno has no defaults; \
+                         use NULL for an empty value)",
                         list.len(),
                         registry_columns.len()
                     ),
@@ -2279,7 +2474,7 @@ fn exec_insert_ast(
                 }
             }
             for row in rows {
-                let mut full = vec![String::new(); registry_columns.len()];
+                let mut full = vec![None; registry_columns.len()];
                 for (col, value) in list.iter().zip(row.iter()) {
                     let pos = registry_columns
                         .iter()
@@ -2343,8 +2538,9 @@ pub(crate) struct SelectPlan {
 
 /// Parse `SELECT ... FROM name ...` from old-style tokens and
 /// resolve its output columns. The WHERE column is NOT checked
-/// against the registry here — matching the V0.3 behaviour, a
-/// filter on an unknown column simply matches no rows.
+/// against the registry here — it is checked at execution time
+/// in `query::eval_condition`, which returns 42703 for an unknown
+/// column since V0.11 (review finding 13).
 /// (V0.9: the output columns come from `query::output_columns`,
 /// which also resolves JOINs, aliases and aggregates — a
 /// `SELECT *` over a JOIN expands to every column of every
@@ -2412,6 +2608,7 @@ fn exec_delete_ast(
     // Poison recovery (V0.5): a thread that panicked while holding
     // this lock must not wedge the server — see `recover_lock`.
     let mut guard = recover_lock(shared);
+    check_where_columns_exist(&guard.tables, name, conditions)?;
     let Shared { engine, tables, .. } = &mut *guard;
     let deleted = match session.txn {
         Some(txn) => tables
@@ -2438,18 +2635,19 @@ fn exec_update_ast(
     session: &mut Session,
 ) -> Result<StmtOutcome, SqlError> {
     let filter = to_filter(name, conditions)?;
-    let mut resolved_sets: Vec<(String, String)> = Vec::with_capacity(sets.len());
+    let mut resolved_sets: Vec<(String, Option<String>)> = Vec::with_capacity(sets.len());
     for (col, value) in sets {
         resolved_sets.push((col.clone(), resolve_value(value)?));
     }
-    let set_refs: Vec<(&str, &str)> = resolved_sets
+    let set_refs: Vec<(&str, Option<&str>)> = resolved_sets
         .iter()
-        .map(|(c, v)| (c.as_str(), v.as_str()))
+        .map(|(c, v)| (c.as_str(), v.as_deref()))
         .collect();
     check_table_visible_in_txn(session, name)?;
     // Poison recovery (V0.5): a thread that panicked while holding
     // this lock must not wedge the server — see `recover_lock`.
     let mut guard = recover_lock(shared);
+    check_where_columns_exist(&guard.tables, name, conditions)?;
     let Shared { engine, tables, .. } = &mut *guard;
     let updated = match session.txn {
         Some(txn) => tables
@@ -2490,7 +2688,7 @@ fn exec_begin(
         return Err(sql_err(
             "25001",
             "already in a transaction — COMMIT or ROLLBACK first \
-             (Zeno 0.10.0 has no nested transactions)",
+             (Zeno 0.11.0 has no nested transactions)",
         ));
     }
     // Poison recovery (V0.5): see `recover_lock`.
@@ -2736,7 +2934,7 @@ fn exec_vacuum(
     session: &mut Session,
 ) -> Result<StmtOutcome, SqlError> {
     if tokens.len() != 1 {
-        return Err(sql_err("42601", "VACUUM takes no arguments in Zeno 0.10.0"));
+        return Err(sql_err("42601", "VACUUM takes no arguments in Zeno 0.11.0"));
     }
     if session.txn.is_some() {
         return Err(sql_err(
@@ -2881,6 +3079,68 @@ mod tests {
         assert_eq!(msg, Some((b'Q', b"abcd".to_vec())));
     }
 
+    /// V0.11 (review finding 3): a reader that dribbles one byte
+    /// at a time, forever, must still hit the absolute deadline —
+    /// the old per-read socket timeout never fired on such a
+    /// client, because every read returned a byte in time. Here
+    /// the drip yields a byte every 50 ms and the budget is
+    /// 300 ms: the third `read_exact` (past the deadline) must
+    /// fail with `TimedOut`, and the whole test must finish in
+    /// well under 5 s.
+    #[test]
+    fn deadline_reader_closes_a_slow_drip_client() {
+        use std::io::Read;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        /// Yields one byte per `read()`, forever, sleeping
+        /// `interval` between bytes — the slow-drip client.
+        struct Drip {
+            sent: Arc<AtomicUsize>,
+            interval: Duration,
+        }
+        impl Read for Drip {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                std::thread::sleep(self.interval);
+                self.sent.fetch_add(1, Ordering::SeqCst);
+                buf[0] = b'x';
+                Ok(1)
+            }
+        }
+
+        let sent = Arc::new(AtomicUsize::new(0));
+        let drip = Drip {
+            sent: Arc::clone(&sent),
+            interval: Duration::from_millis(50),
+        };
+        // Absolute deadline 300 ms from now (the frame budget
+        // starts at the first byte in production; here the
+        // deadline is armed up front — same 300 ms window).
+        let mut reader =
+            DeadlineReader::with_deadline(drip, Instant::now() + Duration::from_millis(300));
+        let started = Instant::now();
+        // The first bytes arrive inside the budget...
+        let mut first = [0u8; 2];
+        reader.read_exact(&mut first).unwrap();
+        // ...but a frame that never finishes must fail at the
+        // deadline instead of dribbling forever.
+        let mut rest = [0u8; 64];
+        let err = reader.read_exact(&mut rest).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "deadline must fire promptly, took {:?}",
+            started.elapsed()
+        );
+        // And a fresh frame gets a fresh budget (reset_budget +
+        // start_frame).
+        reader.reset_budget(Duration::from_millis(300));
+        reader.start_frame();
+        let mut again = [0u8; 1];
+        reader.read_exact(&mut again).unwrap();
+        assert!(sent.load(Ordering::SeqCst) >= 3);
+    }
+
     #[test]
     fn read_timeout_closes_a_half_talking_client() {
         // F2: a client that sends half a message and then goes quiet
@@ -2891,9 +3151,7 @@ mod tests {
         use std::sync::mpsc;
         use std::time::Duration;
 
-        let dir = std::env::temp_dir().join("zeno-pgwire-timeout-test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::unique_test_dir("zeno-pgwire-timeout-test");
         let engine = Engine::open(&dir).unwrap();
         let tables = TableStore::open(&dir).unwrap();
         let shared = Arc::new(Mutex::new(Shared {
@@ -2926,6 +3184,7 @@ mod tests {
                 1,
                 "127.0.0.1".to_string(),
                 false,
+                Instant::now() + Duration::from_secs(60),
             ));
         });
 
@@ -3044,9 +3303,7 @@ mod tests {
         // transaction — with its snapshot — leaked in the engine
         // forever).
         use std::panic::AssertUnwindSafe;
-        let dir = std::env::temp_dir().join("zeno-pgwire-connsession-test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::unique_test_dir("zeno-pgwire-connsession-test");
         let engine = Engine::open(&dir).unwrap();
         let tables = TableStore::open(&dir).unwrap();
         let shared = Arc::new(Mutex::new(Shared {
@@ -3161,9 +3418,7 @@ mod tests {
         // one key with four versions — v1, v2, then a BEGIN whose
         // snapshot sees v2, then v3 and v4 — and runs the real
         // thread on a 50 ms interval.
-        let dir = std::env::temp_dir().join("zeno-pgwire-autovacuum-test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::unique_test_dir("zeno-pgwire-autovacuum-test");
         let engine = Engine::open(&dir).unwrap();
         let tables = TableStore::open(&dir).unwrap();
         let shared = Arc::new(Mutex::new(Shared {

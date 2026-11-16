@@ -1,7 +1,7 @@
 # Zeno V1.0 readiness checklist
 
 What is still missing before Zeno can call itself V1.0 — with an
-honest status per item. Statuses as of **V0.10.0** (2026-11-16).
+honest status per item. Statuses as of **V0.11.0** (2026-11-16).
 Nothing here is a promise of a date; "pending" means not done,
 not "coming soon".
 
@@ -16,15 +16,15 @@ not "coming soon".
 | # | Item | Status | Note |
 |---|------|--------|------|
 | 1 | Real-client verification with `psql` / libpq | pending | `psql` is NOT installed in this sandbox (`which psql` finds nothing, checked again 2026-11-16). Every wire-protocol test speaks raw TCP from a hand-rolled client instead. Done = the same server answers a real `psql` session (Simple + extended protocol, SCRAM login, prepared statements) on a machine that has it. |
-| 2 | Power-loss / crash-safety test | done (V0.10) | `v10_power_loss_kill9_committed_rows_survive`: a real server writes committed rows (5 users, 6 orders, WAL-only), opens a transaction that never commits, is killed with SIGKILL (no graceful shutdown), gets a torn line appended to `wal.log`, and restarts on the same directory — every committed row comes back, the uncommitted row is gone, the torn line is warned about but does not block the open, and the database stays writable (a row written after the recovery survives a second, graceful restart too). No data loss was found, so no WAL fix was needed. Honest limit: a kill -9 is a process crash, not a power cut — there is still no test that cuts power mid-fsync or verifies the on-disk files after an OS crash. |
+| 2 | Process-crash recovery test | done (V0.10, extended V0.11) | `v10_power_loss_kill9_committed_rows_survive`: a real server writes committed rows (5 users, 6 orders, WAL-only), opens a transaction that never commits, is killed with SIGKILL (no graceful shutdown), gets a torn line appended to `wal.log`, and restarts on the same directory — every committed row comes back, the uncommitted row is gone, the torn line is warned about but does not block the open, and the database stays writable (a row written after the recovery survives a second, graceful restart too). No data loss was found, so no WAL fix was needed. Honest limit: a kill -9 is a process crash, not a power cut — there is still no test that cuts power mid-fsync or verifies the on-disk files after an OS crash. **V0.11 extends this to compaction/vacuum:** `v11_compact_crash_after_new_table_reopens_old_generation`, `v11_compact_crash_after_manifest_reopens_new_generation` and `v11_vacuum_crash_after_manifest_reopens_new_generation` crash a real CLI `compact` / `vacuum` at each commit stage (exit 137 = simulated kill -9) and reopen — committed rows present, deleted rows gone, exactly one generation live. A real power cut is still untested (see the V1 acceptance list). |
 | 3 | JOIN | done (V0.9) | INNER JOIN and LEFT JOIN work (nested-loop; aliases, qualified columns, `*` and `u.*` expansion, NULL padding on LEFT misses, 42702 ambiguous / 42703 unknown / 42P01 missing table, 42712 duplicate alias/table). RIGHT / FULL / CROSS JOIN are still 0A000 — a hash join and the remaining JOIN types are V1.0+ work. Regression tests: `v09_inner_join_returns_matching_rows`, `v09_left_join_pads_missing_rows_with_null`, `v09_ambiguous_column_is_42702_and_right_join_is_0a000`, `v09fix_duplicate_alias_is_42712_and_self_join_still_works`, `v09fix_qualified_star_expands`. |
 | 4 | Subqueries | done (V0.9, extended V0.10) | `WHERE ... IN (SELECT ...)` / `NOT IN` (single-column) and scalar `= (SELECT ...)` (0 rows = NULL, 1 row = value, many rows = 21000) work, through Simple Query and the extended protocol, inside transactions (same snapshot). FROM-subqueries are still 0A000. **V0.10 adds scalar subqueries in the SELECT list, correlated and uncorrelated** (`SELECT name, (SELECT MAX(amount) FROM orders WHERE orders.user_id = users.id) FROM users` — per-row values 250 / 50 / 300 / NULL; uncorrelated evaluated lazily once per statement; 0 rows = NULL, >1 row = 21000, >1 column = 42601; aggregates inside; GROUP BY: uncorrelated same value per group, correlated only on GROUP BY columns, anything else 42803; statement timeout 57014 applies). A qualified column is now a valid WHERE right-hand side (`orders.user_id = users.id`); an unqualified bare word stays a literal. **Correlated subqueries in WHERE work since the V0.10 review fix** — a WHERE subquery that references its own statement's tables, or an ancestor statement's, is evaluated once per row, against that row (uncorrelated ones are still hoisted once per statement). Cost: a correlated SELECT-list subquery runs once per outer row (once per group when grouped) with no index and no hash join, so it is slow on large inputs by design. Regression tests: `v09_in_subquery_and_not_in`, `v09_scalar_subquery_null_one_and_many_rows`, `v09_from_subquery_is_0a000`, `v09fix_nested_in_subquery_finishes_fast`, `v09fix_second_connection_not_blocked_by_slow_select`, `v09fix_statement_timeout_cancels_slow_query`, `v09fix_deep_subquery_nesting_is_54001_and_server_survives`, `v10_select_list_subquery_uncorrelated_is_evaluated_once`, `v10_select_list_subquery_correlated_per_row_value`, `v10_select_list_subquery_error_codes`, `v10_select_list_subquery_with_group_by`, `v10_select_list_subquery_timeout_cancels_slow_query`, `v10_power_loss_kill9_committed_rows_survive`, `v10_select_list_subquery_extended_protocol`, `v10fix_nested_select_list_subquery_references_grand_outer`, `v10fix_correlated_where_subquery_evaluated_per_row`. |
 | 5 | GROUP BY / HAVING / aggregates | done (V0.9) | GROUP BY (one or more columns) + COUNT(*), COUNT(col), SUM, AVG, MIN, MAX + HAVING (with AND) + ORDER BY on an aggregate/alias work, with JOINs and **without GROUP BY** (one row over the whole table; COUNT 0 / SUM NULL over no rows — `SELECT COUNT(*) FROM orders HAVING COUNT(*) > 1` returns one row). Wrong aggregate input is 22P02, a non-grouped column is 42803, an unknown column in the SELECT list / HAVING / ORDER BY is 42703 (a HAVING output alias is 42703 too). SUM over plain integers is exact (i128); AVG over plain integers is exact via integer division + remainder decimal (non-terminating divisions run to 16 decimal places, documented as approximate); an integer SUM/AVG overflowing i128 is 22003. Regression tests: `v09_group_by_aggregates`, `v09_having_filters_groups_and_order_by_alias`, `v09_aggregate_errors`, `v09fix_having_without_group_by`, `v09fix_aggregate_error_codes`, `v09fix_avg_exact_and_sum_overflow`. |
 | 6 | Two-phase commit (2PC) | pending | No PREPARE TRANSACTION / COMMIT PREPARED. Transactions are snapshot isolation only. Done = 2PC works across a crash (prepared txns survive restart) with tests. |
 | 7 | READ COMMITTED / SERIALIZABLE | pending | Snapshot isolation only; every statement in a transaction sees the BEGIN snapshot. Done = at least one more isolation level works with tests. |
 | 8 | Benchmarks vs PostgreSQL / MongoDB | pending | `zeno bench` (V0.8) measures Zeno's own engine only. No comparison ran, because neither PostgreSQL nor MongoDB is installed in this sandbox (`which psql mongod postgres` finds nothing, checked again 2026-11-16). No comparison number is claimed anywhere — any number would be invented. Done = the same workload runs against a real PostgreSQL and a real MongoDB on the same machine, and the numbers are published side by side with the machine and config. |
-| 9 | Production hardening | pending | Several prototype-only behaviours remain: trust auth when no users are configured (any local client, no password); self-signed TLS certificate with no channel binding; SCRAM lockout in-memory only (a restart clears it); no encryption at rest; SSTables fully loaded into memory on open; single-machine lock file (no NFS). Done = each of these is fixed or the V1.0 scope explicitly excludes it in writing. |
-| 10 | Independent security audit | pending | No outside audit of the auth, wire protocol, or storage code. The code has self-review fixes (see README "review fixes" sections) and 294 tests, but that is not an audit. |
+| 9 | Production hardening | pending | V0.11 fixed the durability half of this (SSTable manifest commit protocol, WAL parent-directory sync, absolute deadlines for slow clients — see items 21–23). Several prototype-only behaviours remain: trust auth when no users are configured (any local client, no password); self-signed TLS certificate with no channel binding; SCRAM lockout in-memory only (a restart clears it); no encryption at rest; SSTables fully loaded into memory on open; single-machine lock file (no NFS). Done = each of these is fixed or the V1.0 scope explicitly excludes it in writing. |
+| 10 | Independent security audit | pending | No outside audit of the auth, wire protocol, or storage code. The code has self-review fixes (see README "review fixes" sections) and 306 tests, but that is not an audit. |
 | 11 | DDL inside transactions | pending | CREATE TABLE inside a transaction fails with 0A000. Done = DDL is transactional (or the V1.0 scope explicitly excludes it in writing). |
 | 12 | Secondary indexes | pending | `doc find` is a linear scan; tables have no indexes either. Done = at least one index type works with tests. |
 | 13 | Multi-node / replication | pending | Single node only; out of scope for the current design. Listed so nobody assumes otherwise. |
@@ -35,6 +35,14 @@ not "coming soon".
 | 18 | MVCC snapshot isolation + savepoints | done (V0.6/V0.7) | BEGIN/COMMIT/ROLLBACK, write-write conflict 40001, SAVEPOINT / ROLLBACK TO / RELEASE, idle-transaction timeout. |
 | 19 | SCRAM-SHA-256 auth + TLS 1.2/1.3 | done (V0.4/V0.5) | With users configured, password auth is required; self-signed cert (prototype only — see item 9). |
 | 20 | Auto-vacuum | done (V0.7) | Background thread, snapshot-safe, panic-caught, no-op does not rewrite SSTables. |
+| 21 | Durable compaction/vacuum commit protocol | done (V0.11) | `sst-manifest.json` commit: new SSTable written + synced, manifest atomically committed to name only the new table, old files deleted only then, unlink + directory-sync errors propagated. Crash before the commit reopens the old generation, crash after it reopens the new one — a deleted key never comes back. Orphans are ignored (never loaded); a corrupt SSTable, live or orphan, is quarantined; a manifest-listed file that is missing warns loudly instead of refusing the open. Regression tests: `v11_compact_crash_after_new_table_reopens_old_generation`, `v11_compact_crash_after_manifest_reopens_new_generation`, `v11_vacuum_crash_after_manifest_reopens_new_generation` (demo.sh §17 shows it live). |
+| 22 | WAL namespace durability | done (V0.11) | `Wal::open` fsyncs the parent directory on creating a new WAL file; `Wal::clear` fsyncs it after deleting the old one — an acknowledged write's WAL pathname is durable, not just its contents. Regression tests: `v11_wal_rotation_after_flush_survives_reopen`, `clear_then_reopen_does_not_resurrect_old_records`. Honest limit: a directory fsync cannot be observed from inside a test; a real power cut is still untested. |
+| 23 | Slow-drip connection slots | done (V0.11) | Absolute deadlines for the handshake and for every frame (60 s each, `ZENO_HANDSHAKE_TIMEOUT_SECS` / `ZENO_FRAME_TIMEOUT_SECS` override); the budget starts at the frame's first byte, so an idle connection is not cut off between queries. Over-limit refusals run on a separate best-effort thread, off the accept loop. Regression tests: `deadline_reader_closes_a_slow_drip_client`, `v11_slow_drip_frame_frees_its_slot`. Honest limit: a single blocked `read()` can still wait out the socket timeout, and the TLS handshake itself is not deadline-wrapped. |
+| 24 | Bare SQL NULL | done (V0.11) | Bare `NULL` (any case) is a real NULL: stored as JSON `null`, `WHERE c = NULL` never matches, `UPDATE ... SET c = NULL` stores NULL, `SELECT *` reads it as NULL, `COUNT(col)` skips it. Quoted `'NULL'` stays text. Regression tests: `bare_null_is_a_real_null_and_quoted_null_is_text`, `v11_bare_null_stores_real_null_and_quoted_null_is_text`. Known gap: a bound NULL parameter over the extended protocol still arrives as an empty string; `IS NULL` syntax is still 0A000. |
+| 25 | Unambiguous document keys | done (V0.11) | Collection and id are percent-escaped (`:` → `%3A`, `%` → `%25`) in `put`, `get` and `find` alike — (`a:b`, `c`) and (`a`, `b:c`) are different keys, and `find` is isolated per collection. Keys with no `%` or `:` encode byte-identically to V0.10, so old documents read with no migration; only keys containing `%` or `:` change, and those were ambiguous before. Regression tests: `separator_collision_is_isolated`, `legacy_keys_without_separator_still_read`. |
+| 26 | Unknown WHERE column is 42703 | done (V0.11) | A single-table query with an unknown WHERE column now fails with 42703 instead of silently returning zero rows — validated up front, so it errors even over an empty table; UPDATE / DELETE too. Regression test: `v11_unknown_where_column_is_42703`. |
+| 27 | CI draft + toolchain pin + MSRV | done (V0.11, draft) | Drafts in `prototype/ci/` (`.github/workflows/ci.yml`, `rust-toolchain.toml` pinned to 1.99.1) and `rust-version = "1.85"` in `Cargo.toml`. They move to the repo root on push — CI only runs from there. Done = the workflow is live at the root and green. |
+| 28 | Unique test temp dirs | done (V0.11) | Every integration-test directory is unique per call (PID + nanoseconds + counter, `unique_test_dir` in `src/lib.rs`), so concurrent runs of the same test binary cannot delete each other's data. |
 
 ## Notes from the V0.8 build
 
@@ -162,9 +170,9 @@ parser unit tests; suite total 267 → 283):
   columns now error even over an empty result set (up-front
   validation); HAVING-alias code (42703, via M2b).
 - **Minors deliberately left, documented in the README:**
-  WHERE on an unknown column with one table still silently
-  matches nothing (V0.3 behaviour — changing it risked
-  regressions); no general LIMIT pushdown (LIMIT applies after
+  WHERE on an unknown column with one table silently matched
+  nothing (V0.3 behaviour) — **fixed in V0.11: it is 42703 now**
+  (see "Notes from the V0.11 build", item 26); no general LIMIT pushdown (LIMIT applies after
   the full result is built — a big cross product is now capped
   at 100_000 joined rows, 54000, instead of growing memory
   first; simple aggregates stream and LIMIT 0 skips the
@@ -216,7 +224,7 @@ parser unit tests; suite total 267 → 283):
   row), and the CLI `--version` test moved from 0.9.0 to
   0.10.0. Suite total 283 → 290 (133 unit + 43 engine +
   114 pgwire).
-- **Power-loss test found nothing to fix.** Every committed
+- **Process-crash recovery test found nothing to fix.** Every committed
   row survived kill -9 + a torn WAL line on the first run, and
   the uncommitted row was correctly gone — the WAL fsync
   discipline from V0.2/V0.6 already held. The test stays as
@@ -303,3 +311,95 @@ the debug and the release profile):
   `parse_subquery` restores `subquery_depth` on a parse error;
   the integer SUM/AVG path checks the statement deadline every
   1024 values, like the f64 path.
+
+
+## V1 acceptance list (authoritative, V0.11)
+
+One list, one verdict per item — **release blocker** (V1.0
+cannot ship without it), **post-V1** (explicitly after V1.0),
+or **excluded** (not in Zeno at all, by design). This list is
+the authority; if the design draft or an old note disagrees,
+this list wins. "Done" items are listed so the list is
+complete, not because they need more work.
+
+| Item | Verdict | Note |
+|------|---------|------|
+| Real-client verification (`psql` / libpq) — checklist 1 | **release blocker** | No real client has ever spoken to the server yet. |
+| Process-crash recovery — checklist 2 | done (V0.10, extended V0.11) | Kill -9 at every stage, WAL + compaction/vacuum. |
+| Real power-loss test (power cut mid-fsync, on-disk files verified after an OS crash) | **release blocker** | Needs a test rig that cuts power; until it exists, V1.0 claims **process-crash recovery only**, never power-loss safety. |
+| JOIN: INNER / LEFT — checklist 3 | done (V0.9) | Nested-loop only. |
+| JOIN: RIGHT / FULL / CROSS | **post-V1** | 0A000 today; needs a hash join first. |
+| Subqueries: WHERE IN / scalar, SELECT-list — checklist 4 | done (V0.9 / V0.10) | |
+| Subqueries: FROM-subqueries | **post-V1** | 0A000 today. |
+| GROUP BY / HAVING / aggregates — checklist 5 | done (V0.9) | |
+| Two-phase commit (2PC) — checklist 6 | **release blocker** | Or the V1.0 scope explicitly excludes it in writing (checklist 6 allows that). |
+| READ COMMITTED / SERIALIZABLE — checklist 7 | **release blocker** | Or explicitly excluded in writing (checklist 7 allows that). |
+| Benchmarks vs PostgreSQL / MongoDB — checklist 8 | **post-V1** | Changed in V0.11 from the original design draft (§5 item 5): a comparison is only honest after the baseline benchmark and disk-backed SSTable blocks/cache exist (Phase 2/3). No comparison number is claimed anywhere. |
+| Baseline benchmark (Zeno-only, published, reproducible) | **release blocker** | `zeno bench` exists (checklist 16) but no published baseline numbers yet — Phase 2. |
+| Disk-backed SSTable blocks/cache (SSTables not fully loaded into memory on open) | **release blocker** | Phase 2. Today every SSTable loads fully into memory (checklist 9). |
+| Group commit | **post-V1** | Performance, not correctness. |
+| Production hardening — checklist 9 | **release blocker** | Each sub-item fixed, or the V1.0 scope explicitly excludes it in writing: trust auth with no users, self-signed TLS with no channel binding, in-memory-only SCRAM lockout, no encryption at rest, single-machine lock file. Durability half done in V0.11 (items 21–23). |
+| Independent security audit — checklist 10 | **release blocker** | Self-review + tests are not an audit. |
+| DDL inside transactions — checklist 11 | **release blocker** | Or explicitly excluded in writing. |
+| Secondary indexes — checklist 12 | **release blocker** | Or explicitly excluded in writing. `doc find` is a linear scan today. |
+| Multi-node / replication — checklist 13 | **excluded** | Single node by design; V1.0 is a single-node database. |
+| Savepoint PG-compat — checklist 14 | done (V0.8) | |
+| Graceful shutdown — checklist 15 | done (V0.8) | |
+| Zeno-only benchmark command — checklist 16 | done (V0.8) | |
+| SQL parser — checklist 17 | done (V0.7) | |
+| MVCC snapshot isolation + savepoints — checklist 18 | done (V0.6/V0.7) | |
+| SCRAM-SHA-256 auth + TLS — checklist 19 | done (V0.4/V0.5) | |
+| Auto-vacuum — checklist 20 | done (V0.7) | |
+| Durable compaction/vacuum commit protocol — checklist 21 | done (V0.11) | |
+| WAL namespace durability — checklist 22 | done (V0.11) | |
+| Slow-drip connection slots — checklist 23 | done (V0.11) | |
+| Bare SQL NULL — checklist 24 | done (V0.11) | Bound NULL params still a gap (see item 24). |
+| Unambiguous document keys — checklist 25 | done (V0.11) | |
+| Unknown WHERE column is 42703 — checklist 26 | done (V0.11) | |
+| CI draft + toolchain pin + MSRV — checklist 27 | done (V0.11, draft) | Live at the repo root on push. |
+| Unique test temp dirs — checklist 28 | done (V0.11) | |
+| UNION, OR, LIKE, `IS NULL` syntax, hash join, LIMIT pushdown | **post-V1** | All 0A000 today; no new SQL feature was added in V0.11 by design. |
+| Cross-model transactional rollback (table + document + KV in one transaction) | **post-V1** | Design draft §2 promises it; the prototype does not have it. |
+
+## Notes from the V0.11 build
+
+- **A manifest changes what an id means.** SSTable ids are
+  never reused — `next_sst_id` counts every `sst-*.sst` file
+  on disk, orphans included — so after a quarantine the next
+  flush takes a NEW id, not the freed one. The old
+  `quarantine_second_sstable_corruption_keeps_first` test
+  assumed the id was reused; it failed (the second torn file
+  was an orphan, ignored, never quarantined) and was NOT
+  changed by weakening the engine — the engine is right, the
+  test's assumption was pre-manifest. The fix was in the
+  engine's open path, two parts: (a) a corrupt ORPHAN is now
+  quarantined too (a corrupt file in the data directory is
+  never silently ignored — it is renamed to `.corrupt.N` for
+  inspection); (b) a manifest-listed file that is missing
+  warns loudly instead of refusing the whole open, because a
+  quarantined table would otherwise wedge the next open (its
+  id is still in the manifest, its file is gone).
+- **The delete pass cleans orphans.** The first version of
+  `compact()` deleted only the tables it knew in memory; a
+  crash-order test caught an orphan from an earlier crashed
+  compaction surviving on disk. `delete_old_sstables` now
+  enumerates the directory and deletes every `sst-*.sst`
+  except the new one — so each successful compaction also
+  cleans up the previous crash's leftovers.
+- **Bound NULL params are still not SQL NULL.** The literal
+  `NULL` keyword is the only NULL source so far; `$1` bound
+  to NULL over the extended protocol arrives as an empty
+  string (pre-existing, in `extended.rs`). That is the next
+  NULL fix, not this version's.
+- **A deadline is checked between reads, not during one.**
+  `DeadlineReader` bounds a slow drip, but a single blocked
+  `read()` can still wait out the 60 s socket timeout, and the
+  TLS handshake is not wrapped. The test proves the slot
+  frees, not that every slow byte is cut off instantly.
+- **Docs moved, not duplicated.** The root README and
+  `docs/DESIGN.md` were NOT edited — their corrected versions
+  are drafts in `prototype/docs-draft/` and move to the root
+  on push. The prototype README and this checklist were edited
+  in place. The design draft is marked proposal/future, with an
+  explicit "Aaj ki haalat (V0.11)" under every section where it
+  differs from the implementation.

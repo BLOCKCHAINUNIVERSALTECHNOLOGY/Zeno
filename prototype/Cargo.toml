@@ -1,8 +1,9 @@
 [package]
 name = "zeno"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
-description = "Zeno — One Engine, All Data. Hybrid key-value + table + JSON document database in Rust (V0.10 prototype)."
+rust-version = "1.87"
+description = "Zeno — One Engine, All Data. Hybrid key-value + table + JSON document database in Rust (V0.11 prototype)."
 license = "Apache-2.0"
 
 [[bin]]

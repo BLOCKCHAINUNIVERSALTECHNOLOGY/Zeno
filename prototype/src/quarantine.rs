@@ -83,11 +83,7 @@ mod tests {
     use super::*;
 
     fn tmp_dir(name: &str) -> PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!("zeno-quarantine-test-{name}"));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        p
+        crate::unique_test_dir(&format!("zeno-quarantine-test-{name}"))
     }
 
     #[test]

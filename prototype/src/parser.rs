@@ -60,7 +60,8 @@ pub enum CmpOp {
 }
 
 /// One value in the AST: a literal (string, number, or bare word —
-/// all stored as text, because every Zeno column is text) or a
+/// all stored as text, because every Zeno column is text), the SQL
+/// `NULL` literal (V0.11 — a real NULL, not the text "NULL"), or a
 /// `$n` parameter placeholder. Placeholders only survive in a
 /// prepared statement that has not been bound yet (extended
 /// Describe); by execution time `extended::substitute` has replaced
@@ -69,15 +70,19 @@ pub enum CmpOp {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
     Text(String),
+    /// Bare `NULL` (any case): a real SQL NULL. A quoted `'NULL'`
+    /// is `Text("NULL")` — text, not NULL — because the tokenizer
+    /// marks it as a string literal, never as this variant.
+    Null,
     Param(usize),
 }
 
 impl Value {
-    /// The literal text, or `None` for an unbound `$n`.
+    /// The literal text, or `None` for an unbound `$n` and for NULL.
     pub fn as_text(&self) -> Option<&str> {
         match self {
             Value::Text(t) => Some(t),
-            Value::Param(_) => None,
+            Value::Null | Value::Param(_) => None,
         }
     }
 }
@@ -846,7 +851,7 @@ impl Parser {
                 t.line,
                 t.col,
                 format!(
-                    "{} is not supported in Zeno 0.10.0 — one SELECT per statement",
+                    "{} is not supported in Zeno 0.11.0 — one SELECT per statement",
                     t.word_upper()
                 ),
             ),
@@ -914,6 +919,10 @@ impl Parser {
 
     /// A value: string literal, number, `$n`, or a bare word
     /// (`Delhi`, `TRUE` — stored as that text, as before).
+    /// A bare `NULL` (any case) is the SQL NULL literal, not the
+    /// text "NULL" (V0.11, review finding 8): it stores as a real
+    /// NULL and never matches in a comparison. A quoted `'NULL'`
+    /// is still the text "NULL".
     /// `(` starts a subquery, which is not supported. A bare
     /// word followed by `(` is a function call (`upper('x')`,
     /// `now()`) — also not supported, and m1 (V0.7 review) it
@@ -926,7 +935,7 @@ impl Parser {
                     t.line,
                     t.col,
                     format!(
-                        "function call {}(...) is not supported in Zeno 0.10.0 — use a literal value",
+                        "function call {}(...) is not supported in Zeno 0.11.0 — use a literal value",
                         t.word_upper()
                     ),
                 ));
@@ -945,14 +954,19 @@ impl Parser {
                     Ok(v)
                 }
                 TokKind::Ident(s) => {
-                    let v = Value::Text(s.clone());
+                    // Bare NULL is SQL NULL, not the text "NULL".
+                    let v = if s.eq_ignore_ascii_case("null") {
+                        Value::Null
+                    } else {
+                        Value::Text(s.clone())
+                    };
                     self.pos += 1;
                     Ok(v)
                 }
                 TokKind::Punct(p) if p == "(" => Err(ParseError::unsupported(
                     t.line,
                     t.col,
-                    "a parenthesised value is not supported in Zeno 0.10.0 — use a literal value \
+                    "a parenthesised value is not supported in Zeno 0.11.0 — use a literal value \
                      (subqueries are only supported in WHERE, as IN (SELECT ...) or = (SELECT ...))",
                 )),
                 _ => Err(self.err_at(t, "a value")),
@@ -975,7 +989,7 @@ impl Parser {
             "WITH" => Err(ParseError::unsupported(
                 first.line,
                 first.col,
-                "WITH (common table expressions) is not supported in Zeno 0.10.0",
+                "WITH (common table expressions) is not supported in Zeno 0.11.0",
             )),
             other => Err(ParseError::syntax(
                 first.line,
@@ -1015,7 +1029,7 @@ impl Parser {
             return Err(ParseError::unsupported(
                 t.line,
                 t.col,
-                "subqueries in FROM are not supported in Zeno 0.10.0 — query a table directly",
+                "subqueries in FROM are not supported in Zeno 0.11.0 — query a table directly",
             ));
         }
         let table = self.expect_name()?;
@@ -1040,7 +1054,7 @@ impl Parser {
                             t.line,
                             t.col,
                             format!(
-                                "{} JOIN is not supported in Zeno 0.10.0 — use INNER JOIN or LEFT JOIN",
+                                "{} JOIN is not supported in Zeno 0.11.0 — use INNER JOIN or LEFT JOIN",
                                 t.word_upper()
                             ),
                         ));
@@ -1063,7 +1077,7 @@ impl Parser {
                     return Err(ParseError::unsupported(
                         t.line,
                         t.col,
-                        "ON with AND is not supported in Zeno 0.10.0 — only a single \
+                        "ON with AND is not supported in Zeno 0.11.0 — only a single \
                          `table.col = table.col` condition is supported",
                     ));
                 }
@@ -1094,7 +1108,7 @@ impl Parser {
                             t.line,
                             t.col,
                             "GROUP BY with a column position (GROUP BY 1) is not supported \
-                             in Zeno 0.10.0 — name the column",
+                             in Zeno 0.11.0 — name the column",
                         ));
                     }
                 }
@@ -1133,7 +1147,7 @@ impl Parser {
                                 t.line,
                                 t.col,
                                 "ORDER BY with a column position (ORDER BY 1) is not supported \
-                                 in Zeno 0.10.0 — name the column or output alias",
+                                 in Zeno 0.11.0 — name the column or output alias",
                             ));
                         }
                     }
@@ -1239,7 +1253,7 @@ impl Parser {
                     t.line,
                     t.col,
                     format!(
-                        "function call {}(...) is not supported in Zeno 0.10.0 — \
+                        "function call {}(...) is not supported in Zeno 0.11.0 — \
                          only COUNT, SUM, AVG, MIN, MAX exist",
                         t.word_upper()
                     ),
@@ -1294,7 +1308,7 @@ impl Parser {
                     t.line,
                     t.col,
                     format!(
-                        "{} (DISTINCT ...) is not supported in Zeno 0.10.0 — use {} without DISTINCT",
+                        "{} (DISTINCT ...) is not supported in Zeno 0.11.0 — use {} without DISTINCT",
                         func.name().to_ascii_uppercase(),
                         func.name().to_ascii_uppercase()
                     ),
@@ -1376,7 +1390,7 @@ impl Parser {
                 return Err(ParseError::unsupported(
                     t.line,
                     t.col,
-                    "ON conditions must compare two columns in Zeno 0.10.0 — only \
+                    "ON conditions must compare two columns in Zeno 0.11.0 — only \
                      `table.col = table.col` is supported (a literal on either side is not supported)",
                 ));
             }
@@ -1401,7 +1415,7 @@ impl Parser {
                 line,
                 col,
                 message: format!(
-                    "subquery nesting too deep — Zeno 0.10.0 allows at most {MAX_SUBQUERY_DEPTH} \
+                    "subquery nesting too deep — Zeno 0.11.0 allows at most {MAX_SUBQUERY_DEPTH} \
                      levels of nested subqueries"
                 ),
             });
@@ -1488,7 +1502,7 @@ impl Parser {
                 return Err(ParseError::unsupported(
                     t.line,
                     t.col,
-                    "OR in WHERE is not supported in Zeno 0.10.0 — use AND, or run two queries",
+                    "OR in WHERE is not supported in Zeno 0.11.0 — use AND, or run two queries",
                 ));
             }
         }
@@ -1504,7 +1518,7 @@ impl Parser {
                 return Err(ParseError::unsupported(
                     t.line,
                     t.col,
-                    "EXISTS (SELECT ...) is not supported in Zeno 0.10.0 — \
+                    "EXISTS (SELECT ...) is not supported in Zeno 0.11.0 — \
                      use IN (SELECT ...) instead",
                 ));
             }
@@ -1530,7 +1544,7 @@ impl Parser {
                     return Err(ParseError::unsupported(
                         t.line,
                         t.col,
-                        "subqueries are not supported in UPDATE / DELETE in Zeno 0.10.0 — \
+                        "subqueries are not supported in UPDATE / DELETE in Zeno 0.11.0 — \
                          use a literal value",
                     ));
                 }
@@ -1552,7 +1566,7 @@ impl Parser {
                     return Err(ParseError::unsupported(
                         t.line,
                         t.col,
-                        "IN (...) with a list of literal values is not supported in Zeno 0.10.0 — \
+                        "IN (...) with a list of literal values is not supported in Zeno 0.11.0 — \
                          use IN (SELECT ...) instead",
                     ));
                 }
@@ -1598,14 +1612,14 @@ impl Parser {
                         return Err(ParseError::unsupported(
                             op_tok.line,
                             op_tok.col,
-                            "LIKE is not supported in Zeno 0.10.0 — no pattern matching yet (see README)",
+                            "LIKE is not supported in Zeno 0.11.0 — no pattern matching yet (see README)",
                         ));
                     }
                     "IS" => {
                         return Err(ParseError::unsupported(
                             op_tok.line,
                             op_tok.col,
-                            "IS [NOT] NULL is not supported yet in Zeno 0.10.0 — NULLs do exist \
+                            "IS [NOT] NULL is not supported yet in Zeno 0.11.0 — NULLs do exist \
                              in SELECT results (a LEFT JOIN miss, an empty subquery, an aggregate \
                              over no rows); only this syntax is not supported yet (see README)",
                         ));
@@ -1615,7 +1629,7 @@ impl Parser {
                             op_tok.line,
                             op_tok.col,
                             format!(
-                                "{} is not supported in Zeno 0.10.0 — use a plain comparison operator (=, !=, <, >, <=, >=)",
+                                "{} is not supported in Zeno 0.11.0 — use a plain comparison operator (=, !=, <, >, <=, >=)",
                                 op_tok.word_upper()
                             ),
                         ));
@@ -1643,7 +1657,7 @@ impl Parser {
                 return Err(ParseError::unsupported(
                     t.line,
                     t.col,
-                    "subqueries are not supported in UPDATE / DELETE in Zeno 0.10.0 — \
+                    "subqueries are not supported in UPDATE / DELETE in Zeno 0.11.0 — \
                      use a literal value",
                 ));
             }
@@ -1695,7 +1709,7 @@ impl Parser {
                 t.line,
                 t.col,
                 format!(
-                    "{what} with a parameter is not supported in Zeno 0.10.0 — use a literal number"
+                    "{what} with a parameter is not supported in Zeno 0.11.0 — use a literal number"
                 ),
             )),
             _ => Err(ParseError::syntax(
@@ -1731,7 +1745,7 @@ impl Parser {
                 return Err(ParseError::unsupported(
                     t.line,
                     t.col,
-                    "INSERT ... SELECT is not supported in Zeno 0.10.0 — run the SELECT first, then INSERT the values",
+                    "INSERT ... SELECT is not supported in Zeno 0.11.0 — run the SELECT first, then INSERT the values",
                 ));
             }
         }
@@ -1829,7 +1843,7 @@ impl Parser {
                 t.line,
                 t.col,
                 format!(
-                    "only CREATE TABLE is supported in Zeno 0.10.0 (got CREATE '{}')",
+                    "only CREATE TABLE is supported in Zeno 0.11.0 (got CREATE '{}')",
                     t.text()
                 ),
             ));
@@ -1864,7 +1878,7 @@ impl Parser {
                         t.line,
                         t.col,
                         format!(
-                            "table-level constraint {} is not supported in Zeno 0.10.0 — \
+                            "table-level constraint {} is not supported in Zeno 0.11.0 — \
                              put PRIMARY KEY / UNIQUE on a single column instead",
                             t.word_upper()
                         ),
@@ -2069,6 +2083,45 @@ mod tests {
                 assert_eq!(rows[0][0], Value::Text("Sanjay".to_string()));
             }
             other => panic!("expected Insert, got {other:?}"),
+        }
+    }
+
+    /// V0.11 (review finding 8): a bare `NULL` parses as a real
+    /// NULL (`Value::Null`), in any case; a quoted `'NULL'` is
+    /// still the text "NULL". The same holds in WHERE.
+    #[test]
+    fn bare_null_is_a_real_null_and_quoted_null_is_text() {
+        let stmt = parse("INSERT INTO users VALUES (NULL, 'NULL', null, NuLl)");
+        match stmt {
+            Stmt::Insert { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(
+                    rows[0],
+                    vec![
+                        Value::Null,
+                        Value::Text("NULL".to_string()),
+                        Value::Null,
+                        Value::Null,
+                    ]
+                );
+            }
+            other => panic!("expected Insert, got {other:?}"),
+        }
+        let stmt = parse("SELECT * FROM users WHERE city = NULL");
+        match stmt {
+            Stmt::Select { conditions, .. } => {
+                assert_eq!(conditions.len(), 1);
+                assert!(matches!(conditions[0].rhs, CondRhs::Value(Value::Null)));
+            }
+            other => panic!("expected Select, got {other:?}"),
+        }
+        let stmt = parse("UPDATE users SET city = NULL WHERE id = 1");
+        match stmt {
+            Stmt::Update { sets, .. } => {
+                assert_eq!(sets.len(), 1);
+                assert_eq!(sets[0].1, Value::Null);
+            }
+            other => panic!("expected Update, got {other:?}"),
         }
     }
 

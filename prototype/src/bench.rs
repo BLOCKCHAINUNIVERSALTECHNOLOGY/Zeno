@@ -268,7 +268,11 @@ fn measure_once(
     let mut lat = Vec::with_capacity(n);
     let start = Instant::now();
     for i in 0..n {
-        let values = vec![i.to_string(), format!("name{i}"), "Delhi".to_string()];
+        let values = vec![
+            Some(i.to_string()),
+            Some(format!("name{i}")),
+            Some("Delhi".to_string()),
+        ];
         let t = Instant::now();
         tables
             .insert(&mut *engine, &table, values)

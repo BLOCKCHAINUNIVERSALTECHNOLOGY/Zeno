@@ -47,6 +47,92 @@ pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
+/// The SSTable manifest (V0.11, review finding 1): the single
+/// commit point for which SSTable files are LIVE.
+///
+/// File `sst-manifest.json` in the data directory, JSON:
+///   {"live":[3,4]}
+/// meaning only `sst-000003.sst` and `sst-000004.sst` are part of
+/// the database. Written atomically — tmp file + fsync + rename +
+/// directory fsync, exactly like `save_meta` — so a crash leaves
+/// either the old complete manifest or the new complete one, never
+/// a half-written file.
+///
+/// Why this exists: before V0.11, `compact`/`vacuum` wrote the
+/// merged SSTable and then deleted the old files with their errors
+/// discarded (`let _ =`). A crash (or a failed unlink) between the
+/// new file and the deletions left BOTH generations on disk, and
+/// the next open loaded both — a deleted key's old value came back
+/// to life, or an old version shadowed the new one. Now the order
+/// is: (1) write + sync the new SSTable, (2) atomically commit the
+/// manifest naming ONLY the new table, (3) delete the old files,
+/// propagating every error, (4) sync the directory, propagating
+/// the error. A crash before step 2 reopens the OLD generation
+/// (the new file is an orphan, ignored); a crash after step 2
+/// reopens the NEW generation (old files still on disk are
+/// ignored, because they are not in the manifest). Either way the
+/// reopened state is exactly one generation — never a mixture.
+///
+/// A directory with NO manifest is a pre-V0.11 (legacy) database:
+/// every `sst-*.sst` file is live, as before. The first flush /
+/// compaction / vacuum after the upgrade writes a manifest, and
+/// from then on the manifest rules. Orphan SSTable files (not in
+/// the manifest) are ignored on open, never loaded; they waste
+/// disk until a later compaction's delete pass, which is safe
+/// because nothing references them.
+const MANIFEST_FILE: &str = "sst-manifest.json";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SstManifest {
+    live: Vec<u64>,
+}
+
+/// Path of the manifest file inside `dir`.
+pub fn manifest_path(dir: &Path) -> PathBuf {
+    dir.join(MANIFEST_FILE)
+}
+
+/// Read the manifest, if one exists. `Ok(None)` = no manifest
+/// (legacy directory — every SSTable is live). A manifest that
+/// exists but does not parse is an ERROR, not a silent fallback
+/// to "load everything": falling back would resurrect exactly the
+/// deleted data the manifest exists to keep dead.
+pub fn read_manifest(dir: &Path) -> std::io::Result<Option<Vec<u64>>> {
+    let path = manifest_path(dir);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let manifest: SstManifest = serde_json::from_str(&text).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("corrupt SSTable manifest {}: {e}", path.display()),
+        )
+    })?;
+    Ok(Some(manifest.live))
+}
+
+/// Atomically commit a new live set. Errors propagate: the caller
+/// must NOT delete old files (or clear the WAL) until this has
+/// succeeded — this write IS the commit point.
+pub fn write_manifest(dir: &Path, live: &[u64]) -> std::io::Result<()> {
+    let path = manifest_path(dir);
+    let tmp_path = PathBuf::from(format!("{}.tmp", path.display()));
+    let text = serde_json::to_string(&SstManifest {
+        live: live.to_vec(),
+    })
+    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    fs::write(&tmp_path, &text)?;
+    {
+        let f = fs::OpenOptions::new().write(true).open(&tmp_path)?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp_path, &path)?;
+    sync_dir(dir)?;
+    Ok(())
+}
+
 impl SsTable {
     /// Write `entries` (already sorted) to a new SSTable file.
     ///
@@ -199,11 +285,7 @@ mod tests {
     use super::*;
 
     fn tmp_dir(name: &str) -> PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!("zeno-sst-test-{name}"));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        p
+        crate::unique_test_dir(&format!("zeno-sst-test-{name}"))
     }
 
     #[test]

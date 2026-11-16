@@ -1,0 +1,13 @@
+# DRAFT — Zeno Rust toolchain pin (V0.11). This file lives in
+# `prototype/ci/` as a draft: on push to GitHub it moves to the
+# REPO ROOT as `rust-toolchain.toml` (rustup only reads it from
+# the directory you run cargo in, or its parents — a copy inside
+# `prototype/` would not pin the repo root).
+#
+# Pinned to the toolchain this prototype is developed and tested
+# against. `Cargo.toml` separately declares the MSRV
+# (`rust-version = "1.85"`): the code must still build on any
+# Rust >= 1.85, but CI always tests the pinned one.
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]

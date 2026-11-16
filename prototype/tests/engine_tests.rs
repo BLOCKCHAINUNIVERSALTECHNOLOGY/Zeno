@@ -13,8 +13,23 @@ use zeno::txn::decode_chain;
 use zeno::wal::WalRecord;
 
 fn tmp_dir(name: &str) -> PathBuf {
+    // V0.11 (review finding 12): unique per call (process id +
+    // nanoseconds + counter), so two concurrent runs of this test
+    // binary can never delete each other's data directory. The
+    // old fixed path was `remove_dir_all`'d here, which wiped a
+    // parallel run's directory mid-test.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
     let mut p = std::env::temp_dir();
-    p.push(format!("zeno-engine-test-{name}"));
+    p.push(format!(
+        "zeno-engine-test-{name}-{}-{nanos}-{n}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&p);
     std::fs::create_dir_all(&p).unwrap();
     p
@@ -126,21 +141,25 @@ fn table_insert_and_select() {
         .insert(
             &mut e,
             "users",
-            vec!["1".into(), "Sanjay".into(), "Delhi".into()],
+            vec![
+                Some("1".into()),
+                Some("Sanjay".into()),
+                Some("Delhi".into()),
+            ],
         )
         .unwrap();
     tables
         .insert(
             &mut e,
             "users",
-            vec!["2".into(), "Asha".into(), "Mumbai".into()],
+            vec![Some("2".into()), Some("Asha".into()), Some("Mumbai".into())],
         )
         .unwrap();
     tables
         .insert(
             &mut e,
             "users",
-            vec!["3".into(), "Ravi".into(), "Delhi".into()],
+            vec![Some("3".into()), Some("Ravi".into()), Some("Delhi".into())],
         )
         .unwrap();
 
@@ -365,7 +384,7 @@ fn cli_version_exits_zero_and_creates_no_data_dir() {
         );
         assert_eq!(
             String::from_utf8_lossy(&out.stdout).trim(),
-            "zeno 0.10.0",
+            "zeno 0.11.0",
             "{flag} must print exactly the version"
         );
     }
@@ -505,7 +524,11 @@ fn corrupt_tables_json_fails_open_and_quarantines() {
             .create_table("users", vec!["id".into(), "name".into()])
             .unwrap();
         tables
-            .insert(&mut e, "users", vec!["1".into(), "Sanjay".into()])
+            .insert(
+                &mut e,
+                "users",
+                vec![Some("1".into()), Some("Sanjay".into())],
+            )
             .unwrap();
         e.flush().unwrap();
     }
@@ -776,7 +799,11 @@ fn quarantine_second_tables_corruption_keeps_first() {
             .create_table("users", vec!["id".into(), "name".into()])
             .unwrap();
         tables
-            .insert(&mut e, "users", vec!["1".into(), "Sanjay".into()])
+            .insert(
+                &mut e,
+                "users",
+                vec![Some("1".into()), Some("Sanjay".into())],
+            )
             .unwrap();
         e.flush().unwrap();
     }
@@ -1087,7 +1114,11 @@ fn txn_table_update_and_delete_with_rollback() {
         .create_table("users", vec!["id".to_string(), "city".to_string()])
         .unwrap();
     tables
-        .insert(&mut e, "users", vec!["1".to_string(), "Delhi".to_string()])
+        .insert(
+            &mut e,
+            "users",
+            vec![Some("1".to_string()), Some("Delhi".to_string())],
+        )
         .unwrap();
     // Inside a transaction: UPDATE is visible to self, DELETE
     // removes the row for self — nobody else sees either yet.
@@ -1649,7 +1680,7 @@ fn autocommit_update_and_delete_are_single_wal_transactions() {
         .unwrap();
     for (id, city) in [("1", "A"), ("2", "B"), ("3", "C")] {
         tables
-            .insert(&mut e, "u", vec![id.into(), city.into()])
+            .insert(&mut e, "u", vec![Some(id.into()), Some(city.into())])
             .unwrap();
     }
     tables.update(&mut e, "u", "city", "Z", None).unwrap();
@@ -1724,7 +1755,11 @@ fn reserved_key_prefixes_are_rejected_for_raw_puts() {
         .create_table("users", vec!["id".into(), "name".into()])
         .unwrap();
     tables
-        .insert(&mut e, "users", vec!["1".into(), "Sanjay".into()])
+        .insert(
+            &mut e,
+            "users",
+            vec![Some("1".into()), Some("Sanjay".into())],
+        )
         .unwrap();
     assert_eq!(tables.select(&mut e, "users", None).unwrap().len(), 1);
     DocStore::put(&mut e, "profiles", "u1", r#"{"name":"Sanjay"}"#).unwrap();
@@ -1733,5 +1768,184 @@ fn reserved_key_prefixes_are_rejected_for_raw_puts() {
         Some(r#"{"name":"Sanjay"}"#)
     );
     drop(e);
+    cleanup(&dir);
+}
+
+// ---------------------------------------------------------------------
+// V0.11 tests: durable compaction/vacuum commit protocol (review
+// finding 1) and WAL namespace durability (finding 2).
+// ---------------------------------------------------------------------
+
+/// Run the `zeno` CLI binary on `dir` with `args`, plus extra
+/// environment variables (the crash hooks are env-driven).
+fn cli_env(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> std::process::Output {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_zeno"));
+    cmd.arg("--data").arg(dir).args(args);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("run zeno CLI")
+}
+
+fn cli(dir: &Path, args: &[&str]) -> std::process::Output {
+    cli_env(dir, args, &[])
+}
+
+/// How many live SSTable files (`sst-*.sst`) are on disk.
+fn count_sst_files(dir: &Path) -> usize {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .map(|n| n.starts_with("sst-") && n.ends_with(".sst"))
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+/// Seed a directory for the crash-order tests: two live keys and
+/// one deleted key, all flushed into SSTables (two generations),
+/// so a compaction has something to merge and something to drop.
+fn seed_crash_dir(name: &str) -> PathBuf {
+    let dir = tmp_dir(name);
+    {
+        let mut e = Engine::open(&dir).unwrap();
+        e.put("keep1", "v1").unwrap();
+        e.put("keep2", "v2").unwrap();
+        e.put("gone", "v3").unwrap();
+        e.flush().unwrap();
+        e.delete("gone").unwrap();
+        e.flush().unwrap();
+    }
+    dir
+}
+
+fn assert_crash_dir_data(dir: &Path) {
+    let mut e = Engine::open(dir).unwrap();
+    assert_eq!(e.get("keep1"), Some("v1".to_string()));
+    assert_eq!(e.get("keep2"), Some("v2".to_string()));
+    assert_eq!(
+        e.get("gone"),
+        None,
+        "a deleted key must stay deleted after a crash at any stage"
+    );
+}
+
+#[test]
+fn v11_compact_crash_after_new_table_reopens_old_generation() {
+    // Crash after the merged SSTable is written + synced, BEFORE
+    // the manifest commit: the reopened database must be the OLD
+    // generation (the new file is an orphan, ignored), with the
+    // committed rows present and the deleted row still gone
+    // (its tombstone is in the old generation).
+    let dir = seed_crash_dir("v11-crash-new-table");
+    let out = cli_env(&dir, &["compact"], &[("ZENO_CRASH_AFTER_NEW_TABLE", "1")]);
+    assert_eq!(
+        out.status.code(),
+        Some(137),
+        "crash hook must exit 137 (simulated kill -9), stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let live = zeno::sstable::read_manifest(&dir)
+        .unwrap()
+        .expect("a manifest exists after the flushes");
+    assert!(
+        live.len() >= 2,
+        "manifest must still name the old generation, got {live:?}"
+    );
+    assert!(
+        count_sst_files(&dir) > live.len(),
+        "the merged table must be on disk as an orphan (not in the manifest)"
+    );
+    assert_crash_dir_data(&dir);
+    cleanup(&dir);
+}
+
+#[test]
+fn v11_compact_crash_after_manifest_reopens_new_generation() {
+    // Crash after the manifest commit, BEFORE the old files are
+    // deleted: the old files are still on disk, but the manifest
+    // excludes them, so the reopened database must be the NEW
+    // generation only — the deleted key must NOT come back
+    // through the orphaned old files.
+    let dir = seed_crash_dir("v11-crash-manifest");
+    let out = cli_env(&dir, &["compact"], &[("ZENO_CRASH_AFTER_MANIFEST", "1")]);
+    assert_eq!(
+        out.status.code(),
+        Some(137),
+        "crash hook must exit 137 (simulated kill -9), stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let live = zeno::sstable::read_manifest(&dir)
+        .unwrap()
+        .expect("a manifest exists");
+    assert_eq!(
+        live.len(),
+        1,
+        "manifest must name only the merged table after the commit, got {live:?}"
+    );
+    assert!(
+        count_sst_files(&dir) > 1,
+        "old SSTable files must still be on disk after a crash before their deletion"
+    );
+    assert_crash_dir_data(&dir);
+    // A normal compaction now finishes the job: the old files go,
+    // and the data is unchanged.
+    let out = cli(&dir, &["compact"]);
+    assert!(
+        out.status.success(),
+        "a follow-up compact must succeed, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        count_sst_files(&dir),
+        1,
+        "after a clean compact exactly one SSTable must remain"
+    );
+    assert_crash_dir_data(&dir);
+    cleanup(&dir);
+}
+
+#[test]
+fn v11_vacuum_crash_after_manifest_reopens_new_generation() {
+    // Same crash-order proof for VACUUM (the online path the
+    // server runs, not just the CLI compaction).
+    let dir = seed_crash_dir("v11-vacuum-crash");
+    let out = cli_env(&dir, &["vacuum"], &[("ZENO_CRASH_AFTER_MANIFEST", "1")]);
+    assert_eq!(
+        out.status.code(),
+        Some(137),
+        "crash hook must exit 137 (simulated kill -9), stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let live = zeno::sstable::read_manifest(&dir)
+        .unwrap()
+        .expect("a manifest exists");
+    assert_eq!(live.len(), 1, "manifest must name only the vacuumed table");
+    assert_crash_dir_data(&dir);
+    cleanup(&dir);
+}
+
+#[test]
+fn v11_wal_rotation_after_flush_survives_reopen() {
+    // A flush deletes the old WAL and creates a fresh one — a
+    // namespace change (review finding 2). Drop the engine right
+    // after it, without a graceful shutdown, and reopen: every
+    // row written before and after the rotation must be there.
+    let dir = tmp_dir("v11-wal-rotation");
+    {
+        let mut e = Engine::open(&dir).unwrap();
+        e.put("a", "1").unwrap();
+        e.put("b", "2").unwrap();
+        e.flush().unwrap(); // rotates the WAL (clear + recreate)
+        e.put("c", "3").unwrap();
+        // No shutdown_persist: drop like a crash.
+    }
+    let mut e2 = Engine::open(&dir).unwrap();
+    assert_eq!(e2.get("a"), Some("1".to_string()));
+    assert_eq!(e2.get("b"), Some("2".to_string()));
+    assert_eq!(e2.get("c"), Some("3".to_string()));
     cleanup(&dir);
 }

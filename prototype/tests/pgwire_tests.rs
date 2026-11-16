@@ -34,8 +34,23 @@ use rustls::pki_types::pem::PemObject;
 // ---------------------------------------------------------------------
 
 fn tmp_dir(name: &str) -> PathBuf {
+    // V0.11 (review finding 12): unique per call (process id +
+    // nanoseconds + counter), so two concurrent runs of this test
+    // binary can never delete each other's data directory. The
+    // old fixed path was `remove_dir_all`'d here, which wiped a
+    // parallel run's directory mid-test.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
     let mut p = std::env::temp_dir();
-    p.push(format!("zeno-pgwire-test-{name}"));
+    p.push(format!(
+        "zeno-pgwire-test-{name}-{}-{nanos}-{n}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&p);
     std::fs::create_dir_all(&p).unwrap();
     p
@@ -2579,8 +2594,12 @@ fn set_password_on_missing_data_dir_succeeds() {
     // Minor: `user set-password` on a nonexistent data directory
     // used to fail with a cryptic "No such file or directory".
     // It now creates the directory and sets the password.
-    let dir = std::env::temp_dir().join("zeno-pgwire-test-missing-dir/sub/dir");
-    let _ = std::fs::remove_dir_all(std::env::temp_dir().join("zeno-pgwire-test-missing-dir"));
+    let base = std::env::temp_dir().join(format!(
+        "zeno-pgwire-test-missing-dir-{}",
+        std::process::id()
+    ));
+    let dir = base.join("sub/dir");
+    let _ = std::fs::remove_dir_all(&base);
     let bin = env!("CARGO_BIN_EXE_zeno");
     // Password twice on stdin.
     let mut child = Command::new(bin)
@@ -2612,7 +2631,7 @@ fn set_password_on_missing_data_dir_succeeds() {
         dir.join("users.json").exists(),
         "users.json must exist after set-password"
     );
-    let _ = std::fs::remove_dir_all(std::env::temp_dir().join("zeno-pgwire-test-missing-dir"));
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 // ---------------------------------------------------------------------
@@ -6137,4 +6156,240 @@ fn v10_select_list_subquery_extended_protocol() {
     assert_eq!(Client::tag(&msgs).as_deref(), Some("SELECT 4"), "{msgs:?}");
     assert!(Client::error(&msgs).is_none(), "{msgs:?}");
     client.terminate();
+}
+
+// ---------------------------------------------------------------------
+// V0.11 tests: SQL NULL (finding 8), unknown WHERE column (13),
+// slow-drip frame deadline (finding 3).
+// ---------------------------------------------------------------------
+
+#[test]
+fn v11_bare_null_stores_real_null_and_quoted_null_is_text() {
+    let server = Server::start("v11-null");
+    let (mut c, _) = Client::connect(server.port);
+    let msgs = c.query("CREATE TABLE t (id, city)");
+    assert_eq!(
+        Client::tag(&msgs).as_deref(),
+        Some("CREATE TABLE"),
+        "{msgs:?}"
+    );
+    for sql in [
+        "INSERT INTO t VALUES (1, NULL)",
+        "INSERT INTO t VALUES (2, 'NULL')",
+        "INSERT INTO t VALUES (3, NULL)",
+    ] {
+        let msgs = c.query(sql);
+        assert_eq!(
+            Client::tag(&msgs).as_deref(),
+            Some("INSERT 0 1"),
+            "{sql}: {msgs:?}"
+        );
+    }
+    // A bare NULL reads back as a real NULL (DataRow -1); a quoted
+    // 'NULL' reads back as the text "NULL".
+    let msgs = c.query("SELECT id, city FROM t ORDER BY id");
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![
+            vec![Some("1".to_string()), None],
+            vec![Some("2".to_string()), Some("NULL".to_string())],
+            vec![Some("3".to_string()), None],
+        ],
+        "{msgs:?}"
+    );
+    // `SELECT *` reads a stored NULL as NULL too, not as "".
+    let msgs = c.query("SELECT * FROM t ORDER BY id");
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![
+            vec![Some("1".to_string()), None],
+            vec![Some("2".to_string()), Some("NULL".to_string())],
+            vec![Some("3".to_string()), None],
+        ],
+        "{msgs:?}"
+    );
+    // `WHERE city = NULL` never matches (PostgreSQL: the comparison
+    // is NULL, not true) — not even the row that IS null.
+    let msgs = c.query("SELECT id FROM t WHERE city = NULL");
+    assert_eq!(
+        Client::rows(&msgs),
+        Vec::<Vec<Option<String>>>::new(),
+        "{msgs:?}"
+    );
+    // The quoted text still matches by value.
+    let msgs = c.query("SELECT id FROM t WHERE city = 'NULL'");
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![Some("2".to_string())]],
+        "{msgs:?}"
+    );
+    // COUNT(col) skips NULLs; COUNT(*) does not.
+    let msgs = c.query("SELECT COUNT(city), COUNT(*) FROM t");
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![Some("1".to_string()), Some("3".to_string())]],
+        "{msgs:?}"
+    );
+    // UPDATE ... SET city = NULL stores a real NULL too.
+    let msgs = c.query("UPDATE t SET city = NULL WHERE id = 2");
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("UPDATE 1"), "{msgs:?}");
+    let msgs = c.query("SELECT city FROM t WHERE id = 2");
+    assert_eq!(Client::rows(&msgs), vec![vec![None]], "{msgs:?}");
+    // DELETE ... WHERE city = NULL deletes nothing (never matches).
+    let msgs = c.query("DELETE FROM t WHERE city = NULL");
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("DELETE 0"), "{msgs:?}");
+    let msgs = c.query("SELECT COUNT(*) FROM t");
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![Some("3".to_string())]],
+        "{msgs:?}"
+    );
+    c.terminate();
+}
+
+#[test]
+fn v11_unknown_where_column_is_42703() {
+    let server = Server::start("v11-unknown-col");
+    let (mut c, _) = Client::connect(server.port);
+    let msgs = c.query("CREATE TABLE t (id, name)");
+    assert_eq!(
+        Client::tag(&msgs).as_deref(),
+        Some("CREATE TABLE"),
+        "{msgs:?}"
+    );
+    let msgs = c.query("INSERT INTO t VALUES (1, 'Sanjay')");
+    assert_eq!(
+        Client::tag(&msgs).as_deref(),
+        Some("INSERT 0 1"),
+        "{msgs:?}"
+    );
+    // A typo'd WHERE column is 42703, not a silent zero-row result.
+    for sql in [
+        "SELECT * FROM t WHERE emali = 'x'",
+        "SELECT * FROM t WHERE name = 'Sanjay' AND emali = 'x'",
+    ] {
+        let msgs = c.query(sql);
+        assert_eq!(
+            Client::error(&msgs).map(|(code, _)| code).as_deref(),
+            Some("42703"),
+            "{sql}: {msgs:?}"
+        );
+    }
+    // Even over an EMPTY table: the scope is validated before any
+    // row is filtered.
+    let msgs = c.query("CREATE TABLE e (id)");
+    assert_eq!(
+        Client::tag(&msgs).as_deref(),
+        Some("CREATE TABLE"),
+        "{msgs:?}"
+    );
+    let msgs = c.query("SELECT * FROM e WHERE nope = 1");
+    assert_eq!(
+        Client::error(&msgs).map(|(code, _)| code).as_deref(),
+        Some("42703"),
+        "{msgs:?}"
+    );
+    // UPDATE / DELETE with an unknown WHERE column are 42703 too.
+    let msgs = c.query("UPDATE t SET name = 'y' WHERE badcol = 1");
+    assert_eq!(
+        Client::error(&msgs).map(|(code, _)| code).as_deref(),
+        Some("42703"),
+        "{msgs:?}"
+    );
+    let msgs = c.query("DELETE FROM t WHERE badcol = 1");
+    assert_eq!(
+        Client::error(&msgs).map(|(code, _)| code).as_deref(),
+        Some("42703"),
+        "{msgs:?}"
+    );
+    // And the row is still there: nothing was silently deleted.
+    let msgs = c.query("SELECT name FROM t WHERE id = 1");
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![Some("Sanjay".to_string())]],
+        "{msgs:?}"
+    );
+    c.terminate();
+}
+
+#[test]
+fn v11_slow_drip_frame_frees_its_slot() {
+    // A client that dribbles one byte of a Query frame every
+    // 200 ms must NOT hold its connection slot forever: with a
+    // 2 s frame budget the server closes it at most ~2 s after
+    // the frame started, and the only slot (max-connections 1)
+    // frees up for the next client.
+    let dir = tmp_dir("v11-drip");
+    let server = Server::start_with_args_on_dir_env(
+        dir,
+        &["--max-connections", "1"],
+        &[("ZENO_FRAME_TIMEOUT_SECS", "2")],
+    );
+    // The drip connection: a full handshake, then one byte of a
+    // 'Q' frame every 200 ms, forever (or until the server
+    // closes the socket under it).
+    let mut drip = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    drip.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    drip.write_all(&startup_frame("zeno")).unwrap();
+    drip.flush().unwrap();
+    // Read until ReadyForQuery ('Z').
+    {
+        let mut reader = BufReader::new(drip.try_clone().unwrap());
+        loop {
+            let mut tag = [0u8; 1];
+            reader.read_exact(&mut tag).unwrap();
+            let mut len_buf = [0u8; 4];
+            reader.read_exact(&mut len_buf).unwrap();
+            let len = i32::from_be_bytes(len_buf);
+            let mut body = vec![0u8; (len - 4) as usize];
+            reader.read_exact(&mut body).unwrap();
+            if tag[0] == b'Z' {
+                break;
+            }
+        }
+    }
+    let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopped_clone = Arc::clone(&stopped);
+    let drip_thread = std::thread::spawn(move || {
+        // One byte per 200 ms: the tag, then the length bytes,
+        // then body bytes that never arrive in full.
+        let mut frame: Vec<u8> = vec![b'Q'];
+        frame.extend_from_slice(&1000i32.to_be_bytes());
+        frame.extend_from_slice(b"SELECT 1");
+        for byte in frame {
+            if drip.write_all(&[byte]).is_err() {
+                break;
+            }
+            let _ = drip.flush();
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        stopped_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    // The drip holds the only slot: a new connection is refused
+    // (53300) while it is alive.
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !try_connect(server.port),
+        "the drip connection must hold the only slot at first"
+    );
+    // ...but the slot must free up once the frame deadline fires:
+    // a new connection succeeds well inside 15 s (deadline 2 s).
+    let mut freed = false;
+    for _ in 0..75 {
+        if try_connect(server.port) {
+            freed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        freed,
+        "the slow-drip connection's slot must free up after the frame deadline"
+    );
+    // The drip thread must have noticed the close (its writes fail).
+    let _ = drip_thread.join();
+    assert!(
+        stopped.load(std::sync::atomic::Ordering::SeqCst),
+        "the drip thread must end once the server closes the connection"
+    );
 }

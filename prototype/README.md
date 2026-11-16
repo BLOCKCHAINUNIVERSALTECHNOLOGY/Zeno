@@ -1,9 +1,9 @@
-# Zeno — One Engine, All Data (V0.8 prototype)
+# Zeno — One Engine, All Data (V0.9 prototype)
 
 > **Zeno is a hybrid SQL + JSON database in Rust — not ZenoDB (Lantern, Go
 > time-series) and not ZenDB.** The name was chosen knowing those exist.
 
-Zeno V0.8 is a small, working, single-node database prototype. One engine
+Zeno V0.9 is a small, working, single-node database prototype. One engine
 stores three kinds of data: **key-value**, **tables**, and **JSON
 documents**. It is written in Rust using `std` + `serde` +
 `serde_json` + small RustCrypto crates (`sha2`, `hmac`, `pbkdf2`,
@@ -11,12 +11,12 @@ documents**. It is written in Rust using `std` + `serde` +
 `rustls` (TLS 1.2/1.3, `ring` provider) + `rcgen` (self-signed
 certificate generation) for `serve --tls` — and `ctrlc`
 (SIGINT/SIGTERM handling) for the graceful shutdown — no heavy
-dependencies, no external database engine. V0.8 adds
-**PostgreSQL-compatible savepoint portal closing**, a
-**graceful shutdown on SIGINT/SIGTERM**, and a **`zeno bench`
-command with a V1.0 readiness checklist** on top of the V0.7 SQL
-parser, savepoints and background auto-vacuum (see "What is new
-in V0.8").
+dependencies, no external database engine. V0.9 adds **SQL query
+power — INNER / LEFT JOIN, WHERE subqueries (`IN (SELECT ...)` and
+scalar `= (SELECT ...)`), and GROUP BY + aggregates (COUNT, SUM,
+AVG, MIN, MAX) + HAVING** — on top of the V0.8 savepoint portal
+closing, graceful shutdown and `zeno bench` (see "What is new in
+V0.9").
 
 > **⚠️ LOCAL PROTOTYPE ONLY. With no users configured, `zeno serve`
 > accepts EVERY local client with NO password (trust auth) and
@@ -29,6 +29,134 @@ in V0.8").
 > shared machine, and never use it in production. Anyone on the
 > same machine can read and change all your data. See "Password
 > auth (SCRAM-SHA-256)" and "TLS" below.**
+
+## What is new in V0.9
+
+- **JOIN — INNER JOIN and LEFT JOIN.** Two or more tables, one
+  `=` ON condition per JOIN, table aliases (`users u JOIN orders
+  o ON u.id = o.user_id`), qualified columns (`u.id`,
+  `o.amount`), and `SELECT *` over a JOIN expands to every
+  column of every table, base table first. An unqualified column
+  that exists in two tables is 42702 (ambiguous — qualify it);
+  an unknown column is 42703; a missing table is 42P01. A LEFT
+  JOIN pads an unmatched row's columns with real SQL NULLs
+  (sent as DataRow length -1, not as `""`). JOIN works with
+  WHERE / ORDER BY / LIMIT / OFFSET, and with GROUP BY (below).
+  The executor is a **nested-loop join**: correct and simple at
+  this scale, and slow on large inputs — there is no hash join
+  and no index, so a JOIN over two big tables scans both fully.
+  A hash join is V1.0+ work (see `docs/V1-READINESS.md`). No
+  speed claim is made anywhere for JOINs.
+  ```sql
+  SELECT u.name, o.amount FROM users u
+    JOIN orders o ON u.id = o.user_id ORDER BY o.id;
+  SELECT u.name, o.amount FROM users u
+    LEFT JOIN orders o ON u.id = o.user_id ORDER BY u.id;
+  ```
+  (`IS NULL` is still unsupported, so there is no way to ask
+  for "users with no orders" in one query yet — the unmatched
+  row shows up with NULL in the orders columns instead.)
+  A table or alias named twice in one SELECT (the same alias
+  for two tables, or the same table twice with no alias) is
+  **42712** ("table name specified more than once") — before
+  the V0.9 review fix the second table silently overwrote the
+  first table's columns and returned mismatched values. A
+  self-join with two different aliases (`users a JOIN users b`)
+  still works. `SELECT u.*` expands to every column of that
+  table; `SELECT *` still expands to every column of every
+  table in scope.
+- **Subqueries in WHERE.** `IN (SELECT ...)` and `NOT IN
+  (SELECT ...)` over a single-column subquery, and scalar
+  `= (SELECT ...)` (also with `!=`, `<`, `>`, `<=`, `>=`) over
+  a one-row, one-column subquery. A scalar subquery returning
+  no rows is NULL (so the row does not match — it is not an
+  error); returning more than one row is 21000; a subquery
+  returning more than one column is 42601. NULL rules follow
+  PostgreSQL: a NULL value never matches `IN`, and a NULL
+  anywhere in the list makes `NOT IN` false. A subquery reads
+  the same snapshot as its outer query (inside a transaction it
+  sees the BEGIN snapshot plus the transaction's own writes).
+  Each subquery is evaluated **once per statement, not once
+  per outer row** (hoisted before the WHERE loop — a nested
+  `IN` of depth 2 over 200-row tables used to run 30s+ and
+  never finish; it now finishes in well under a second).
+  **Correlated subqueries are not supported** — a subquery
+  cannot reference the outer query's tables (there is no syntax
+  for it; an outer-table reference inside a subquery does not
+  resolve). Scalar subqueries in the SELECT list are not
+  supported either (0A000) — only in WHERE.
+  ```sql
+  SELECT name FROM users WHERE id IN (SELECT user_id FROM orders);
+  SELECT name FROM users WHERE id NOT IN (SELECT user_id FROM orders);
+  SELECT name FROM users WHERE id = (SELECT MAX(user_id) FROM orders);
+  ```
+- **GROUP BY + aggregates + HAVING.** `GROUP BY` one or more
+  columns; aggregates `COUNT(*)`, `COUNT(col)`, `SUM`, `AVG`,
+  `MIN`, `MAX`; `HAVING` on an aggregate (with AND) — with or
+  without `GROUP BY` (`SELECT COUNT(*) FROM orders HAVING
+  COUNT(*) > 1` returns one row); `ORDER BY`
+  on an aggregate or on an output alias. Aggregates without
+  GROUP BY return one row over the whole table — over no rows,
+  `COUNT` is 0 and `SUM`/`AVG`/`MIN`/`MAX` are NULL. `SUM`/`AVG`
+  over a non-numeric value is 22P02 (invalid input syntax for
+  type numeric); a plain column in the SELECT list that is not
+  in GROUP BY is 42803 (PostgreSQL's rule), and an unknown
+  column there (or in HAVING, or in ORDER BY) is 42703 — a
+  HAVING output alias such as `HAVING total > 100` is 42703
+  too, because the alias is no table column. GROUP BY works
+  with JOINs. `SUM` over plain integers is exact (i128
+  arithmetic); `AVG` over plain integers is exact too —
+  integer division plus the remainder as a decimal expansion
+  (e.g. `AVG` of 100 and 250 is `175`, `AVG` of 1 and 2 is
+  `1.5`); when the division does not terminate (1/3) the
+  expansion runs to 16 decimal places, which is an
+  approximation and is not claimed exact. An integer `SUM` /
+  `AVG` whose sum overflows i128 is **22003**, not a silent
+  f64 approximation.
+  ```sql
+  SELECT city, COUNT(*) FROM users GROUP BY city ORDER BY city;
+  SELECT user_id, SUM(amount) AS total FROM orders
+    GROUP BY user_id HAVING SUM(amount) > 100 ORDER BY total DESC;
+  SELECT COUNT(*), SUM(amount) FROM orders;
+  ```
+- **NULLs in query results (new in V0.9).** Stored values are
+  still never NULL, and a bound SQL NULL parameter is still
+  stored as `""` — but a LEFT JOIN miss, an empty scalar
+  subquery and an aggregate over no rows now produce real NULLs
+  in SELECT results, sent as DataRow length -1. Comparisons
+  involving NULL never match (PostgreSQL rule). The
+  `StmtOutcome::Rows` type is now `Vec<Vec<Option<String>>>`
+  and `data_row` writes -1 for `None`.
+- **Executor: `src/query.rs` (new).** The SELECT executor moved
+  out of `pgwire.rs` into its own module: scope resolution
+  (tables + aliases), nested-loop join, WHERE (with subquery
+  execution), GROUP BY + aggregates + HAVING, projection,
+  ORDER BY, LIMIT/OFFSET. Simple Query and the extended
+  protocol share it — a prepared JOIN / GROUP BY query runs
+  through Parse + Describe + Bind + Execute the same way a
+  plain SELECT does (Describe resolves the output columns from
+  the registry, including `*` over a JOIN and aggregate
+  aliases). JOIN/grouped reads inside a transaction use the
+  V0.6 snapshot rules — the tables must have existed at BEGIN,
+  and the scan is the transaction's snapshot plus its own
+  writes. A SELECT takes a **statement-level snapshot** of
+  every table it reads (one scan per table, under the shared
+  lock) and then executes against the snapshot with the lock
+  released, so a long SELECT no longer blocks other
+  connections, and concurrent writes mid-SELECT are not seen
+  by it. There is a **statement timeout** (57014): a SELECT
+  running longer than `ZENO_STATEMENT_TIMEOUT_MS` (default
+  30000 ms; `0` disables it) is cancelled instead of running
+  forever. Subquery nesting is capped at 64 levels (54001) —
+  deeper nesting used to overflow the server's stack and kill
+  the process.
+- **LIMIT is applied last (no LIMIT pushdown).** `LIMIT` /
+  `OFFSET` slice the result after the join, WHERE, grouping
+  and sort — so `LIMIT 5` over a big JOIN still materialises
+  the whole join first, and a big cross product can use a lot
+  of memory before the LIMIT cuts it down. That is a known
+  prototype limit, not a bug.
+- Version is now **0.9.0** (Cargo.toml, CLI, README).
 
 ## What is new in V0.8
 
@@ -860,7 +988,7 @@ Each has a regression test (see "Tests").
   demonstrated and tested (used by `demo.sh` and the lock tests).
 - Version is now **0.2.0** (Cargo.toml, CLI, README).
 
-## What works in V0.7
+## What works in V0.9
 
 - **MVCC transactions (snapshot isolation)** — `BEGIN` /
   `COMMIT` / `ROLLBACK` (+ `START TRANSACTION`, `END`,
@@ -883,7 +1011,9 @@ Each has a regression test (see "Tests").
   PortalSuspended resume). The SQL is parsed by the real V0.7
   parser: multi-condition WHERE (`=`, `!=`, `<`, `>`, `<=`, `>=`),
   ORDER BY / LIMIT / OFFSET, multi-row INSERT, multi-SET UPDATE
-  (see "What is new in V0.7"). **Auth: trust auth (no password)
+  (see "What is new in V0.7") — extended in V0.9 with JOINs,
+  subqueries and GROUP BY / aggregates (see "What is new in
+  V0.9"). **Auth: trust auth (no password)
   while no users are configured, SCRAM-SHA-256 password auth
   once a user exists — local prototype only (see the warning at
   the top and "Password auth" below).**
@@ -955,9 +1085,15 @@ Each has a regression test (see "Tests").
   `tables.json`), `INSERT` rows (single-row, multi-row, or with a
   column list — V0.7), `SELECT` with a multi-condition WHERE,
   ORDER BY / LIMIT / OFFSET (V0.7), `UPDATE` (several SET
-  assignments, V0.7), `DELETE`. Rows are stored as keys
+  assignments, V0.7), `DELETE`. V0.9 adds `INNER` / `LEFT JOIN`
+  (with aliases and qualified columns), `WHERE ... IN (SELECT
+  ...)` / scalar subqueries, and `GROUP BY` + aggregates
+  (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) + `HAVING` (see "What is
+  new in V0.9"). Rows are stored as keys
   `table:<name>:<row-id>`. SELECT is still a linear scan filter
   over the rows (no index) — only the parsing is real SQL now.
+  JOINs are nested-loop (slow on large inputs — see "What is new
+  in V0.9").
   `INSERT` persists the next row id (atomically
   written `tables.json`) before writing the row, so a crash cannot
   reuse an id and overwrite the previous row (worst case: a gap).
@@ -1006,15 +1142,17 @@ Each has a regression test (see "Tests").
   is an account-DoS trade-off (see "SCRAM rate limiting" above):
   anyone who knows a username can lock that user out for 5
   minutes from one IP; a restart clears it.
-- **Bound NULL becomes the empty string.** Zeno has no NULLs: a
-  parameter bound as SQL NULL is stored as `""`, and a missing
-  column reads back as `""` (never NULL) — same as V0.3's
-  DataRow behaviour.
+- **Bound NULL becomes the empty string.** A parameter bound as
+  SQL NULL is still stored as `""`, and a missing column still
+  reads back as `""` — but since V0.9 a SELECT result CAN be
+  NULL (a LEFT JOIN miss, an empty scalar subquery, an
+  aggregate over no rows), and that NULL is sent as a real NULL
+  (DataRow length -1), not as `""` (see "What is new in V0.9").
 - **Extended protocol deviations (documented in "What is new in
   V0.4"):** Execute repeats the RowDescription (PostgreSQL
   sends it only on Describe); Parse checks syntax and parameter
   types only, table/column existence is checked at
-  Bind/Describe/Execute; a bound SQL NULL becomes the empty string (Zeno has no NULLs).
+  Bind/Describe/Execute; a bound SQL NULL becomes the empty string (stored values are still never NULL — only SELECT results can be NULL since V0.9).
 - **No MVCC beyond snapshot isolation.** Transactions are snapshot
   isolation only: no two-phase commit, no DDL inside a
   transaction, no SERIALIZABLE, no READ COMMITTED (see "What is
@@ -1023,21 +1161,41 @@ Each has a regression test (see "Tests").
   explicit `VACUUM` statement (or the `vacuum` / `compact` CLI
   commands when the server is stopped); the committed-transaction
   set is pruned by VACUUM / compaction.
-- **What the parser does not support (V0.7).** The parser is real
-  but small: no `JOIN`, no subqueries, no `GROUP BY` / `HAVING`,
-  no `UNION`, no `OR` in WHERE, no expressions or arithmetic, no
-  table-qualified columns (`t.col`), no aliases, no aggregate or
-  scalar functions (`COUNT(*)`, ...), no `LIKE` / `IS NULL`, no
+- **What the parser does not support (V0.9).** The parser is real
+  but small: no `RIGHT` / `FULL` / `CROSS JOIN`, no subqueries
+  in `FROM`, no `UNION`, no `OR` in WHERE, no expressions or
+  arithmetic, no scalar functions (`UPPER(...)`,
+  `COALESCE(...)`, ...), no `LIKE` / `IS NULL`, no `EXISTS`,
+  no `IN (...)` list of literals (only `IN (SELECT ...)`), no
   `INSERT ... SELECT`, no table-level `PRIMARY KEY (...)`, no
-  `LIMIT $1` (LIMIT/OFFSET need literal numbers). Those fail with 0A000 ("feature not
-  supported"), not with a silent misparse. `VARCHAR(10)` and
-  `SERIAL PRIMARY KEY` in a column definition, a column list in
+  `LIMIT $1` (LIMIT/OFFSET need literal numbers), no scalar
+  subqueries in the SELECT list (only in WHERE), no correlated
+  subqueries (a subquery cannot reference the outer query's
+  tables), no `ON ... AND ...` and no literal in an `ON`
+  condition (only one `table.col = table.col`), no
+  `COUNT(DISTINCT ...)`, no `GROUP BY 1` / `ORDER BY 1`
+  (column positions — name the column). Those fail
+  with 0A000 ("feature not supported"), not with a silent
+  misparse. `JOIN` (INNER / LEFT), `WHERE ... IN (SELECT ...)`
+  and scalar subqueries, `GROUP BY` / `HAVING`, aggregates
+  (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`), table-qualified
+  columns (`u.id`) and aliases (`users u`, `SUM(x) AS total`)
+  all work now (V0.9). `VARCHAR(10)` and `SERIAL PRIMARY KEY`
+  in a column definition, a column list in
   `INSERT INTO t (a, b) VALUES (...)`, `WHERE id > 1`, and
   `ORDER BY` / `LIMIT` all work now (V0.7) — including several
   ORDER BY keys (`ORDER BY a, b DESC`) and LIMIT/OFFSET in either
   order — but a column list in
   INSERT must name every column exactly once (Zeno has no NULLs
   or defaults to fill the rest).
+- **WHERE on an unknown column, one table, silently matches
+  nothing (deliberate, V0.3 behaviour — not changed).** A
+  filter on a column the (single) table does not have filters
+  every row out instead of erroring with 42703; with two or
+  more tables in scope the same filter IS 42703. Inconsistent,
+  kept as-is in V0.9 because changing it risked regressions
+  elsewhere; it is documented here so nobody mistakes the
+  silence for a correct empty result.
 - **No secondary index on documents.** `doc find` scans the whole
   collection linearly.
 - **No multi-node / replication / clustering.** Single node only.
@@ -1054,10 +1212,11 @@ Each has a regression test (see "Tests").
   all fixed in V0.5 (see "What is new in V0.5"). What remains:
   the lockout is in-memory only (restart resets it), the TLS
   cert is self-signed with no channel binding, and there is
-  still no JOIN / subqueries / GROUP BY / aggregates, no 2PC /
-  SERIALIZABLE, and no multi-node support (see the other
-  bullets in this section). The V0.7 parser and savepoints are
-  done (see "What is new in V0.7").
+  still no RIGHT/FULL JOIN, no FROM-subqueries, no UNION, no
+  2PC / SERIALIZABLE, and no multi-node support (see the other
+  bullets in this section). The V0.7 parser, savepoints, and
+  V0.9 JOINs / subqueries / GROUP BY are done (see "What is new
+  in V0.7" and "What is new in V0.9").
 - **Not production-ready.** No independent audit. A Zeno-only
   benchmark exists (`zeno bench`, see "What is new in V0.8")
   but there is still no benchmark against PostgreSQL or
@@ -1252,7 +1411,10 @@ its old data; SAVEPOINT / ROLLBACK TO SAVEPOINT / RELEASE (with a
 3B001 for a released name); and the new parser — multi-row INSERT,
 column-list INSERT, ORDER BY + LIMIT, multi-condition WHERE,
 multi-SET UPDATE, plus a bad SQL failing with 42601 and its line
-and column, and a JOIN failing with 0A000 ("not supported").
+and column — and the V0.9 addition (section 15, fresh data dir):
+users + orders tables, INNER JOIN and LEFT JOIN (with a real
+NULL row), GROUP BY + SUM/COUNT with HAVING, and an IN-subquery
+— with the exact numbers printed.
 
 ## Tests
 
@@ -1262,14 +1424,19 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-- 127 unit tests (the 99 from V0.6, plus 15 V0.7 parser ones —
-  lexer line/column tracking, comments, unterminated string
+- 128 unit tests (the 99 from V0.6, plus 16 parser ones (15
+  from V0.7, plus 1 net new in V0.9: the old "JOIN / GROUP BY /
+  aggregates / subqueries as not supported" test became two —
+  JOIN / LEFT JOIN / GROUP BY / aggregates / IN + NOT IN +
+  scalar subqueries now parse (with aliases, qualified columns,
+  HAVING, ORDER BY on an alias), and RIGHT / FULL / CROSS JOIN,
+  FROM-subqueries, UNION, OR, EXISTS stay 0A000) — lexer
+  line/column tracking, comments, unterminated string
   position, SELECT with multi-condition WHERE + ORDER BY +
   LIMIT + OFFSET, all six comparison operators, INSERT column
   list + multi-row VALUES, multi-SET UPDATE, multi-condition
   DELETE, CREATE TABLE with types and constraints, syntax errors
-  with line/column, JOIN / GROUP BY / aggregates / subqueries /
-  OR as "not supported", LIMIT validation, `$1` surviving as a
+  with line/column, LIMIT validation, `$1` surviving as a
   parameter, multi-column ORDER BY + OFFSET-before-LIMIT, LIKE /
   IS NULL / function call / INSERT ... SELECT / table-level
   PRIMARY KEY as 0A000 — plus 1 auto-vacuum one: the background thread
@@ -1308,7 +1475,7 @@ cargo test
   on lines 3 and 5 instead of 2 and 3 — plus 2 V0.8 review-fix
   ones: `zeno --version` exits 0 and creates no data dir, and an
   unknown command fails without creating a data dir.
-- 85 integration tests in `tests/pgwire_tests.rs` (the 62 from
+- 96 integration tests in `tests/pgwire_tests.rs` (the 62 from
   V0.6, plus 17 V0.7 ones: savepoint rollback keeps earlier
   writes and drops later ones (and the savepoint survives a
   ROLLBACK TO), savepoint release + unknown-name 3B001 +
@@ -1317,7 +1484,8 @@ cargo test
   over the extended protocol, SELECT with ORDER BY / LIMIT /
   OFFSET, multi-condition WHERE with comparisons, multi-row
   INSERT + column list, multi-SET UPDATE, syntax errors with
-  line/column + JOIN/aggregates as 0A000 + typed CREATE TABLE,
+  line/column + RIGHT JOIN as 0A000 + COUNT(*) working + typed
+  CREATE TABLE,
   `--vacuum-interval` / `--no-auto-vacuum` flags start a working
   server — plus 7 review-fix ones: integers above 2^53 compare
   exactly in WHERE and ORDER BY, a suspended portal is re-run
@@ -1335,8 +1503,20 @@ cargo test
   it and keeping the ones created before it, graceful shutdown
   on SIGTERM exiting 0 and keeping data, `zeno bench`
   reporting measured numbers, and duplicate `--rows` rejected
-  with a clear error.
-- 255 tests total, all passing.
+  with a clear error — plus 11 V0.9 ones: INNER JOIN rows with
+  aliases + `*` expansion over a JOIN + JOIN with WHERE/LIMIT +
+  a second JOIN in one query, LEFT JOIN NULL padding + NULL
+  filtering in WHERE, ambiguous column 42702 + RIGHT/FULL JOIN
+  0A000 + missing table 42P01, IN / NOT IN subqueries, scalar
+  subquery (NULL / one row / many rows 21000), FROM-subquery
+  0A000, GROUP BY + all five aggregates + aggregates without
+  GROUP BY + aggregates over no rows + JOIN+GROUP BY, HAVING
+  with AND + ORDER BY on an alias, aggregate errors (SUM over
+  text 22P02, non-grouped column 42803, `SELECT *` with GROUP
+  BY 42803), JOIN + GROUP BY inside a transaction seeing the
+  BEGIN snapshot, and JOIN + GROUP BY over the extended
+  protocol with a `$1` parameter.
+- 267 tests total, all passing.
 
 **How the wire protocol is verified without `psql`:** `psql` is not
 installed in this sandbox, so `tests/pgwire_tests.rs` builds the
@@ -1365,6 +1545,8 @@ src/
   sstable.rs   immutable sorted files, Bloom filter stored alongside
   bloom.rs     Bloom filter, scaled: 16 bits/key, min 1 KiB, 3 hashes
   table.rs     table registry + insert/select/delete over prefixed keys
+  parser.rs    real SQL parser (V0.7): lexer + recursive-descent AST, line/column errors (V0.9: JOIN, subqueries, GROUP BY/aggregates)
+  query.rs     SELECT executor (V0.9): scope resolution, nested-loop JOIN, WHERE subqueries, GROUP BY + aggregates + HAVING
   doc.rs       JSON documents + linear-scan find
 tests/
   engine_tests.rs   integration tests (each in its own temp directory)

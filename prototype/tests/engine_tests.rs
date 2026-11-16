@@ -365,7 +365,7 @@ fn cli_version_exits_zero_and_creates_no_data_dir() {
         );
         assert_eq!(
             String::from_utf8_lossy(&out.stdout).trim(),
-            "zeno 0.8.0",
+            "zeno 0.9.0",
             "{flag} must print exactly the version"
         );
     }

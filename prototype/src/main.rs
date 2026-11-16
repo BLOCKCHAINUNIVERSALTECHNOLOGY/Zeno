@@ -30,11 +30,11 @@ use zeno::doc;
 use zeno::engine::Engine;
 use zeno::table::TableStore;
 
-const VERSION: &str = "0.8.0";
+const VERSION: &str = "0.9.0";
 
 fn usage() -> String {
     format!(
-        "Zeno {VERSION} — One Engine, All Data (V0.8 prototype)\n\
+        "Zeno {VERSION} — One Engine, All Data (V0.9 prototype)\n\
         \n\
         Usage: zeno [--data <dir>] <command> [args]   (default data dir: ./zeno-data)\n\
         \n\

@@ -68,7 +68,7 @@ use crate::auth::LoginRateLimiter;
 use crate::engine::Engine;
 use crate::extended::ExtendedState;
 use crate::parser::{parse_sql, CmpOp, Stmt as ParsedStmt, Value as ParsedValue};
-use crate::table::{compare_values, FilterOp, RowFilter, TableStore};
+use crate::table::{FilterOp, RowFilter, TableStore};
 use crate::tls;
 use crate::txn::CommitError;
 use std::collections::BTreeSet;
@@ -338,7 +338,7 @@ pub fn serve(data_dir: &Path, port: u16, opts: &ServeOptions) -> std::io::Result
     }));
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     println!(
-        "zeno 0.8.0 listening on 127.0.0.1:{} (data dir: {})",
+        "zeno 0.9.0 listening on 127.0.0.1:{} (data dir: {})",
         port,
         data_dir.display()
     );
@@ -1060,14 +1060,20 @@ pub(crate) fn row_description(
 }
 
 /// DataRow: 'D' + Int16 field count, then per field Int32 length
-/// (-1 = NULL) + bytes. Zeno values are never NULL, so -1 never
-/// appears here — a missing column is sent as an empty string.
-pub(crate) fn data_row(writer: &mut impl Write, values: &[String]) -> std::io::Result<()> {
+/// (-1 = NULL) + bytes. V0.9: a value CAN be NULL now (a LEFT
+/// JOIN miss, an empty scalar subquery, an aggregate over no
+/// rows), and it is sent as a real NULL (-1), not as "".
+pub(crate) fn data_row(writer: &mut impl Write, values: &[Option<String>]) -> std::io::Result<()> {
     let mut body = Vec::new();
     put_i16(&mut body, values.len() as i16);
     for v in values {
-        put_i32(&mut body, v.len() as i32);
-        body.extend_from_slice(v.as_bytes());
+        match v {
+            None => put_i32(&mut body, -1),
+            Some(v) => {
+                put_i32(&mut body, v.len() as i32);
+                body.extend_from_slice(v.as_bytes());
+            }
+        }
     }
     write_message(writer, b'D', &body)
 }
@@ -1651,10 +1657,12 @@ pub(crate) fn sql_err(code: &'static str, message: impl Into<String>) -> SqlErro
 /// at once (`write_outcome`); extended Execute may stream it in
 /// slices and end with PortalSuspended instead of CommandComplete.
 pub(crate) enum StmtOutcome {
-    /// SELECT: output columns + all rows (values in column order).
+    /// SELECT: output columns + all rows (values in column
+    /// order; `None` = SQL NULL — V0.9: a LEFT JOIN miss, an
+    /// empty scalar subquery, or an aggregate over no rows).
     Rows {
         columns: Vec<String>,
-        rows: Vec<Vec<String>>,
+        rows: Vec<Vec<Option<String>>>,
     },
     /// CREATE / INSERT / DELETE: the CommandComplete tag.
     Command(String),
@@ -1850,7 +1858,7 @@ pub(crate) fn classify_statement(tokens: &[Token]) -> Result<StmtKind, SqlError>
         "DROP" | "ALTER" | "SET" | "SHOW" | "GRANT" | "REVOKE" | "TRUNCATE" | "COPY"
         | "EXPLAIN" => Err(sql_err(
             "0A000",
-            format!("{first} is not supported in Zeno 0.8.0 (only CREATE TABLE, INSERT, UPDATE, SELECT, DELETE, VACUUM, BEGIN, COMMIT, ROLLBACK, SAVEPOINT, RELEASE SAVEPOINT, ROLLBACK TO SAVEPOINT)"),
+            format!("{first} is not supported in Zeno 0.9.0 (only CREATE TABLE, INSERT, UPDATE, SELECT, DELETE, VACUUM, BEGIN, COMMIT, ROLLBACK, SAVEPOINT, RELEASE SAVEPOINT, ROLLBACK TO SAVEPOINT)"),
         )),
         "" => Ok(StmtKind::Empty),
         other => Err(sql_err(
@@ -2055,7 +2063,7 @@ pub(crate) fn expect_name(tokens: &[Token], i: usize) -> Option<(String, usize)>
 /// exist yet. Outside a transaction every registered table is
 /// visible. (CREATE TABLE inside a transaction is refused with
 /// 0A000, so a transaction can never see its own DDL.)
-fn check_table_visible_in_txn(session: &Session, name: &str) -> Result<(), SqlError> {
+pub(crate) fn check_table_visible_in_txn(session: &Session, name: &str) -> Result<(), SqlError> {
     if let Some(tables) = &session.txn_tables {
         if !tables.contains(name) {
             return Err(sql_err(
@@ -2115,10 +2123,20 @@ fn resolve_value(value: &ParsedValue) -> Result<String, SqlError> {
 }
 
 /// A parsed WHERE (AND-joined conditions) as a `RowFilter` for
-/// the table store.
-fn to_filter(conditions: &[crate::parser::Condition]) -> Result<RowFilter, SqlError> {
+/// the table store. Only literal comparisons reach here — the
+/// parser rejects subqueries in UPDATE / DELETE (0A000), and a
+/// qualified column must name this table (42703 otherwise).
+fn to_filter(table: &str, conditions: &[crate::parser::Condition]) -> Result<RowFilter, SqlError> {
     let mut filter = RowFilter::default();
     for cond in conditions {
+        if let Some(q) = &cond.column.qualifier {
+            if q != table {
+                return Err(sql_err(
+                    "42703",
+                    format!("missing FROM-clause entry for table '{q}'"),
+                ));
+            }
+        }
         let op = match cond.op {
             CmpOp::Eq => FilterOp::Eq,
             CmpOp::Ne => FilterOp::Ne,
@@ -2127,9 +2145,16 @@ fn to_filter(conditions: &[crate::parser::Condition]) -> Result<RowFilter, SqlEr
             CmpOp::Le => FilterOp::Le,
             CmpOp::Ge => FilterOp::Ge,
         };
+        let crate::parser::CondRhs::Value(value) = &cond.rhs else {
+            return Err(sql_err(
+                "0A000",
+                "subqueries are not supported in UPDATE / DELETE in Zeno 0.9.0 — \
+                 use a literal value",
+            ));
+        };
         filter
             .conditions
-            .push((cond.column.clone(), op, resolve_value(&cond.value)?));
+            .push((cond.column.name.clone(), op, resolve_value(value)?));
     }
     Ok(filter)
 }
@@ -2137,7 +2162,7 @@ fn to_filter(conditions: &[crate::parser::Condition]) -> Result<RowFilter, SqlEr
 /// Map a table-store error to its SQLSTATE: "no such table" is
 /// 42P01, an unknown column is 42703, anything else is 42601
 /// (a count mismatch or a registry error).
-fn table_err(e: String) -> SqlError {
+pub(crate) fn table_err(e: String) -> SqlError {
     if e.contains("no such table") {
         sql_err("42P01", e)
     } else if e.contains("does not exist") {
@@ -2164,7 +2189,7 @@ fn exec_create_ast(
     if session.txn.is_some() {
         return Err(sql_err(
             "0A000",
-            "CREATE TABLE is not supported inside a transaction in Zeno 0.8.0 \
+            "CREATE TABLE is not supported inside a transaction in Zeno 0.9.0 \
              (DDL is not versioned — run it outside a transaction, after COMMIT or ROLLBACK)",
         ));
     }
@@ -2312,62 +2337,35 @@ pub(crate) struct SelectPlan {
 /// resolve its output columns. The WHERE column is NOT checked
 /// against the registry here — matching the V0.3 behaviour, a
 /// filter on an unknown column simply matches no rows.
+/// (V0.9: the output columns come from `query::output_columns`,
+/// which also resolves JOINs, aliases and aggregates — a
+/// `SELECT *` over a JOIN expands to every column of every
+/// table in scope.)
 pub(crate) fn parse_select(
     shared: &Arc<Mutex<Shared>>,
     tokens: &[Token],
 ) -> Result<SelectPlan, SqlError> {
     let sql = tokens_to_sql(tokens);
     let parsed = parse_sql(&sql).map_err(|e| sql_err(e.code, e.to_sql_message()))?;
-    let ParsedStmt::Select { columns, table, .. } = parsed else {
+    let ParsedStmt::Select { .. } = parsed else {
         return Err(sql_err("42601", "expected SELECT"));
     };
     let guard = recover_lock(shared);
-    let all_columns = guard
-        .tables
-        .columns(&table)
-        .ok_or_else(|| sql_err("42P01", format!("no such table '{table}'")))?
-        .to_vec();
-    // Resolve the output columns; '*' = all columns, registry order.
-    let out_columns: Vec<String> = match &columns {
-        None => all_columns.clone(),
-        Some(want) => {
-            for col in want {
-                if !all_columns.iter().any(|c| c == col) {
-                    return Err(sql_err(
-                        "42703",
-                        format!("column '{col}' does not exist in table '{table}'"),
-                    ));
-                }
-            }
-            want.clone()
-        }
-    };
-    Ok(SelectPlan {
-        columns: out_columns,
-    })
+    let columns = crate::query::output_columns(&guard.tables, &parsed)?;
+    Ok(SelectPlan { columns })
 }
 
-/// SELECT * | col1, col2 FROM name [WHERE ...] [ORDER BY col
-/// [ASC|DESC]] [LIMIT n] [OFFSET m] (V0.7 — see `parser.rs`).
-/// Inside a transaction this reads the transaction's BEGIN
-/// snapshot (plus its own writes) — never newer commits.
-/// ORDER BY sorts on the column's value (numbers numerically,
-/// everything else lexicographically — the same comparison the
-/// WHERE `<`/`>` use); LIMIT/OFFSET slice after sorting.
+/// SELECT in V0.9 (see `query.rs` for the executor): JOINs,
+/// subqueries, GROUP BY + aggregates, ORDER BY / LIMIT /
+/// OFFSET. Inside a transaction this reads the transaction's
+/// BEGIN snapshot (plus its own writes) — never newer commits
+/// — including the JOINed tables and any subquery.
 fn exec_select_ast(
     shared: &Arc<Mutex<Shared>>,
     parsed: &ParsedStmt,
     session: &mut Session,
 ) -> Result<StmtOutcome, SqlError> {
-    let ParsedStmt::Select {
-        columns,
-        table,
-        conditions,
-        order_by,
-        limit,
-        offset,
-    } = parsed
-    else {
+    let ParsedStmt::Select { .. } = parsed else {
         // `execute_parsed` only calls this for a SELECT — this
         // arm is unreachable, but returning an error beats
         // panicking if the dispatch ever changes.
@@ -2376,92 +2374,21 @@ fn exec_select_ast(
             "internal error: exec_select_ast called with a non-SELECT statement",
         ));
     };
-    let filter = to_filter(conditions)?;
-    // Resolve the output columns against the registry first, so
-    // a missing table is 42P01 and an unknown column is 42703
-    // before anything is read.
-    let (out_columns, all_columns) = {
-        let guard = recover_lock(shared);
-        let all = guard
-            .tables
-            .columns(table)
-            .ok_or_else(|| sql_err("42P01", format!("no such table '{table}'")))?
-            .to_vec();
-        let out = match columns {
-            None => all.clone(),
-            Some(want) => {
-                for col in want {
-                    if !all.iter().any(|c| c == col) {
-                        return Err(sql_err(
-                            "42703",
-                            format!("column '{col}' does not exist in table '{table}'"),
-                        ));
-                    }
-                }
-                want.clone()
-            }
-        };
-        (out, all)
-    };
-    for (col, _) in order_by {
-        if !all_columns.iter().any(|c| c == col) {
-            return Err(sql_err(
-                "42703",
-                format!("column '{col}' does not exist in table '{table}'"),
-            ));
-        }
-    }
-    // m1: the table must have existed at this transaction's
-    // BEGIN (the registry check above only looks at the live one).
-    check_table_visible_in_txn(session, table)?;
+    // B2 (V0.9 review): a SELECT used to hold the shared lock
+    // for its whole run, so one slow query blocked every other
+    // connection. Now only the snapshot is taken under the lock
+    // (one scan per table, fast); the join / WHERE / grouping
+    // runs against the snapshot with the lock released, under a
+    // statement timeout (see `query::statement_deadline`).
     // Poison recovery (V0.5): a thread that panicked while holding
     // this lock must not wedge the server — see `recover_lock`.
-    let mut guard = recover_lock(shared);
-    let Shared { engine, tables, .. } = &mut *guard;
-    let mut rows = match session.txn {
-        Some(txn) => tables
-            .select_txn_filtered(engine, txn, table, Some(&filter))
-            .map_err(table_err)?,
-        None => tables
-            .select_filtered(engine, table, Some(&filter))
-            .map_err(table_err)?,
+    let snapshot = {
+        let mut guard = recover_lock(shared);
+        let Shared { engine, tables, .. } = &mut *guard;
+        crate::query::collect_snapshot(engine, tables, session, parsed)?
     };
-    if !order_by.is_empty() {
-        rows.sort_by(|(_, a), (_, b)| {
-            // M5: several ORDER BY keys — the first key whose
-            // values differ decides; later keys break ties.
-            for (col, asc) in order_by {
-                let ord = compare_values(
-                    a.get(col).map(String::as_str).unwrap_or(""),
-                    b.get(col).map(String::as_str).unwrap_or(""),
-                );
-                if ord != std::cmp::Ordering::Equal {
-                    return if *asc { ord } else { ord.reverse() };
-                }
-            }
-            std::cmp::Ordering::Equal
-        });
-    }
-    let offset = (*offset).unwrap_or(0) as usize;
-    let limit = (*limit).map(|n| n as usize);
-    let rows: Vec<_> = rows
-        .into_iter()
-        .skip(offset)
-        .take(limit.unwrap_or(usize::MAX))
-        .collect();
-    let out_rows: Vec<Vec<String>> = rows
-        .iter()
-        .map(|(_, row)| {
-            out_columns
-                .iter()
-                .map(|c| row.get(c).cloned().unwrap_or_default())
-                .collect()
-        })
-        .collect();
-    Ok(StmtOutcome::Rows {
-        columns: out_columns,
-        rows: out_rows,
-    })
+    let (columns, rows) = crate::query::execute_select_snapshot(&snapshot, parsed)?;
+    Ok(StmtOutcome::Rows { columns, rows })
 }
 
 /// DELETE FROM name [WHERE ...] — without WHERE, all rows go.
@@ -2472,7 +2399,7 @@ fn exec_delete_ast(
     conditions: &[crate::parser::Condition],
     session: &mut Session,
 ) -> Result<StmtOutcome, SqlError> {
-    let filter = to_filter(conditions)?;
+    let filter = to_filter(name, conditions)?;
     check_table_visible_in_txn(session, name)?;
     // Poison recovery (V0.5): a thread that panicked while holding
     // this lock must not wedge the server — see `recover_lock`.
@@ -2502,7 +2429,7 @@ fn exec_update_ast(
     conditions: &[crate::parser::Condition],
     session: &mut Session,
 ) -> Result<StmtOutcome, SqlError> {
-    let filter = to_filter(conditions)?;
+    let filter = to_filter(name, conditions)?;
     let mut resolved_sets: Vec<(String, String)> = Vec::with_capacity(sets.len());
     for (col, value) in sets {
         resolved_sets.push((col.clone(), resolve_value(value)?));
@@ -2555,7 +2482,7 @@ fn exec_begin(
         return Err(sql_err(
             "25001",
             "already in a transaction — COMMIT or ROLLBACK first \
-             (Zeno 0.8.0 has no nested transactions)",
+             (Zeno 0.9.0 has no nested transactions)",
         ));
     }
     // Poison recovery (V0.5): see `recover_lock`.
@@ -2801,7 +2728,7 @@ fn exec_vacuum(
     session: &mut Session,
 ) -> Result<StmtOutcome, SqlError> {
     if tokens.len() != 1 {
-        return Err(sql_err("42601", "VACUUM takes no arguments in Zeno 0.8.0"));
+        return Err(sql_err("42601", "VACUUM takes no arguments in Zeno 0.9.0"));
     }
     if session.txn.is_some() {
         return Err(sql_err(

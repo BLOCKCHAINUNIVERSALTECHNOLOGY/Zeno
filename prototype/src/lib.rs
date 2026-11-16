@@ -12,6 +12,7 @@ pub mod memtable;
 pub mod parser;
 pub mod pgwire;
 pub mod quarantine;
+pub mod query;
 pub mod sstable;
 pub mod table;
 pub mod tls;

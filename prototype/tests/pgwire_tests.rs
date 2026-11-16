@@ -71,11 +71,26 @@ impl Server {
         Self::start_with_args_on_dir(dir, extra)
     }
 
+    /// Start with environment variables for the server child
+    /// only (see `start_with_args_on_dir_env`).
+    fn start_with_env(name: &str, envs: &[(&str, &str)]) -> Server {
+        let dir = tmp_dir(name);
+        Self::start_with_args_on_dir_env(dir, &[], envs)
+    }
+
     /// Like `start_with_args`, but on an already-prepared directory
     /// (the TLS test generates its certificate there first — the
     /// `tmp_dir` helper wipes the directory, so the cert must be
     /// made AFTER the wipe and BEFORE the server starts).
     fn start_with_args_on_dir(dir: PathBuf, extra: &[&str]) -> Server {
+        Self::start_with_args_on_dir_env(dir, extra, &[])
+    }
+
+    /// Like `start_with_args_on_dir`, plus environment variables
+    /// for the server child only (e.g. `ZENO_STATEMENT_TIMEOUT_MS`
+    /// for the statement-timeout test — set on the child, never
+    /// on the test process, so parallel tests are unaffected).
+    fn start_with_args_on_dir_env(dir: PathBuf, extra: &[&str], envs: &[(&str, &str)]) -> Server {
         let bin = env!("CARGO_BIN_EXE_zeno");
         // `free_port` binds :0 and releases it, so two tests starting
         // at the same moment can be handed the SAME port — and the
@@ -94,6 +109,7 @@ impl Server {
             argv.extend(extra.iter().map(|s| s.to_string()));
             let mut child = Command::new(bin)
                 .args(&argv)
+                .envs(envs.iter().copied())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
@@ -4418,15 +4434,23 @@ fn parser_syntax_errors_carry_line_and_column() {
         message.contains("line 3, column"),
         "multi-line syntax error must point at line 3: {message}"
     );
-    // JOIN is a clean "not supported" (0A000), not a syntax error.
+    // JOIN over a missing table is 42P01 (JOIN itself works
+    // since V0.9 — the table is what is missing here).
     let msgs = client.query("SELECT * FROM users JOIN other ON users.id = other.id");
-    let (code, message) = Client::error(&msgs).expect("JOIN must error");
+    let (code, _) = Client::error(&msgs).expect("JOIN over a missing table must error");
+    assert_eq!(code, "42P01", "{msgs:?}");
+    // RIGHT JOIN is still \"not supported\" (0A000).
+    let msgs = client.query("SELECT * FROM users RIGHT JOIN users u2 ON users.id = u2.id");
+    let (code, message) = Client::error(&msgs).expect("RIGHT JOIN must error");
     assert_eq!(code, "0A000", "{msgs:?}");
-    assert!(message.contains("JOIN"), "{message}");
-    // Aggregates are "not supported" too.
+    assert!(message.contains("RIGHT JOIN"), "{message}");
+    // Aggregates work since V0.9: COUNT(*) over the 4 seeded rows.
     let msgs = client.query("SELECT COUNT(*) FROM users");
-    let (code, _) = Client::error(&msgs).expect("COUNT(*) must error");
-    assert_eq!(code, "0A000", "{msgs:?}");
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![Some("4".to_string())]],
+        "{msgs:?}"
+    );
     // A missing comma in CREATE TABLE is still a syntax error.
     let msgs = client.query("CREATE TABLE broken (id name)");
     let (code, _) = Client::error(&msgs).expect("bad CREATE TABLE must error");
@@ -4459,4 +4483,995 @@ fn serve_accepts_vacuum_interval_and_no_auto_vacuum_flags() {
         assert_eq!(Client::rows(&client.query("SELECT * FROM t")).len(), 1);
         client.terminate();
     }
+}
+
+// ---------------------------------------------------------------------
+// V0.9 — JOIN, subqueries, GROUP BY + aggregates.
+// ---------------------------------------------------------------------
+
+/// users (4 rows) + orders (5 rows). User 4 (Meera) has no
+/// orders — the LEFT JOIN case. Amounts: user 1 = 100+250,
+/// user 2 = 50, user 3 = 300+150 (total 850).
+fn seed_users_orders(client: &mut Client) {
+    client.query("CREATE TABLE users (id, name, city)");
+    client.query("INSERT INTO users VALUES (1, 'Sanjay', 'Delhi')");
+    client.query("INSERT INTO users VALUES (2, 'Asha', 'Mumbai')");
+    client.query("INSERT INTO users VALUES (3, 'Ravi', 'Delhi')");
+    client.query("INSERT INTO users VALUES (4, 'Meera', 'Pune')");
+    client.query("CREATE TABLE orders (id, user_id, amount)");
+    client.query("INSERT INTO orders VALUES (1, 1, 100)");
+    client.query("INSERT INTO orders VALUES (2, 1, 250)");
+    client.query("INSERT INTO orders VALUES (3, 2, 50)");
+    client.query("INSERT INTO orders VALUES (4, 3, 300)");
+    client.query("INSERT INTO orders VALUES (5, 3, 150)");
+}
+
+fn s(v: &str) -> Option<String> {
+    Some(v.to_string())
+}
+
+#[test]
+fn v09_inner_join_returns_matching_rows() {
+    let server = Server::start("v09-inner-join");
+    let (mut client, _) = Client::connect(server.port);
+    seed_users_orders(&mut client);
+
+    // Aliases + qualified columns + ORDER BY on the joined table.
+    let msgs = client.query(
+        "SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id ORDER BY o.id",
+    );
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![
+            vec![s("Sanjay"), s("100")],
+            vec![s("Sanjay"), s("250")],
+            vec![s("Asha"), s("50")],
+            vec![s("Ravi"), s("300")],
+            vec![s("Ravi"), s("150")],
+        ],
+        "{msgs:?}"
+    );
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("SELECT 5"), "{msgs:?}");
+
+    // `*` over a JOIN expands to every column of both tables,
+    // base table first; Meera (no orders) is absent.
+    let msgs = client.query("SELECT * FROM users u JOIN orders o ON u.id = o.user_id");
+    assert!(
+        msgs.iter().any(|m| matches!(
+            m,
+            Msg::RowDescription(cols, _)
+                if cols == &["id", "name", "city", "id", "user_id", "amount"]
+        )),
+        "RowDescription must list both tables' columns: {msgs:?}"
+    );
+    assert_eq!(Client::rows(&msgs).len(), 5, "{msgs:?}");
+
+    // JOIN + WHERE + LIMIT: only the big orders, first two.
+    let msgs = client.query(
+        "SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id \
+         WHERE o.amount > 200 ORDER BY o.amount LIMIT 2",
+    );
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![s("Sanjay"), s("250")], vec![s("Ravi"), s("300")]],
+        "{msgs:?}"
+    );
+
+    // INNER JOIN spelled out, and a second JOIN in one query.
+    client.query("CREATE TABLE cities (city, state)");
+    client.query("INSERT INTO cities VALUES ('Delhi', 'DL')");
+    client.query("INSERT INTO cities VALUES ('Mumbai', 'MH')");
+    client.query("INSERT INTO cities VALUES ('Pune', 'MH')");
+    let msgs = client.query(
+        "SELECT u.name, c.state FROM users u INNER JOIN orders o ON u.id = o.user_id \
+         JOIN cities c ON u.city = c.city WHERE o.amount = 50",
+    );
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![s("Asha"), s("MH")]],
+        "{msgs:?}"
+    );
+    client.terminate();
+}
+
+#[test]
+fn v09_left_join_pads_missing_rows_with_null() {
+    let server = Server::start("v09-left-join");
+    let (mut client, _) = Client::connect(server.port);
+    seed_users_orders(&mut client);
+
+    let msgs = client.query(
+        "SELECT u.id, u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id \
+         ORDER BY u.id, o.id",
+    );
+    let rows = Client::rows(&msgs);
+    assert_eq!(rows.len(), 6, "5 orders + Meera's NULL row: {msgs:?}");
+    // Meera's row: the orders columns are real NULLs, not "".
+    assert_eq!(
+        rows[5],
+        vec![s("4"), s("Meera"), None],
+        "unmatched LEFT JOIN side must be NULL: {msgs:?}"
+    );
+
+    // A WHERE on the right table's column filters the NULL row
+    // out (NULL > 200 is not true) — PostgreSQL behaviour.
+    let msgs = client.query(
+        "SELECT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id \
+         WHERE o.amount > 200 ORDER BY u.name",
+    );
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![s("Ravi")], vec![s("Sanjay")]],
+        "{msgs:?}"
+    );
+    client.terminate();
+}
+
+#[test]
+fn v09_ambiguous_column_is_42702_and_right_join_is_0a000() {
+    let server = Server::start("v09-join-errors");
+    let (mut client, _) = Client::connect(server.port);
+    seed_users_orders(&mut client);
+
+    // `id` exists in both tables: ambiguous.
+    let msgs = client.query("SELECT id FROM users u JOIN orders o ON u.id = o.user_id");
+    let (code, message) = Client::error(&msgs).expect("ambiguous column must error");
+    assert_eq!(code, "42702", "{msgs:?}");
+    assert!(message.contains("ambiguous"), "{message}");
+
+    // An unknown column in a JOIN is 42703.
+    let msgs = client.query("SELECT nope FROM users u JOIN orders o ON u.id = o.user_id");
+    let (code, _) = Client::error(&msgs).expect("unknown column must error");
+    assert_eq!(code, "42703", "{msgs:?}");
+
+    // RIGHT JOIN is still not supported.
+    let msgs = client.query("SELECT * FROM users u RIGHT JOIN orders o ON u.id = o.user_id");
+    let (code, message) = Client::error(&msgs).expect("RIGHT JOIN must error");
+    assert_eq!(code, "0A000", "{msgs:?}");
+    assert!(message.contains("RIGHT JOIN"), "{message}");
+
+    // FULL JOIN too.
+    let msgs = client.query("SELECT * FROM users u FULL JOIN orders o ON u.id = o.user_id");
+    let (code, _) = Client::error(&msgs).expect("FULL JOIN must error");
+    assert_eq!(code, "0A000", "{msgs:?}");
+
+    // A JOIN over a missing table is 42P01.
+    let msgs = client.query("SELECT * FROM users u JOIN missing m ON u.id = m.id");
+    let (code, _) = Client::error(&msgs).expect("missing table must error");
+    assert_eq!(code, "42P01", "{msgs:?}");
+    client.terminate();
+}
+
+#[test]
+fn v09_in_subquery_and_not_in() {
+    let server = Server::start("v09-in-subquery");
+    let (mut client, _) = Client::connect(server.port);
+    seed_users_orders(&mut client);
+
+    // Users who have at least one order (Meera excluded).
+    let msgs =
+        client.query("SELECT name FROM users WHERE id IN (SELECT user_id FROM orders) ORDER BY id");
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![s("Sanjay")], vec![s("Asha")], vec![s("Ravi")]],
+        "{msgs:?}"
+    );
+
+    // NOT IN: only Meera.
+    let msgs = client.query("SELECT name FROM users WHERE id NOT IN (SELECT user_id FROM orders)");
+    assert_eq!(Client::rows(&msgs), vec![vec![s("Meera")]], "{msgs:?}");
+
+    // The subquery itself can have a WHERE.
+    let msgs = client.query(
+        "SELECT name FROM users WHERE id IN (SELECT user_id FROM orders WHERE amount > 200) \
+         ORDER BY id",
+    );
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![s("Sanjay")], vec![s("Ravi")]],
+        "{msgs:?}"
+    );
+
+    // IN over a text column.
+    let msgs =
+        client.query("SELECT name FROM users WHERE city IN (SELECT city FROM users WHERE id = 2)");
+    assert_eq!(Client::rows(&msgs), vec![vec![s("Asha")]], "{msgs:?}");
+    client.terminate();
+}
+
+#[test]
+fn v09_scalar_subquery_null_one_and_many_rows() {
+    let server = Server::start("v09-scalar-subquery");
+    let (mut client, _) = Client::connect(server.port);
+    seed_users_orders(&mut client);
+
+    // One row, one column: MAX(user_id) = 3 -> Ravi.
+    let msgs = client.query("SELECT name FROM users WHERE id = (SELECT MAX(user_id) FROM orders)");
+    assert_eq!(Client::rows(&msgs), vec![vec![s("Ravi")]], "{msgs:?}");
+
+    // No rows -> NULL -> no match (SELECT 0, not an error).
+    let msgs = client.query(
+        "SELECT name FROM users WHERE id = (SELECT user_id FROM orders WHERE amount > 1000)",
+    );
+    assert_eq!(Client::rows(&msgs).len(), 0, "{msgs:?}");
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("SELECT 0"), "{msgs:?}");
+
+    // Many rows -> 21000.
+    let msgs = client.query("SELECT name FROM users WHERE id = (SELECT user_id FROM orders)");
+    let (code, message) = Client::error(&msgs).expect("multi-row scalar must error");
+    assert_eq!(code, "21000", "{msgs:?}");
+    assert!(message.contains("more than one row"), "{message}");
+
+    // A scalar subquery with another operator works too.
+    let msgs = client
+        .query("SELECT name FROM users WHERE id > (SELECT MIN(user_id) FROM orders) ORDER BY id");
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![s("Asha")], vec![s("Ravi")], vec![s("Meera")]],
+        "{msgs:?}"
+    );
+    client.terminate();
+}
+
+#[test]
+fn v09_from_subquery_is_0a000() {
+    let server = Server::start("v09-from-subquery");
+    let (mut client, _) = Client::connect(server.port);
+    seed_users_orders(&mut client);
+
+    let msgs = client.query("SELECT * FROM (SELECT id FROM users) AS x");
+    let (code, message) = Client::error(&msgs).expect("FROM-subquery must error");
+    assert_eq!(code, "0A000", "{msgs:?}");
+    assert!(message.to_lowercase().contains("subquer"), "{message}");
+    client.terminate();
+}
+
+#[test]
+fn v09_group_by_aggregates() {
+    let server = Server::start("v09-group-by");
+    let (mut client, _) = Client::connect(server.port);
+    seed_users_orders(&mut client);
+
+    // COUNT(*) per city.
+    let msgs = client.query("SELECT city, COUNT(*) FROM users GROUP BY city ORDER BY city");
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![
+            vec![s("Delhi"), s("2")],
+            vec![s("Mumbai"), s("1")],
+            vec![s("Pune"), s("1")],
+        ],
+        "{msgs:?}"
+    );
+
+    // All five aggregates per user.
+    let msgs = client.query(
+        "SELECT user_id, SUM(amount), COUNT(*), AVG(amount), MIN(amount), MAX(amount) \
+         FROM orders GROUP BY user_id ORDER BY user_id",
+    );
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![
+            vec![s("1"), s("350"), s("2"), s("175"), s("100"), s("250")],
+            vec![s("2"), s("50"), s("1"), s("50"), s("50"), s("50")],
+            vec![s("3"), s("450"), s("2"), s("225"), s("150"), s("300")],
+        ],
+        "{msgs:?}"
+    );
+
+    // Aggregates without GROUP BY: one row over the whole table.
+    let msgs = client.query("SELECT COUNT(*), SUM(amount), AVG(amount) FROM orders");
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![s("5"), s("850"), s("170")]],
+        "{msgs:?}"
+    );
+    let msgs = client.query("SELECT MIN(amount), MAX(amount) FROM orders");
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![s("50"), s("300")]],
+        "{msgs:?}"
+    );
+
+    // Aggregates over no rows: COUNT is 0, SUM is NULL.
+    let msgs = client.query("SELECT COUNT(*), SUM(amount) FROM orders WHERE amount > 10000");
+    assert_eq!(Client::rows(&msgs), vec![vec![s("0"), None]], "{msgs:?}");
+
+    // GROUP BY with no matching rows returns no rows at all.
+    let msgs = client.query("SELECT city, COUNT(*) FROM users WHERE id > 100 GROUP BY city");
+    assert_eq!(Client::rows(&msgs).len(), 0, "{msgs:?}");
+
+    // A plain GROUP BY column with no aggregate is fine.
+    let msgs = client.query("SELECT city FROM users GROUP BY city ORDER BY city");
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![s("Delhi")], vec![s("Mumbai")], vec![s("Pune")]],
+        "{msgs:?}"
+    );
+
+    // JOIN + GROUP BY: total orders per city.
+    let msgs = client.query(
+        "SELECT u.city, COUNT(*), SUM(o.amount) FROM users u JOIN orders o ON u.id = o.user_id \
+         GROUP BY u.city ORDER BY u.city",
+    );
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![
+            vec![s("Delhi"), s("4"), s("800")],
+            vec![s("Mumbai"), s("1"), s("50")],
+        ],
+        "{msgs:?}"
+    );
+    client.terminate();
+}
+
+#[test]
+fn v09_having_filters_groups_and_order_by_alias() {
+    let server = Server::start("v09-having");
+    let (mut client, _) = Client::connect(server.port);
+    seed_users_orders(&mut client);
+
+    // HAVING on an aggregate, ORDER BY on the alias.
+    let msgs = client.query(
+        "SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id \
+         HAVING SUM(amount) > 100 ORDER BY total DESC",
+    );
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![s("3"), s("450")], vec![s("1"), s("350")]],
+        "{msgs:?}"
+    );
+
+    // HAVING with AND: big total AND more than one order.
+    let msgs = client.query(
+        "SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id \
+         HAVING SUM(amount) > 100 AND COUNT(*) > 1 ORDER BY user_id",
+    );
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![s("1"), s("350")], vec![s("3"), s("450")]],
+        "{msgs:?}"
+    );
+
+    // HAVING that keeps exactly one group.
+    let msgs =
+        client.query("SELECT user_id, COUNT(*) FROM orders GROUP BY user_id HAVING COUNT(*) = 1");
+    assert_eq!(Client::rows(&msgs), vec![vec![s("2"), s("1")]], "{msgs:?}");
+
+    // HAVING that keeps no group: SELECT 0.
+    let msgs = client.query(
+        "SELECT user_id, SUM(amount) FROM orders GROUP BY user_id HAVING SUM(amount) > 10000",
+    );
+    assert_eq!(Client::rows(&msgs).len(), 0, "{msgs:?}");
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("SELECT 0"), "{msgs:?}");
+    client.terminate();
+}
+
+#[test]
+fn v09_aggregate_errors() {
+    let server = Server::start("v09-agg-errors");
+    let (mut client, _) = Client::connect(server.port);
+    seed_users_orders(&mut client);
+
+    // SUM over a text column: not a number.
+    let msgs = client.query("SELECT SUM(city) FROM users");
+    let (code, _) = Client::error(&msgs).expect("SUM(text) must error");
+    assert_eq!(code, "22P02", "{msgs:?}");
+
+    // AVG over a text column: same.
+    let msgs = client.query("SELECT AVG(name) FROM users");
+    let (code, _) = Client::error(&msgs).expect("AVG(text) must error");
+    assert_eq!(code, "22P02", "{msgs:?}");
+
+    // A plain column next to an aggregate, not in GROUP BY: 42803.
+    let msgs = client.query("SELECT name, COUNT(*) FROM users");
+    let (code, message) = Client::error(&msgs).expect("non-grouped column must error");
+    assert_eq!(code, "42803", "{msgs:?}");
+    assert!(message.contains("GROUP BY"), "{message}");
+
+    // Same with a GROUP BY that does not include the column.
+    let msgs = client.query("SELECT name, COUNT(*) FROM users GROUP BY city");
+    let (code, _) = Client::error(&msgs).expect("non-grouped column must error");
+    assert_eq!(code, "42803", "{msgs:?}");
+
+    // SELECT * with GROUP BY: 42803.
+    let msgs = client.query("SELECT * FROM users GROUP BY city");
+    let (code, _) = Client::error(&msgs).expect("SELECT * with GROUP BY must error");
+    assert_eq!(code, "42803", "{msgs:?}");
+    client.terminate();
+}
+
+#[test]
+fn v09_join_and_group_by_inside_transaction_see_snapshot() {
+    let server = Server::start("v09-txn-join");
+    let (mut a, _) = Client::connect(server.port);
+    let (mut b, _) = Client::connect(server.port);
+    seed_users_orders(&mut a);
+
+    // A BEGINs and inserts an order B must not see yet — not in
+    // a JOIN, not in a GROUP BY, not in a subquery.
+    a.query("BEGIN");
+    a.query("INSERT INTO orders VALUES (6, 1, 500)");
+    let msgs = b.query(
+        "SELECT u.name, SUM(o.amount) AS total FROM users u JOIN orders o ON u.id = o.user_id \
+         WHERE u.id = 1 GROUP BY u.name",
+    );
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![s("Sanjay"), s("350")]],
+        "B must see the pre-BEGIN total: {msgs:?}"
+    );
+    let msgs = b.query(
+        "SELECT name FROM users WHERE id IN (SELECT user_id FROM orders WHERE amount = 500)",
+    );
+    assert_eq!(Client::rows(&msgs).len(), 0, "{msgs:?}");
+    // A sees its own uncommitted row.
+    let msgs = a.query(
+        "SELECT u.name, SUM(o.amount) AS total FROM users u JOIN orders o ON u.id = o.user_id \
+         WHERE u.id = 1 GROUP BY u.name",
+    );
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![s("Sanjay"), s("850")]],
+        "{msgs:?}"
+    );
+    a.query("COMMIT");
+    // After COMMIT, B sees it too.
+    let msgs = b.query(
+        "SELECT u.name, SUM(o.amount) AS total FROM users u JOIN orders o ON u.id = o.user_id \
+         WHERE u.id = 1 GROUP BY u.name",
+    );
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![s("Sanjay"), s("850")]],
+        "{msgs:?}"
+    );
+    a.terminate();
+    b.terminate();
+}
+
+#[test]
+fn v09_join_group_by_over_extended_protocol() {
+    let server = Server::start("v09-extended");
+    let (mut client, _) = Client::connect(server.port);
+    seed_users_orders(&mut client);
+
+    // Parse + Describe(statement) + Bind($1) + Describe(portal)
+    // + Execute + Sync, all in one flush — the JOIN + GROUP BY
+    // query runs through the extended protocol, with a parameter.
+    let sql = "SELECT u.name, SUM(o.amount) AS total FROM users u JOIN orders o \
+               ON u.id = o.user_id WHERE o.amount > $1 GROUP BY u.name ORDER BY total DESC";
+    let msgs = client.extended(&[
+        parse_frame("", sql, &[]),
+        describe_frame(b'S', ""),
+        bind_frame("", "", &[], &[text_param("100")], &[]),
+        describe_frame(b'P', ""),
+        execute_frame("", 0),
+        sync_frame(),
+    ]);
+    assert!(
+        msgs.iter().any(|m| matches!(
+            m,
+            Msg::RowDescription(cols, _) if cols == &["name".to_string(), "total".to_string()]
+        )),
+        "Describe must name name, total: {msgs:?}"
+    );
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![s("Ravi"), s("450")], vec![s("Sanjay"), s("250")]],
+        "only orders over 100 count (Asha's 50 and Sanjay's 100 drop out): {msgs:?}"
+    );
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("SELECT 2"), "{msgs:?}");
+    assert!(Client::error(&msgs).is_none(), "{msgs:?}");
+
+    // A prepared IN-subquery works through the extended protocol too.
+    let msgs = client.extended(&[
+        parse_frame("in_q", "SELECT name FROM users WHERE id IN (SELECT user_id FROM orders WHERE amount > $1) ORDER BY id", &[]),
+        bind_frame("", "in_q", &[], &[text_param("200")], &[]),
+        execute_frame("", 0),
+        sync_frame(),
+    ]);
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![s("Sanjay")], vec![s("Ravi")]],
+        "{msgs:?}"
+    );
+    client.terminate();
+}
+
+// ---------------------------------------------------------------------
+// V0.9 review fixes (B1/B2/B3, M1–M5) — regression tests.
+// ---------------------------------------------------------------------
+
+/// Create `table (id)` and fill it with ids 1..=n in ONE
+/// multi-row INSERT (fast to seed, and it exercises multi-row
+/// VALUES too).
+fn seed_numbered(client: &mut Client, table: &str, n: usize) {
+    client.query(&format!("CREATE TABLE {table} (id)"));
+    let values: Vec<String> = (1..=n).map(|i| format!("({i})")).collect();
+    client.query(&format!("INSERT INTO {table} VALUES {}", values.join(",")));
+}
+
+fn err_code(msgs: &[Msg]) -> (String, String) {
+    Client::error(msgs).expect("expected an error response")
+}
+
+#[test]
+fn v09fix_duplicate_alias_is_42712_and_self_join_still_works() {
+    let server = Server::start("v09fix-dup-alias");
+    let (mut client, _) = Client::connect(server.port);
+    seed_users_orders(&mut client);
+
+    // B1 probe 1: the same alias twice — was 20 mismatched rows.
+    let msgs =
+        client.query("SELECT a.id, a.name FROM users a JOIN orders a ON a.id = a.id ORDER BY a.id");
+    let (code, message) = err_code(&msgs);
+    assert_eq!(code, "42712", "{msgs:?}");
+    assert!(message.contains("specified more than once"), "{message}");
+
+    // B1 probe 2: the same table twice with no alias at all.
+    let msgs = client.query("SELECT users.name FROM users JOIN users ON users.id = users.id");
+    let (code, _) = err_code(&msgs);
+    assert_eq!(code, "42712", "{msgs:?}");
+
+    // A self-join with DISTINCT aliases still works.
+    let msgs = client
+        .query("SELECT a.name, b.name FROM users a JOIN users b ON a.id = b.id ORDER BY a.id");
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![
+            vec![s("Sanjay"), s("Sanjay")],
+            vec![s("Asha"), s("Asha")],
+            vec![s("Ravi"), s("Ravi")],
+            vec![s("Meera"), s("Meera")],
+        ],
+        "{msgs:?}"
+    );
+
+    // Base table and JOINed table sharing a name (no alias).
+    let msgs = client.query("SELECT * FROM users JOIN orders ON users.id = orders.user_id");
+    assert_eq!(Client::rows(&msgs).len(), 5, "{msgs:?}");
+    client.terminate();
+}
+
+#[test]
+fn v09fix_having_without_group_by() {
+    let server = Server::start("v09fix-having-no-group");
+    let (mut client, _) = Client::connect(server.port);
+    seed_users_orders(&mut client);
+
+    // M1 probe: valid PostgreSQL, was 42601.
+    let msgs = client.query("SELECT COUNT(*) FROM orders HAVING COUNT(*) > 1");
+    assert_eq!(Client::rows(&msgs), vec![vec![s("5")]], "{msgs:?}");
+
+    // HAVING that filters the single group out: zero rows.
+    let msgs = client.query("SELECT COUNT(*) FROM orders HAVING COUNT(*) > 100");
+    assert_eq!(Client::rows(&msgs).len(), 0, "{msgs:?}");
+
+    // HAVING on a column-less aggregate over an empty table.
+    client.query("CREATE TABLE empty_t (id, v)");
+    let msgs = client.query("SELECT COUNT(*) FROM empty_t HAVING COUNT(*) > 1");
+    assert_eq!(Client::rows(&msgs).len(), 0, "{msgs:?}");
+    let msgs = client.query("SELECT COUNT(*) FROM empty_t HAVING COUNT(*) > -1");
+    assert_eq!(Client::rows(&msgs), vec![vec![s("0")]], "{msgs:?}");
+
+    // GROUP BY + HAVING still works (regression guard).
+    let msgs = client.query(
+        "SELECT user_id, COUNT(*) FROM orders GROUP BY user_id HAVING COUNT(*) > 1 ORDER BY user_id",
+    );
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![s("1"), s("2")], vec![s("3"), s("2")]],
+        "{msgs:?}"
+    );
+    client.terminate();
+}
+
+#[test]
+fn v09fix_aggregate_error_codes() {
+    let server = Server::start("v09fix-agg-codes");
+    let (mut client, _) = Client::connect(server.port);
+    seed_users_orders(&mut client);
+
+    // M2a: ORDER BY on a real but non-grouped column is 42803,
+    // not 42703 — the column exists, it is just not grouped.
+    let msgs = client.query("SELECT city, COUNT(*) FROM users GROUP BY city ORDER BY name");
+    let (code, message) = err_code(&msgs);
+    assert_eq!(code, "42803", "{msgs:?}");
+    assert!(message.contains("must appear in the GROUP BY"), "{message}");
+
+    // M2b: an UNKNOWN column in the SELECT list is 42703, not 42803.
+    let msgs = client.query("SELECT nope, COUNT(*) FROM users");
+    let (code, _) = err_code(&msgs);
+    assert_eq!(code, "42703", "{msgs:?}");
+
+    // M2b: an UNKNOWN column in HAVING is 42703 too.
+    let msgs = client.query("SELECT city, COUNT(*) FROM users GROUP BY city HAVING nope > 1");
+    let (code, _) = err_code(&msgs);
+    assert_eq!(code, "42703", "{msgs:?}");
+
+    // Minor 6: a HAVING alias is 42703 (PostgreSQL: the alias
+    // is no table column), not 42803.
+    let msgs = client.query(
+        "SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id HAVING total > 100",
+    );
+    let (code, _) = err_code(&msgs);
+    assert_eq!(code, "42703", "{msgs:?}");
+
+    // A non-grouped column that DOES exist in HAVING is 42803.
+    let msgs = client.query("SELECT city, COUNT(*) FROM users GROUP BY city HAVING name > 'A'");
+    let (code, _) = err_code(&msgs);
+    assert_eq!(code, "42803", "{msgs:?}");
+
+    // Unknown ORDER BY column is 42703.
+    let msgs = client.query("SELECT city, COUNT(*) FROM users GROUP BY city ORDER BY nope");
+    let (code, _) = err_code(&msgs);
+    assert_eq!(code, "42703", "{msgs:?}");
+
+    // Minor 2: an unknown GROUP BY column errors even when the
+    // filtered set is empty (it used to pass silently).
+    client.query("CREATE TABLE empty_t (id, x)");
+    let msgs = client.query("SELECT x, COUNT(*) FROM empty_t GROUP BY nope");
+    let (code, _) = err_code(&msgs);
+    assert_eq!(code, "42703", "{msgs:?}");
+    client.terminate();
+}
+
+#[test]
+fn v09fix_unsupported_constructs_are_0a000() {
+    let server = Server::start("v09fix-0a000");
+    let (mut client, _) = Client::connect(server.port);
+    seed_users_orders(&mut client);
+
+    // M2c: IN with a literal list, and LIMIT $1.
+    for sql in [
+        "SELECT * FROM users WHERE id IN (1, 2)",
+        "SELECT * FROM users WHERE id NOT IN (1, 2)",
+        "SELECT * FROM users LIMIT $1",
+        "SELECT * FROM users OFFSET $1",
+    ] {
+        let msgs = client.query(sql);
+        let (code, message) = err_code(&msgs);
+        assert_eq!(code, "0A000", "{sql}: {msgs:?}");
+        assert!(!message.is_empty(), "{sql}");
+    }
+
+    // M2e: a scalar subquery in the SELECT list.
+    let msgs = client.query("SELECT (SELECT MAX(id) FROM orders) FROM users");
+    let (code, message) = err_code(&msgs);
+    assert_eq!(code, "0A000", "{msgs:?}");
+    assert!(message.contains("SELECT list"), "{message}");
+
+    // M2f: ON with AND, ON with a literal, COUNT(DISTINCT),
+    // GROUP BY 1, ORDER BY 1.
+    for (sql, needle) in [
+        (
+            "SELECT * FROM users u JOIN orders o ON u.id = o.user_id AND u.city = o.user_id",
+            "AND",
+        ),
+        (
+            "SELECT * FROM users u JOIN orders o ON u.id = 1",
+            "ON conditions",
+        ),
+        ("SELECT COUNT(DISTINCT city) FROM users", "DISTINCT"),
+        ("SELECT city, COUNT(*) FROM users GROUP BY 1", "GROUP BY"),
+        ("SELECT * FROM users ORDER BY 1", "ORDER BY"),
+    ] {
+        let msgs = client.query(sql);
+        let (code, message) = err_code(&msgs);
+        assert_eq!(code, "0A000", "{sql}: {msgs:?}");
+        assert!(message.contains(needle), "{sql}: {message}");
+    }
+
+    // M3: IS NULL no longer claims Zeno has no NULLs.
+    let msgs = client.query("SELECT * FROM users WHERE id IS NULL");
+    let (code, message) = err_code(&msgs);
+    assert_eq!(code, "0A000", "{msgs:?}");
+    assert!(message.contains("NULLs do exist"), "{message}");
+    assert!(!message.contains("has no NULLs"), "{message}");
+    client.terminate();
+}
+
+#[test]
+fn v09fix_qualified_star_expands() {
+    let server = Server::start("v09fix-qstar");
+    let (mut client, _) = Client::connect(server.port);
+    seed_users_orders(&mut client);
+
+    // M2d probe: was 42601 "expected a name".
+    let msgs = client.query("SELECT u.* FROM users u ORDER BY u.id");
+    assert!(
+        msgs.iter().any(|m| matches!(
+            m,
+            Msg::RowDescription(cols, _)
+                if cols == &["id".to_string(), "name".to_string(), "city".to_string()]
+        )),
+        "RowDescription must list the users columns: {msgs:?}"
+    );
+    assert_eq!(Client::rows(&msgs).len(), 4, "{msgs:?}");
+    assert_eq!(
+        Client::rows(&msgs)[0],
+        vec![s("1"), s("Sanjay"), s("Delhi")],
+        "{msgs:?}"
+    );
+
+    // Mixed with a plain column from the other table.
+    let msgs = client
+        .query("SELECT u.*, o.amount FROM users u JOIN orders o ON u.id = o.user_id ORDER BY o.id");
+    assert!(
+        msgs.iter().any(|m| matches!(
+            m,
+            Msg::RowDescription(cols, _)
+                if cols == &["id".to_string(), "name".to_string(), "city".to_string(), "amount".to_string()]
+        )),
+        "RowDescription must list u.* + amount: {msgs:?}"
+    );
+    assert_eq!(Client::rows(&msgs).len(), 5, "{msgs:?}");
+
+    // Unknown qualifier is 42703.
+    let msgs = client.query("SELECT z.* FROM users u");
+    let (code, _) = err_code(&msgs);
+    assert_eq!(code, "42703", "{msgs:?}");
+
+    // A qualified star with GROUP BY is 42803, like SELECT *.
+    let msgs = client.query("SELECT u.*, COUNT(*) FROM users u GROUP BY u.id");
+    let (code, _) = err_code(&msgs);
+    assert_eq!(code, "42803", "{msgs:?}");
+    client.terminate();
+}
+
+#[test]
+fn v09fix_avg_exact_and_sum_overflow() {
+    let server = Server::start("v09fix-avg-exact");
+    let (mut client, _) = Client::connect(server.port);
+
+    // M4 probe: AVG(9007199254740993, 9007199254740993) was
+    // 9007199254740992 (one less, via f64).
+    client.query("CREATE TABLE big (id, v)");
+    client.query("INSERT INTO big VALUES (1, 9007199254740993)");
+    client.query("INSERT INTO big VALUES (2, 9007199254740993)");
+    let msgs = client.query("SELECT AVG(v) FROM big");
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![s("9007199254740993")]],
+        "{msgs:?}"
+    );
+    let msgs = client.query("SELECT SUM(v) FROM big");
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![s("18014398509481986")]],
+        "{msgs:?}"
+    );
+
+    // AVG that does not divide evenly: exact decimal expansion.
+    client.query("CREATE TABLE thirds (id, v)");
+    client.query("INSERT INTO thirds VALUES (1, 0), (2, 0), (3, 1)");
+    let msgs = client.query("SELECT AVG(v) FROM thirds");
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![s("0.3333333333333333")]],
+        "{msgs:?}"
+    );
+    client.query("CREATE TABLE halves (id, v)");
+    client.query("INSERT INTO halves VALUES (1, 1), (2, 2)");
+    let msgs = client.query("SELECT AVG(v) FROM halves");
+    assert_eq!(Client::rows(&msgs), vec![vec![s("1.5")]], "{msgs:?}");
+
+    // M4: SUM of two i128::MAX values no longer silently
+    // prints a wrong f64 approximation — it is 22003.
+    client.query("CREATE TABLE huge (id, v)");
+    client.query(
+        "INSERT INTO huge VALUES (1, 170141183460469231731687303715884105727), \
+         (2, 170141183460469231731687303715884105727)",
+    );
+    let msgs = client.query("SELECT SUM(v) FROM huge");
+    let (code, message) = err_code(&msgs);
+    assert_eq!(code, "22003", "{msgs:?}");
+    assert!(message.contains("overflow"), "{message}");
+    let msgs = client.query("SELECT AVG(v) FROM huge");
+    let (code, _) = err_code(&msgs);
+    assert_eq!(code, "22003", "{msgs:?}");
+
+    // One i128::MAX alone still sums exactly.
+    client.query("CREATE TABLE one_huge (id, v)");
+    client.query("INSERT INTO one_huge VALUES (1, 170141183460469231731687303715884105727)");
+    let msgs = client.query("SELECT SUM(v) FROM one_huge");
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![s("170141183460469231731687303715884105727")]],
+        "{msgs:?}"
+    );
+    client.terminate();
+}
+
+#[test]
+fn v09fix_nested_in_subquery_finishes_fast() {
+    let server = Server::start("v09fix-nested-in");
+    let (mut client, _) = Client::connect(server.port);
+    seed_numbered(&mut client, "t1", 200);
+    seed_numbered(&mut client, "t2", 200);
+    seed_numbered(&mut client, "t3", 200);
+
+    // B2 probe: nested IN depth 2 over 200-row tables used to
+    // run 30s+ (the inner subquery re-ran per outer row). With
+    // hoisting each level runs once.
+    let start = std::time::Instant::now();
+    let msgs = client.query(
+        "SELECT COUNT(*) FROM t1 WHERE id IN \
+         (SELECT id FROM t2 WHERE id IN (SELECT id FROM t3))",
+    );
+    let elapsed = start.elapsed();
+    assert_eq!(Client::rows(&msgs), vec![vec![s("200")]], "{msgs:?}");
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "nested IN depth 2 took {elapsed:?} — hoisting did not work"
+    );
+
+    // Nested scalar subquery, same shape.
+    let msgs = client.query(
+        "SELECT COUNT(*) FROM t1 WHERE id = \
+         (SELECT MAX(id) FROM t2 WHERE id IN (SELECT id FROM t3))",
+    );
+    assert_eq!(Client::rows(&msgs), vec![vec![s("1")]], "{msgs:?}");
+    client.terminate();
+}
+
+#[test]
+fn v09fix_second_connection_not_blocked_by_slow_select() {
+    let server = Server::start("v09fix-not-blocked");
+    let (mut client, _) = Client::connect(server.port);
+    seed_numbered(&mut client, "x", 500);
+    seed_numbered(&mut client, "y", 500);
+    let port = server.port;
+    client.terminate();
+
+    // A deliberately slow SELECT on one connection: a 500x500
+    // cross product (ON is always true), counted. It runs in a
+    // thread with its own connection.
+    let slow = std::thread::spawn(move || {
+        let (mut c, _) = Client::connect(port);
+        let start = std::time::Instant::now();
+        let msgs = c.query("SELECT COUNT(*) FROM x a JOIN y b ON a.id = a.id");
+        let elapsed = start.elapsed();
+        let rows = Client::rows(&msgs);
+        c.terminate();
+        (rows, elapsed)
+    });
+    // Give the slow query time to start, then a trivial SELECT
+    // on a second connection must answer promptly — before the
+    // fix it waited out the whole slow query behind the global
+    // lock (5s client read timeout).
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let (mut client2, _) = Client::connect(port);
+    let start = std::time::Instant::now();
+    let msgs = client2.query("SELECT COUNT(*) FROM x");
+    let elapsed2 = start.elapsed();
+    assert_eq!(Client::rows(&msgs), vec![vec![s("500")]], "{msgs:?}");
+    assert!(
+        elapsed2 < std::time::Duration::from_secs(5),
+        "second connection blocked {elapsed2:?} by the slow SELECT"
+    );
+    client2.terminate();
+
+    let (rows, elapsed) = slow.join().expect("slow query thread");
+    assert_eq!(rows, vec![vec![s("250000")]], "cross product count");
+    eprintln!("slow cross-product SELECT took {elapsed:?}; second connection took {elapsed2:?}");
+}
+
+#[test]
+fn v09fix_deep_subquery_nesting_is_54001_and_server_survives() {
+    let server = Server::start("v09fix-deep-nesting");
+    let (mut client, _) = Client::connect(server.port);
+    seed_users_orders(&mut client);
+
+    // Build `SELECT id FROM users WHERE id = (SELECT id FROM
+    // users WHERE id = ... (SELECT id FROM users LIMIT 1)...)`
+    // with `depth` nested scalar subqueries.
+    fn nested(depth: usize) -> String {
+        let mut sql = "SELECT id FROM users WHERE id = ".to_string();
+        for _ in 0..depth {
+            sql.push_str("(SELECT id FROM users WHERE id = ");
+        }
+        sql.push_str("(SELECT id FROM users LIMIT 1)");
+        for _ in 0..depth {
+            sql.push(')');
+        }
+        sql
+    }
+
+    // 40 deep is under the limit (64) and works.
+    let msgs = client.query(&nested(40));
+    assert_eq!(Client::rows(&msgs), vec![vec![s("1")]], "{msgs:?}");
+
+    // B3 probe: 1000 deep used to kill the server process
+    // (stack overflow). Now it is a 54001 error and the server
+    // stays alive for the next query.
+    let msgs = client.query(&nested(1000));
+    let (code, message) = err_code(&msgs);
+    assert_eq!(code, "54001", "{msgs:?}");
+    assert!(message.contains("too deep"), "{message}");
+
+    let msgs = client.query("SELECT COUNT(*) FROM users");
+    assert_eq!(Client::rows(&msgs), vec![vec![s("4")]], "{msgs:?}");
+    client.terminate();
+}
+
+#[test]
+fn v09fix_minor_coverage_null_in_not_in_group_by_null_order_by_agg() {
+    let server = Server::start("v09fix-minor-coverage");
+    let (mut client, _) = Client::connect(server.port);
+    seed_users_orders(&mut client);
+
+    // NOT IN with a NULL in the list is false for every row
+    // (PostgreSQL rule): Meera's LEFT JOIN miss makes the
+    // subquery list contain NULL.
+    let msgs = client.query(
+        "SELECT name FROM users WHERE id NOT IN \
+         (SELECT o.user_id FROM users u LEFT JOIN orders o ON u.id = o.user_id)",
+    );
+    assert_eq!(Client::rows(&msgs).len(), 0, "{msgs:?}");
+    // IN with the same list: the NULL never matches, the real
+    // ids do.
+    let msgs = client.query(
+        "SELECT name FROM users WHERE id IN \
+         (SELECT o.user_id FROM users u LEFT JOIN orders o ON u.id = o.user_id) ORDER BY id",
+    );
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![s("Sanjay")], vec![s("Asha")], vec![s("Ravi")]],
+        "{msgs:?}"
+    );
+
+    // GROUP BY over a NULL key: the NULLs form one group, and
+    // NULL sorts last under ASC.
+    let msgs = client.query(
+        "SELECT o.user_id, COUNT(*) FROM users u LEFT JOIN orders o ON u.id = o.user_id \
+         GROUP BY o.user_id ORDER BY o.user_id",
+    );
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![
+            vec![s("1"), s("2")],
+            vec![s("2"), s("1")],
+            vec![s("3"), s("2")],
+            vec![None, s("1")],
+        ],
+        "{msgs:?}"
+    );
+
+    // ORDER BY on an aggregate that is NOT in the SELECT list.
+    let msgs = client.query("SELECT city FROM users GROUP BY city ORDER BY COUNT(*) DESC");
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![s("Delhi")], vec![s("Mumbai")], vec![s("Pune")]],
+        "{msgs:?}"
+    );
+    client.terminate();
+}
+
+#[test]
+fn v09fix_statement_timeout_cancels_slow_query() {
+    // B2 backstop: with a 500 ms statement timeout, the same
+    // 500x500 cross product that takes seconds is cancelled
+    // with 57014 — and the server stays alive afterwards.
+    let server = Server::start_with_env(
+        "v09fix-stmt-timeout",
+        &[("ZENO_STATEMENT_TIMEOUT_MS", "500")],
+    );
+    let (mut client, _) = Client::connect(server.port);
+    seed_numbered(&mut client, "x", 500);
+    seed_numbered(&mut client, "y", 500);
+
+    let start = std::time::Instant::now();
+    let msgs = client.query("SELECT COUNT(*) FROM x a JOIN y b ON a.id = a.id");
+    let elapsed = start.elapsed();
+    let (code, message) = err_code(&msgs);
+    assert_eq!(code, "57014", "{msgs:?}");
+    assert!(message.contains("statement timeout"), "{message}");
+    eprintln!("timed-out cross-product query took {elapsed:?}");
+
+    // The server (and the connection) survive the cancellation.
+    let msgs = client.query("SELECT COUNT(*) FROM x");
+    assert_eq!(Client::rows(&msgs), vec![vec![s("500")]], "{msgs:?}");
+    client.terminate();
 }

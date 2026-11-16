@@ -126,7 +126,8 @@ struct PreparedStatement {
 #[derive(Debug, Clone)]
 struct CachedRows {
     columns: Vec<String>,
-    rows: Vec<Vec<String>>,
+    /// `None` = SQL NULL (V0.9: LEFT JOIN misses and the like).
+    rows: Vec<Vec<Option<String>>>,
     /// B2 (V0.7 review): the session `cache_epoch` this cache
     /// was computed under. A successful ROLLBACK TO SAVEPOINT
     /// bumps the session epoch (it rewound the transaction's

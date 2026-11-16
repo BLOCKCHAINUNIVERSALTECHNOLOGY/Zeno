@@ -46,12 +46,16 @@
 #      reads its old data); SAVEPOINT / ROLLBACK TO SAVEPOINT /
 #      RELEASE; and the new parser: multi-row INSERT, ORDER BY /
 #      LIMIT, multi-condition WHERE, multi-SET UPDATE, plus a bad
-#      SQL line/column error and a JOIN "not supported" error.
+#      SQL line/column error and a RIGHT JOIN "not supported" error.
 #  14. GRACEFUL SHUTDOWN + BENCH (V0.8) — a server writes two rows,
 #      gets SIGTERM, and exits 0 after flushing + saving meta.json
 #      (no meta.json exists before the signal); a restart reads the
 #      rows back. Then `zeno bench --rows 100,1000` prints real
 #      measured throughput/latency numbers on this machine.
+#  15. JOIN + SUBQUERIES + GROUP BY (V0.9) — users + orders
+#      tables: INNER JOIN, LEFT JOIN (Meera has no orders — a
+#      real NULL row), GROUP BY + SUM/COUNT with HAVING, and an
+#      IN-subquery, with the exact numbers printed.
 #
 # No fake numbers: everything printed below is real output of the binary.
 set -euo pipefail
@@ -971,9 +975,9 @@ q(a, "RELEASE SAVEPOINT sp1", "A")
 q(a, "ROLLBACK TO SAVEPOINT sp1", "A")
 q(a, "COMMIT", "A")
 q(b, "SELECT * FROM v7_users", "B")
-print("-- honest errors: bad SQL gets a line/column, JOIN gets 'not supported':")
+print("-- honest errors: bad SQL gets a line/column, RIGHT JOIN gets 'not supported':")
 q(a, "SELECT * FROM v7_users WHERE city =", "A")
-q(a, "SELECT * FROM v7_users JOIN other ON v7_users.id = other.id", "A")
+q(a, "SELECT * FROM v7_users RIGHT JOIN v7_users v2 ON v7_users.id = v2.id", "A")
 a.sendall(b"X" + struct.pack("!I", 4)); a.close()
 b.sendall(b"X" + struct.pack("!I", 4)); b.close()
 print("V0.7 demo done")
@@ -1118,6 +1122,104 @@ echo "(fresh temp dir, removed afterwards; no PostgreSQL/MongoDB"
 echo " comparison — neither is installed here.)"
 $ZENO bench --rows 100,1000
 
+say "15. JOIN + SUBQUERIES + GROUP BY (V0.9)"
+echo "(users + orders: 4 users, 5 orders — Sanjay 100+250, Asha 50,"
+echo " Ravi 300+150, Meera has NO orders. Totals: 850 overall,"
+echo " Delhi 800 (Sanjay 350 + Ravi 450), Mumbai 50.)"
+rm -rf ./demo-data-v9
+$ZENO --data ./demo-data-v9 serve --port 5438 --no-auto-vacuum &
+SERVER4=$!
+sleep 1
+python3 - <<'PYEOF'
+import socket, struct
+
+def recvn(s, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = s.recv(n - len(buf))
+        if not chunk:
+            raise EOFError("connection closed")
+        buf += chunk
+    return buf
+
+def read_msg(s):
+    tag = recvn(s, 1)
+    (ln,) = struct.unpack("!I", recvn(s, 4))
+    return tag, recvn(s, ln - 4)
+
+s = socket.create_connection(("127.0.0.1", 5438))
+params = b"user\0zeno\0database\0zeno\0\0"
+body = struct.pack("!I", 196608) + params
+s.sendall(struct.pack("!I", len(body) + 4) + body)
+while True:
+    tag, _ = read_msg(s)
+    if tag == b'Z':
+        break
+
+def q(sql):
+    body = sql.encode() + b"\0"
+    s.sendall(b"Q" + struct.pack("!I", len(body) + 4) + body)
+    rows = []
+    while True:
+        tag, b = read_msg(s)
+        if tag == b'Z':
+            break
+        if tag == b'T':
+            n = struct.unpack("!H", b[:2])[0]
+            cols, p = [], 2
+            for _ in range(n):
+                end = b.index(b"\0", p)
+                cols.append(b[p:end].decode())
+                p = end + 1 + 18
+            print(f"   columns: {cols}")
+        elif tag == b'D':
+            (ncols,) = struct.unpack("!h", b[:2])
+            pos, vals = 2, []
+            for _ in range(ncols):
+                (ln,) = struct.unpack("!i", b[pos:pos+4])
+                pos += 4
+                vals.append(None if ln < 0 else b[pos:pos+ln].decode())
+                pos += max(ln, 0)
+            rows.append(vals)
+        elif tag == b'C':
+            print(f"   {sql} -> {b[:-1].decode()}")
+        elif tag == b'E':
+            code, msg, p = "", "", 0
+            while p < len(b) and b[p] != 0:
+                f = chr(b[p]); p += 1
+                end = b.index(b"\0", p)
+                v = b[p:end].decode(); p = end + 1
+                if f == 'C': code = v
+                if f == 'M': msg = v
+            print(f"   {sql} -> ErrorResponse [{code}] {msg}")
+    print(f"   rows: {rows}")
+    return rows
+
+q("CREATE TABLE v9_users (id, name, city)")
+q("CREATE TABLE v9_orders (id, user_id, amount)")
+q("INSERT INTO v9_users VALUES (1, 'Sanjay', 'Delhi'), (2, 'Asha', 'Mumbai'), (3, 'Ravi', 'Delhi'), (4, 'Meera', 'Pune')")
+q("INSERT INTO v9_orders VALUES (1, 1, 100), (2, 1, 250), (3, 2, 50), (4, 3, 300), (5, 3, 150)")
+print("-- INNER JOIN (aliases + qualified columns + ORDER BY):")
+q("SELECT u.name, o.amount FROM v9_users u JOIN v9_orders o ON u.id = o.user_id ORDER BY o.id")
+print("-- LEFT JOIN: Meera has no orders — her amount is a real NULL (None), not \"\":")
+q("SELECT u.name, o.amount FROM v9_users u LEFT JOIN v9_orders o ON u.id = o.user_id ORDER BY u.id, o.id")
+print("-- GROUP BY + SUM/COUNT over the JOIN, biggest city first:")
+q("SELECT u.city, COUNT(*) AS orders, SUM(o.amount) AS total FROM v9_users u JOIN v9_orders o ON u.id = o.user_id GROUP BY u.city ORDER BY total DESC")
+print("-- HAVING: only users whose total spend is over 100:")
+q("SELECT user_id, SUM(amount) AS total FROM v9_orders GROUP BY user_id HAVING SUM(amount) > 100 ORDER BY total DESC")
+print("-- IN-subquery: users with an order over 200:")
+q("SELECT name FROM v9_users WHERE id IN (SELECT user_id FROM v9_orders WHERE amount > 200) ORDER BY id")
+print("-- aggregates without GROUP BY: one row over the whole table:")
+q("SELECT COUNT(*), SUM(amount) FROM v9_orders")
+print("-- honest error: RIGHT JOIN is still not supported:")
+q("SELECT * FROM v9_users u RIGHT JOIN v9_orders o ON u.id = o.user_id")
+s.sendall(b"X" + struct.pack("!I", 4))
+s.close()
+print("V0.9 demo done")
+PYEOF
+kill $SERVER4 || true
+wait $SERVER4 2>/dev/null || true
+rm -rf ./demo-data-v9
 
 echo
 echo "PostgreSQL demo done. Try it yourself with psql (on a machine that has it):"

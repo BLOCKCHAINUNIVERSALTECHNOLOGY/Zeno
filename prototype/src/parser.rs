@@ -25,12 +25,18 @@
 //   table aliases), WHERE ... IN (SELECT ...) / NOT IN /
 //   scalar `= (SELECT ...)`, GROUP BY + aggregates (COUNT, SUM,
 //   AVG, MIN, MAX) + HAVING.
+// - V0.10: scalar subqueries in the SELECT list, correlated
+//   (they may reference the outer query's tables) and
+//   uncorrelated, with aggregates inside; a qualified column
+//   reference as a WHERE right-hand side
+//   (`orders.user_id = users.id`, the correlated comparison).
 //
 // NOT supported, with an explicit error (not a silent misparse):
 // RIGHT / FULL / CROSS JOIN, FROM-subqueries, UNION, OR, LIKE,
 // other aggregate or scalar function calls (`COALESCE(...)`,
-// `UPPER(...)`, ...), scalar subqueries in the SELECT list,
-// correlated subqueries, `ON ... AND ...` / a literal in ON,
+// `UPPER(...)`, ...), correlated subqueries in WHERE
+// (a WHERE subquery cannot reference the outer query's tables),
+// `ON ... AND ...` / a literal in ON,
 // `COUNT(DISTINCT ...)`, `GROUP BY 1` / `ORDER BY 1`, an
 // `IN (...)` list of literals, `LIMIT $1`. Those fail with
 // 0A000 ("feature not supported") and a message naming the
@@ -133,6 +139,13 @@ pub struct AggregateExpr {
 /// aliased), or a qualified star (`u.*` — expands to every column
 /// of that table, V0.9 fix). `*` is not an item — it is `items:
 /// None` on the statement, as before.
+/// V0.10 adds a scalar subquery item
+/// (`(SELECT MAX(amount) FROM orders WHERE orders.user_id =
+/// users.id)` — optionally aliased): one value per outer row,
+/// NULL over no rows, 21000 over more than one row, 42601 over
+/// more than one column. A subquery that references the outer
+/// query's tables is correlated (evaluated once per outer row);
+/// one that does not is evaluated once per statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectItem {
     Column {
@@ -146,6 +159,10 @@ pub enum SelectItem {
     QualifiedStar {
         qualifier: String,
     },
+    ScalarSubquery {
+        query: Box<Stmt>,
+        alias: Option<String>,
+    },
 }
 
 impl SelectItem {
@@ -154,7 +171,8 @@ impl SelectItem {
     /// A qualified star has no single output name — it expands
     /// to several columns, so callers that expand it must not
     /// call this on it (it returns `qualifier.*` as a fallback
-    /// for error messages only).
+    /// for error messages only). An unaliased scalar subquery
+    /// is `?column?`, like PostgreSQL.
     pub fn output_name(&self) -> String {
         match self {
             SelectItem::Column { col, alias } => alias.clone().unwrap_or_else(|| col.name.clone()),
@@ -162,6 +180,9 @@ impl SelectItem {
                 alias.clone().unwrap_or_else(|| agg.func.name().to_string())
             }
             SelectItem::QualifiedStar { qualifier } => format!("{qualifier}.*"),
+            SelectItem::ScalarSubquery { alias, .. } => {
+                alias.clone().unwrap_or_else(|| "?column?".to_string())
+            }
         }
     }
 }
@@ -169,10 +190,17 @@ impl SelectItem {
 /// The right-hand side of a WHERE condition (V0.9): a literal
 /// value, an `IN (SELECT ...)` / `NOT IN (SELECT ...)` list
 /// test, or a scalar subquery compared with an operator
-/// (`= (SELECT ...)`).
+/// (`= (SELECT ...)`). V0.10 adds a qualified column reference
+/// (`orders.user_id = users.id`): the right-hand side may be a
+/// column of a table in scope — including, inside a subquery,
+/// a column of the OUTER query (a correlated comparison). An
+/// unqualified bare word stays a literal value (`city =
+/// Delhi` means the text "Delhi", not a column named Delhi),
+/// so only `table.column` is a column reference here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CondRhs {
     Value(Value),
+    Column(ColumnRef),
     InSubquery { negated: bool, query: Box<Stmt> },
     ScalarSubquery(Box<Stmt>),
 }
@@ -818,7 +846,7 @@ impl Parser {
                 t.line,
                 t.col,
                 format!(
-                    "{} is not supported in Zeno 0.9.0 — one SELECT per statement",
+                    "{} is not supported in Zeno 0.10.0 — one SELECT per statement",
                     t.word_upper()
                 ),
             ),
@@ -898,7 +926,7 @@ impl Parser {
                     t.line,
                     t.col,
                     format!(
-                        "function call {}(...) is not supported in Zeno 0.9.0 — use a literal value",
+                        "function call {}(...) is not supported in Zeno 0.10.0 — use a literal value",
                         t.word_upper()
                     ),
                 ));
@@ -924,7 +952,7 @@ impl Parser {
                 TokKind::Punct(p) if p == "(" => Err(ParseError::unsupported(
                     t.line,
                     t.col,
-                    "a parenthesised value is not supported in Zeno 0.9.0 — use a literal value \
+                    "a parenthesised value is not supported in Zeno 0.10.0 — use a literal value \
                      (subqueries are only supported in WHERE, as IN (SELECT ...) or = (SELECT ...))",
                 )),
                 _ => Err(self.err_at(t, "a value")),
@@ -947,7 +975,7 @@ impl Parser {
             "WITH" => Err(ParseError::unsupported(
                 first.line,
                 first.col,
-                "WITH (common table expressions) is not supported in Zeno 0.9.0",
+                "WITH (common table expressions) is not supported in Zeno 0.10.0",
             )),
             other => Err(ParseError::syntax(
                 first.line,
@@ -987,7 +1015,7 @@ impl Parser {
             return Err(ParseError::unsupported(
                 t.line,
                 t.col,
-                "subqueries in FROM are not supported in Zeno 0.9.0 — query a table directly",
+                "subqueries in FROM are not supported in Zeno 0.10.0 — query a table directly",
             ));
         }
         let table = self.expect_name()?;
@@ -1012,7 +1040,7 @@ impl Parser {
                             t.line,
                             t.col,
                             format!(
-                                "{} JOIN is not supported in Zeno 0.9.0 — use INNER JOIN or LEFT JOIN",
+                                "{} JOIN is not supported in Zeno 0.10.0 — use INNER JOIN or LEFT JOIN",
                                 t.word_upper()
                             ),
                         ));
@@ -1035,7 +1063,7 @@ impl Parser {
                     return Err(ParseError::unsupported(
                         t.line,
                         t.col,
-                        "ON with AND is not supported in Zeno 0.9.0 — only a single \
+                        "ON with AND is not supported in Zeno 0.10.0 — only a single \
                          `table.col = table.col` condition is supported",
                     ));
                 }
@@ -1066,7 +1094,7 @@ impl Parser {
                             t.line,
                             t.col,
                             "GROUP BY with a column position (GROUP BY 1) is not supported \
-                             in Zeno 0.9.0 — name the column",
+                             in Zeno 0.10.0 — name the column",
                         ));
                     }
                 }
@@ -1105,7 +1133,7 @@ impl Parser {
                                 t.line,
                                 t.col,
                                 "ORDER BY with a column position (ORDER BY 1) is not supported \
-                                 in Zeno 0.9.0 — name the column or output alias",
+                                 in Zeno 0.10.0 — name the column or output alias",
                             ));
                         }
                     }
@@ -1164,27 +1192,28 @@ impl Parser {
     }
 
     /// One SELECT-list item: an aggregate call, a qualified star
-    /// (`u.*`), or a column, each optionally followed by `AS
-    /// alias`. A scalar subquery in the SELECT list is a known
-    /// construct Zeno does not support: 0A000, not 42601.
+    /// (`u.*`), a scalar subquery (`(SELECT ...)` — V0.10,
+    /// optionally aliased), or a column, each optionally
+    /// followed by `AS alias`.
     fn parse_select_item(&mut self) -> Result<SelectItem, ParseError> {
         if self.peek_is_aggregate_call() {
             let agg = self.parse_aggregate()?;
             let alias = self.parse_optional_alias()?;
             return Ok(SelectItem::Aggregate { agg, alias });
         }
-        // `(SELECT ...)` in the SELECT list: scalar subqueries
-        // live only in WHERE in Zeno 0.9.0 (M2e).
+        // `(SELECT ...)` in the SELECT list: a scalar subquery
+        // (V0.10). Its value is one value per outer row; the
+        // executor decides correlated vs uncorrelated, and
+        // 0 rows / >1 row / >1 column are NULL / 21000 / 42601.
         if self.peek().is_some_and(|t| t.is_punct("("))
             && self.peek2().is_some_and(|t| t.is_word("SELECT"))
         {
-            let t = self.peek().expect("peeked token").clone();
-            return Err(ParseError::unsupported(
-                t.line,
-                t.col,
-                "scalar subqueries in the SELECT list are not supported in Zeno 0.9.0 — \
-                 only in WHERE (see README)",
-            ));
+            let query = self.parse_subquery()?;
+            let alias = self.parse_optional_alias()?;
+            return Ok(SelectItem::ScalarSubquery {
+                query: Box::new(query),
+                alias,
+            });
         }
         // `u.*`: a qualified star expands to every column of
         // that table (M2d). Lookahead is `Ident . *`.
@@ -1210,7 +1239,7 @@ impl Parser {
                     t.line,
                     t.col,
                     format!(
-                        "function call {}(...) is not supported in Zeno 0.9.0 — \
+                        "function call {}(...) is not supported in Zeno 0.10.0 — \
                          only COUNT, SUM, AVG, MIN, MAX exist",
                         t.word_upper()
                     ),
@@ -1265,7 +1294,7 @@ impl Parser {
                     t.line,
                     t.col,
                     format!(
-                        "{} (DISTINCT ...) is not supported in Zeno 0.9.0 — use {} without DISTINCT",
+                        "{} (DISTINCT ...) is not supported in Zeno 0.10.0 — use {} without DISTINCT",
                         func.name().to_ascii_uppercase(),
                         func.name().to_ascii_uppercase()
                     ),
@@ -1347,7 +1376,7 @@ impl Parser {
                 return Err(ParseError::unsupported(
                     t.line,
                     t.col,
-                    "ON conditions must compare two columns in Zeno 0.9.0 — only \
+                    "ON conditions must compare two columns in Zeno 0.10.0 — only \
                      `table.col = table.col` is supported (a literal on either side is not supported)",
                 ));
             }
@@ -1372,17 +1401,25 @@ impl Parser {
                 line,
                 col,
                 message: format!(
-                    "subquery nesting too deep — Zeno 0.9.0 allows at most {MAX_SUBQUERY_DEPTH} \
+                    "subquery nesting too deep — Zeno 0.10.0 allows at most {MAX_SUBQUERY_DEPTH} \
                      levels of nested subqueries"
                 ),
             });
         }
         self.subquery_depth += 1;
-        self.expect_punct("(")?;
-        let stmt = self.parse_select()?;
-        self.expect_punct(")")?;
+        // Decrement on every exit, including a parse error
+        // inside — the depth is per-statement state, and a
+        // failed subquery must not leave it raised for the
+        // rest of the parse (harmless today, since the parser
+        // is per-statement, but wrong if that ever changes).
+        let result = (|| {
+            self.expect_punct("(")?;
+            let stmt = self.parse_select()?;
+            self.expect_punct(")")?;
+            Ok(stmt)
+        })();
         self.subquery_depth -= 1;
-        Ok(stmt)
+        result
     }
 
     /// One HAVING condition: an aggregate or a GROUP BY column,
@@ -1451,7 +1488,7 @@ impl Parser {
                 return Err(ParseError::unsupported(
                     t.line,
                     t.col,
-                    "OR in WHERE is not supported in Zeno 0.9.0 — use AND, or run two queries",
+                    "OR in WHERE is not supported in Zeno 0.10.0 — use AND, or run two queries",
                 ));
             }
         }
@@ -1467,7 +1504,7 @@ impl Parser {
                 return Err(ParseError::unsupported(
                     t.line,
                     t.col,
-                    "EXISTS (SELECT ...) is not supported in Zeno 0.9.0 — \
+                    "EXISTS (SELECT ...) is not supported in Zeno 0.10.0 — \
                      use IN (SELECT ...) instead",
                 ));
             }
@@ -1493,7 +1530,7 @@ impl Parser {
                     return Err(ParseError::unsupported(
                         t.line,
                         t.col,
-                        "subqueries are not supported in UPDATE / DELETE in Zeno 0.9.0 — \
+                        "subqueries are not supported in UPDATE / DELETE in Zeno 0.10.0 — \
                          use a literal value",
                     ));
                 }
@@ -1515,7 +1552,7 @@ impl Parser {
                     return Err(ParseError::unsupported(
                         t.line,
                         t.col,
-                        "IN (...) with a list of literal values is not supported in Zeno 0.9.0 — \
+                        "IN (...) with a list of literal values is not supported in Zeno 0.10.0 — \
                          use IN (SELECT ...) instead",
                     ));
                 }
@@ -1561,14 +1598,14 @@ impl Parser {
                         return Err(ParseError::unsupported(
                             op_tok.line,
                             op_tok.col,
-                            "LIKE is not supported in Zeno 0.9.0 — no pattern matching yet (see README)",
+                            "LIKE is not supported in Zeno 0.10.0 — no pattern matching yet (see README)",
                         ));
                     }
                     "IS" => {
                         return Err(ParseError::unsupported(
                             op_tok.line,
                             op_tok.col,
-                            "IS [NOT] NULL is not supported yet in Zeno 0.9.0 — NULLs do exist \
+                            "IS [NOT] NULL is not supported yet in Zeno 0.10.0 — NULLs do exist \
                              in SELECT results (a LEFT JOIN miss, an empty subquery, an aggregate \
                              over no rows); only this syntax is not supported yet (see README)",
                         ));
@@ -1578,7 +1615,7 @@ impl Parser {
                             op_tok.line,
                             op_tok.col,
                             format!(
-                                "{} is not supported in Zeno 0.9.0 — use a plain comparison operator (=, !=, <, >, <=, >=)",
+                                "{} is not supported in Zeno 0.10.0 — use a plain comparison operator (=, !=, <, >, <=, >=)",
                                 op_tok.word_upper()
                             ),
                         ));
@@ -1606,7 +1643,7 @@ impl Parser {
                 return Err(ParseError::unsupported(
                     t.line,
                     t.col,
-                    "subqueries are not supported in UPDATE / DELETE in Zeno 0.9.0 — \
+                    "subqueries are not supported in UPDATE / DELETE in Zeno 0.10.0 — \
                      use a literal value",
                 ));
             }
@@ -1615,6 +1652,24 @@ impl Parser {
                 column,
                 op,
                 rhs: CondRhs::ScalarSubquery(Box::new(query)),
+            });
+        }
+        // A qualified column reference as the right-hand side
+        // (V0.10): `table.column`. Only a qualified reference
+        // is a column here — an unqualified bare word stays a
+        // literal value (see `CondRhs::Column`). This is what
+        // makes a correlated subquery possible:
+        // `WHERE orders.user_id = users.id`.
+        if matches!(
+            &self.peek().map(|t| t.kind.clone()),
+            Some(TokKind::Ident(_))
+        ) && self.peek2().is_some_and(|n| n.is_punct("."))
+        {
+            let col = self.parse_column_ref()?;
+            return Ok(Condition {
+                column,
+                op,
+                rhs: CondRhs::Column(col),
             });
         }
         let value = self.parse_value()?;
@@ -1640,7 +1695,7 @@ impl Parser {
                 t.line,
                 t.col,
                 format!(
-                    "{what} with a parameter is not supported in Zeno 0.9.0 — use a literal number"
+                    "{what} with a parameter is not supported in Zeno 0.10.0 — use a literal number"
                 ),
             )),
             _ => Err(ParseError::syntax(
@@ -1676,7 +1731,7 @@ impl Parser {
                 return Err(ParseError::unsupported(
                     t.line,
                     t.col,
-                    "INSERT ... SELECT is not supported in Zeno 0.9.0 — run the SELECT first, then INSERT the values",
+                    "INSERT ... SELECT is not supported in Zeno 0.10.0 — run the SELECT first, then INSERT the values",
                 ));
             }
         }
@@ -1774,7 +1829,7 @@ impl Parser {
                 t.line,
                 t.col,
                 format!(
-                    "only CREATE TABLE is supported in Zeno 0.9.0 (got CREATE '{}')",
+                    "only CREATE TABLE is supported in Zeno 0.10.0 (got CREATE '{}')",
                     t.text()
                 ),
             ));
@@ -1809,7 +1864,7 @@ impl Parser {
                         t.line,
                         t.col,
                         format!(
-                            "table-level constraint {} is not supported in Zeno 0.9.0 — \
+                            "table-level constraint {} is not supported in Zeno 0.10.0 — \
                              put PRIMARY KEY / UNIQUE on a single column instead",
                             t.word_upper()
                         ),
@@ -2314,7 +2369,7 @@ mod tests {
     }
 
     #[test]
-    fn qualified_star_parses_and_select_list_subquery_is_0a000() {
+    fn qualified_star_parses_and_select_list_subquery_parses() {
         // M2d: `u.*` expands to the table's columns.
         let stmt = parse("SELECT u.*, o.amount FROM users u JOIN orders o ON u.id = o.user_id");
         match stmt {
@@ -2327,10 +2382,47 @@ mod tests {
             }
             other => panic!("expected Select, got {other:?}"),
         }
-        // M2e: a scalar subquery in the SELECT list is 0A000.
-        let err = parse_sql("SELECT (SELECT MAX(id) FROM orders) FROM users").unwrap_err();
-        assert_eq!(err.code, "0A000");
-        assert!(err.message.contains("SELECT list"), "{err}");
+        // V0.10: a scalar subquery in the SELECT list parses
+        // now (it used to be 0A000) — uncorrelated and
+        // correlated, with an optional alias.
+        let stmt = parse(
+            "SELECT name, (SELECT MAX(amount) FROM orders WHERE orders.user_id = users.id) \
+             AS max_amt FROM users",
+        );
+        match stmt {
+            Stmt::Select { items, .. } => {
+                assert_eq!(items.as_ref().map(Vec::len), Some(2));
+                match &items.as_ref().unwrap()[1] {
+                    SelectItem::ScalarSubquery { query, alias } => {
+                        assert_eq!(alias.as_deref(), Some("max_amt"));
+                        assert!(matches!(**query, Stmt::Select { .. }));
+                    }
+                    other => panic!("expected ScalarSubquery, got {other:?}"),
+                }
+            }
+            other => panic!("expected Select, got {other:?}"),
+        }
+        assert!(matches!(
+            parse("SELECT (SELECT MAX(id) FROM orders) FROM users"),
+            Stmt::Select { .. }
+        ));
+        // A qualified column on the right-hand side of a WHERE
+        // condition parses too (the correlated comparison).
+        let stmt = parse("SELECT MAX(amount) FROM orders WHERE orders.user_id = users.id");
+        match stmt {
+            Stmt::Select { conditions, .. } => {
+                assert!(matches!(conditions[0].rhs, CondRhs::Column(_)));
+            }
+            other => panic!("expected Select, got {other:?}"),
+        }
+        // An unqualified bare word is still a literal, not a column.
+        let stmt = parse("SELECT * FROM t WHERE city = Delhi");
+        match stmt {
+            Stmt::Select { conditions, .. } => {
+                assert!(matches!(conditions[0].rhs, CondRhs::Value(Value::Text(_))));
+            }
+            other => panic!("expected Select, got {other:?}"),
+        }
     }
 
     #[test]

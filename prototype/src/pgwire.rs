@@ -338,7 +338,7 @@ pub fn serve(data_dir: &Path, port: u16, opts: &ServeOptions) -> std::io::Result
     }));
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     println!(
-        "zeno 0.9.0 listening on 127.0.0.1:{} (data dir: {})",
+        "zeno 0.10.0 listening on 127.0.0.1:{} (data dir: {})",
         port,
         data_dir.display()
     );
@@ -1858,7 +1858,7 @@ pub(crate) fn classify_statement(tokens: &[Token]) -> Result<StmtKind, SqlError>
         "DROP" | "ALTER" | "SET" | "SHOW" | "GRANT" | "REVOKE" | "TRUNCATE" | "COPY"
         | "EXPLAIN" => Err(sql_err(
             "0A000",
-            format!("{first} is not supported in Zeno 0.9.0 (only CREATE TABLE, INSERT, UPDATE, SELECT, DELETE, VACUUM, BEGIN, COMMIT, ROLLBACK, SAVEPOINT, RELEASE SAVEPOINT, ROLLBACK TO SAVEPOINT)"),
+            format!("{first} is not supported in Zeno 0.10.0 (only CREATE TABLE, INSERT, UPDATE, SELECT, DELETE, VACUUM, BEGIN, COMMIT, ROLLBACK, SAVEPOINT, RELEASE SAVEPOINT, ROLLBACK TO SAVEPOINT)"),
         )),
         "" => Ok(StmtKind::Empty),
         other => Err(sql_err(
@@ -2148,8 +2148,16 @@ fn to_filter(table: &str, conditions: &[crate::parser::Condition]) -> Result<Row
         let crate::parser::CondRhs::Value(value) = &cond.rhs else {
             return Err(sql_err(
                 "0A000",
-                "subqueries are not supported in UPDATE / DELETE in Zeno 0.9.0 — \
-                 use a literal value",
+                match &cond.rhs {
+                    crate::parser::CondRhs::Column(_) => {
+                        "a column-to-column comparison is not supported in UPDATE / DELETE \
+                         in Zeno 0.10.0 — use a literal value"
+                    }
+                    _ => {
+                        "subqueries are not supported in UPDATE / DELETE in Zeno 0.10.0 — \
+                         use a literal value"
+                    }
+                },
             ));
         };
         filter
@@ -2189,7 +2197,7 @@ fn exec_create_ast(
     if session.txn.is_some() {
         return Err(sql_err(
             "0A000",
-            "CREATE TABLE is not supported inside a transaction in Zeno 0.9.0 \
+            "CREATE TABLE is not supported inside a transaction in Zeno 0.10.0 \
              (DDL is not versioned — run it outside a transaction, after COMMIT or ROLLBACK)",
         ));
     }
@@ -2482,7 +2490,7 @@ fn exec_begin(
         return Err(sql_err(
             "25001",
             "already in a transaction — COMMIT or ROLLBACK first \
-             (Zeno 0.9.0 has no nested transactions)",
+             (Zeno 0.10.0 has no nested transactions)",
         ));
     }
     // Poison recovery (V0.5): see `recover_lock`.
@@ -2728,7 +2736,7 @@ fn exec_vacuum(
     session: &mut Session,
 ) -> Result<StmtOutcome, SqlError> {
     if tokens.len() != 1 {
-        return Err(sql_err("42601", "VACUUM takes no arguments in Zeno 0.9.0"));
+        return Err(sql_err("42601", "VACUUM takes no arguments in Zeno 0.10.0"));
     }
     if session.txn.is_some() {
         return Err(sql_err(

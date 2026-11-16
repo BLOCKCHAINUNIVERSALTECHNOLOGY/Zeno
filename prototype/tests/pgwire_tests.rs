@@ -18,11 +18,11 @@
 // port and data directory, so the server binary — not just the
 // library — is what gets exercised, including the data-dir lock.
 
-use std::io::{BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 // `PemObject` brings `CertificateDer::pem_slice_iter` into scope
@@ -110,33 +110,76 @@ impl Server {
             let mut child = Command::new(bin)
                 .args(&argv)
                 .envs(envs.iter().copied())
-                .stdout(Stdio::null())
+                .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .spawn()
                 .expect("failed to start zeno serve");
-            // Wait until the server accepts connections (up to ~5s).
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            loop {
-                if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                    // The child must still be alive: if it exited
-                    // (bind failed) we may have connected to another
-                    // test's server on the same port instead. Wait a
-                    // moment first — a bind failure exits within
-                    // milliseconds of spawn, so a live child after
-                    // this delay really owns the port.
-                    std::thread::sleep(Duration::from_millis(150));
-                    match child.try_wait() {
-                        Ok(None) => return Server { child, port, dir },
-                        _ => break, // exited — retry with a new port
+            // Readiness = OUR child's own listening line. The
+            // server prints it (to stdout) right after binding,
+            // so seeing `listening on 127.0.0.1:{port}` proves
+            // this child owns the port. A bare TCP probe cannot
+            // prove that: under parallel load the probe could
+            // connect to ANOTHER test's server on the same port
+            // while our child had not bound yet (or had failed
+            // to), and the old 150 ms settle delay was not
+            // enough to catch it — the TLS test failed that way
+            // once in a parallel release run. A thread drains
+            // the child's stdout for the life of the server and
+            // forwards lines over a channel; the wait below only
+            // looks for the listening line and ignores the rest.
+            // The drain MUST keep reading until EOF even after
+            // the starter stops listening: if it exits, the pipe
+            // read end closes while the server is still printing
+            // its startup lines, and its next println! fails
+            // with EPIPE and panics the server (exit 101).
+            let stdout = child.stdout.take().expect("piped stdout");
+            let (tx, rx) = mpsc::channel::<String>();
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stdout);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line) {
+                        Ok(0) => break, // EOF: the child exited
+                        Ok(_) => {
+                            // Best-effort forward; once the
+                            // starter stops listening, keep
+                            // draining and discard.
+                            let _ = tx.send(line.clone());
+                        }
+                        Err(_) => break,
                     }
                 }
-                if std::time::Instant::now() > deadline {
-                    break; // child never listened — retry
+            });
+            let listening_line = format!("listening on 127.0.0.1:{port}");
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut ready = false;
+            loop {
+                match rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(line) => {
+                        if line.contains(&listening_line) {
+                            ready = true;
+                            break;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if std::time::Instant::now() > deadline {
+                            break; // child never listened — retry
+                        }
+                        if child.try_wait().map(|s| s.is_some()).unwrap_or(false) {
+                            break; // exited early (e.g. bind failed) — retry
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        break; // stdout closed: the child exited — retry
+                    }
                 }
-                if child.try_wait().map(|s| s.is_some()).unwrap_or(false) {
-                    break; // exited early (e.g. bind failed) — retry
+            }
+            if ready {
+                // Exited just after printing — retry.
+                if let Ok(None) = child.try_wait() {
+                    return Server { child, port, dir };
                 }
-                std::thread::sleep(Duration::from_millis(50));
             }
             let _ = child.kill();
             let _ = child.wait();
@@ -5136,11 +5179,15 @@ fn v09fix_unsupported_constructs_are_0a000() {
         assert!(!message.is_empty(), "{sql}");
     }
 
-    // M2e: a scalar subquery in the SELECT list.
-    let msgs = client.query("SELECT (SELECT MAX(id) FROM orders) FROM users");
-    let (code, message) = err_code(&msgs);
-    assert_eq!(code, "0A000", "{msgs:?}");
-    assert!(message.contains("SELECT list"), "{message}");
+    // M2e (V0.10): a scalar subquery in the SELECT list WORKS
+    // now — it used to be 0A000. The uncorrelated MAX over all
+    // orders is 300, in every row.
+    let msgs = client.query("SELECT (SELECT MAX(id) FROM orders) FROM users ORDER BY id");
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![s("5")], vec![s("5")], vec![s("5")], vec![s("5")],],
+        "{msgs:?}"
+    );
 
     // M2f: ON with AND, ON with a literal, COUNT(DISTINCT),
     // GROUP BY 1, ORDER BY 1.
@@ -5451,16 +5498,21 @@ fn v09fix_minor_coverage_null_in_not_in_group_by_null_order_by_agg() {
 
 #[test]
 fn v09fix_statement_timeout_cancels_slow_query() {
-    // B2 backstop: with a 500 ms statement timeout, the same
-    // 500x500 cross product that takes seconds is cancelled
-    // with 57014 — and the server stays alive afterwards.
+    // B2 backstop: with a 500 ms statement timeout, a 2000x2000
+    // cross product (seconds of work in both profiles — the
+    // streaming COUNT(*) takes ~2.2 s in release and longer in
+    // debug, so the 500 ms timeout always fires) is cancelled
+    // with 57014 — and the server stays alive afterwards. (A
+    // 500x500 product used to be the workload, but the
+    // streaming aggregate made it finish inside 500 ms in
+    // release.)
     let server = Server::start_with_env(
         "v09fix-stmt-timeout",
         &[("ZENO_STATEMENT_TIMEOUT_MS", "500")],
     );
     let (mut client, _) = Client::connect(server.port);
-    seed_numbered(&mut client, "x", 500);
-    seed_numbered(&mut client, "y", 500);
+    seed_numbered(&mut client, "x", 2000);
+    seed_numbered(&mut client, "y", 2000);
 
     let start = std::time::Instant::now();
     let msgs = client.query("SELECT COUNT(*) FROM x a JOIN y b ON a.id = a.id");
@@ -5472,6 +5524,617 @@ fn v09fix_statement_timeout_cancels_slow_query() {
 
     // The server (and the connection) survive the cancellation.
     let msgs = client.query("SELECT COUNT(*) FROM x");
-    assert_eq!(Client::rows(&msgs), vec![vec![s("500")]], "{msgs:?}");
+    assert_eq!(Client::rows(&msgs), vec![vec![s("2000")]], "{msgs:?}");
+    client.terminate();
+}
+
+// ---------------------------------------------------------------------
+// V0.10 — SELECT-list scalar subqueries + power-loss recovery.
+// ---------------------------------------------------------------------
+
+#[test]
+fn v10_select_list_subquery_uncorrelated_is_evaluated_once() {
+    let server = Server::start("v10-select-subquery-uncorr");
+    let (mut client, _) = Client::connect(server.port);
+    seed_users_orders(&mut client);
+
+    // Uncorrelated: the same value in every row (MAX over all
+    // orders is 300, SUM is 850, COUNT is 5).
+    let msgs = client
+        .query("SELECT name, (SELECT MAX(amount) FROM orders) AS max_amt FROM users ORDER BY id");
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![
+            vec![s("Sanjay"), s("300")],
+            vec![s("Asha"), s("300")],
+            vec![s("Ravi"), s("300")],
+            vec![s("Meera"), s("300")],
+        ],
+        "{msgs:?}"
+    );
+    let msgs = client.query(
+        "SELECT name, (SELECT SUM(amount) FROM orders) AS total, \
+         (SELECT COUNT(*) FROM orders) AS n FROM users ORDER BY id LIMIT 1",
+    );
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![s("Sanjay"), s("850"), s("5")]],
+        "{msgs:?}"
+    );
+    // An unaliased subquery is named `?column?`, like PostgreSQL.
+    let msgs = client.query("SELECT (SELECT MAX(amount) FROM orders) FROM users LIMIT 1");
+    assert!(
+        msgs.iter().any(|m| matches!(m,
+            Msg::RowDescription(cols, _) if cols == &["?column?".to_string()])),
+        "unaliased SELECT-list subquery must be ?column?: {msgs:?}"
+    );
+    client.terminate();
+}
+
+#[test]
+fn v10_select_list_subquery_correlated_per_row_value() {
+    let server = Server::start("v10-select-subquery-corr");
+    let (mut client, _) = Client::connect(server.port);
+    seed_users_orders(&mut client);
+
+    // Correlated: a different value per outer row — the MAX /
+    // SUM of that user's own orders. Meera has no orders, so
+    // her subquery returns no rows: a real NULL, not 0.
+    let msgs = client.query(
+        "SELECT name, (SELECT MAX(amount) FROM orders WHERE orders.user_id = users.id) AS max_amt \
+         FROM users ORDER BY id",
+    );
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![
+            vec![s("Sanjay"), s("250")],
+            vec![s("Asha"), s("50")],
+            vec![s("Ravi"), s("300")],
+            vec![s("Meera"), None],
+        ],
+        "{msgs:?}"
+    );
+    let msgs = client.query(
+        "SELECT name, (SELECT SUM(amount) FROM orders WHERE orders.user_id = users.id) AS total \
+         FROM users ORDER BY id",
+    );
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![
+            vec![s("Sanjay"), s("350")],
+            vec![s("Asha"), s("50")],
+            vec![s("Ravi"), s("450")],
+            vec![s("Meera"), None],
+        ],
+        "{msgs:?}"
+    );
+    // ORDER BY on the subquery's alias sorts by its value
+    // (NULL sorts as larger than any value, so DESC puts the
+    // NULL first — see `cmp_order` in src/query.rs).
+    let msgs = client.query(
+        "SELECT name, (SELECT MAX(amount) FROM orders WHERE orders.user_id = users.id) AS max_amt \
+         FROM users ORDER BY max_amt DESC",
+    );
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![
+            vec![s("Meera"), None],
+            vec![s("Ravi"), s("300")],
+            vec![s("Sanjay"), s("250")],
+            vec![s("Asha"), s("50")],
+        ],
+        "{msgs:?}"
+    );
+    // The correlation may also run the other way round
+    // (outer column on the left of the `=`).
+    let msgs = client.query(
+        "SELECT name, (SELECT MAX(amount) FROM orders WHERE users.id = orders.user_id) AS max_amt \
+         FROM users ORDER BY id",
+    );
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![
+            vec![s("Sanjay"), s("250")],
+            vec![s("Asha"), s("50")],
+            vec![s("Ravi"), s("300")],
+            vec![s("Meera"), None],
+        ],
+        "{msgs:?}"
+    );
+    client.terminate();
+}
+
+#[test]
+fn v10_select_list_subquery_error_codes() {
+    let server = Server::start("v10-select-subquery-errors");
+    let (mut client, _) = Client::connect(server.port);
+    seed_users_orders(&mut client);
+
+    // >1 row is 21000 (Sanjay has two orders).
+    let msgs = client.query(
+        "SELECT name, (SELECT amount FROM orders WHERE orders.user_id = users.id) \
+         FROM users ORDER BY id",
+    );
+    let (code, message) = err_code(&msgs);
+    assert_eq!(code, "21000", "{msgs:?}");
+    assert!(message.contains("more than one row"), "{message}");
+
+    // >1 column is 42601.
+    let msgs = client.query(
+        "SELECT name, (SELECT id, amount FROM orders LIMIT 1) FROM users ORDER BY id LIMIT 1",
+    );
+    let (code, message) = err_code(&msgs);
+    assert_eq!(code, "42601", "{msgs:?}");
+    assert!(message.contains("only one column"), "{message}");
+
+    // 0 rows is NULL, not an error — even with LIMIT 1 the
+    // statement returns one row with a NULL.
+    let msgs = client.query(
+        "SELECT name, (SELECT MAX(amount) FROM orders WHERE orders.user_id = 99) \
+         FROM users WHERE id = 4",
+    );
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![s("Meera"), None]],
+        "{msgs:?}"
+    );
+
+    // A subquery that would fail (21000) does NOT fail a
+    // statement whose outer table is empty and returns no rows.
+    client.query("CREATE TABLE empty_t (id)");
+    let msgs = client.query("SELECT id, (SELECT amount FROM orders) FROM empty_t");
+    assert_eq!(Client::rows(&msgs).len(), 0, "{msgs:?}");
+    assert!(Client::error(&msgs).is_none(), "{msgs:?}");
+
+    // A column-to-column comparison is not supported in
+    // UPDATE / DELETE (the table store only filters on
+    // literals): 0A000, with a message that says so.
+    let msgs = client.query("UPDATE users SET city = 'X' WHERE id = users.id");
+    let (code, message) = err_code(&msgs);
+    assert_eq!(code, "0A000", "{msgs:?}");
+    assert!(message.contains("column-to-column"), "{message}");
+    client.terminate();
+}
+
+#[test]
+fn v10_select_list_subquery_with_group_by() {
+    let server = Server::start("v10-select-subquery-group-by");
+    let (mut client, _) = Client::connect(server.port);
+    seed_users_orders(&mut client);
+
+    // Uncorrelated subquery in a grouped query: the same total
+    // (850) in every group.
+    let msgs = client.query(
+        "SELECT city, COUNT(*) AS n, (SELECT SUM(amount) FROM orders) AS total \
+         FROM users GROUP BY city ORDER BY city",
+    );
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![
+            vec![s("Delhi"), s("2"), s("850")],
+            vec![s("Mumbai"), s("1"), s("850")],
+            vec![s("Pune"), s("1"), s("850")],
+        ],
+        "{msgs:?}"
+    );
+
+    // Correlated subquery on a GROUP BY column: one value per
+    // group, from that group's key (Meera's group has no
+    // orders, so NULL).
+    let msgs = client.query(
+        "SELECT id, (SELECT MAX(amount) FROM orders WHERE orders.user_id = users.id) AS max_amt \
+         FROM users GROUP BY id ORDER BY id",
+    );
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![
+            vec![s("1"), s("250")],
+            vec![s("2"), s("50")],
+            vec![s("3"), s("300")],
+            vec![s("4"), None],
+        ],
+        "{msgs:?}"
+    );
+
+    // Correlated subquery on a NON-grouped column: 42803, not
+    // a silent wrong value from some other row of the group
+    // (Delhi's group holds both Sanjay and Ravi).
+    let msgs = client.query(
+        "SELECT city, COUNT(*), (SELECT MAX(amount) FROM orders WHERE orders.user_id = users.id) \
+         FROM users GROUP BY city ORDER BY city",
+    );
+    let (code, message) = err_code(&msgs);
+    assert_eq!(code, "42803", "{msgs:?}");
+    assert!(message.contains("GROUP BY"), "{message}");
+
+    // The same rule without GROUP BY: `users.id` is not
+    // grouped, so the correlated subquery is 42803 even though
+    // the query still returns one row (COUNT over the table).
+    let msgs = client.query(
+        "SELECT COUNT(*), (SELECT MAX(amount) FROM orders WHERE orders.user_id = users.id) \
+         FROM users",
+    );
+    let (code, _) = err_code(&msgs);
+    assert_eq!(code, "42803", "{msgs:?}");
+
+    // But an uncorrelated subquery next to an aggregate is fine.
+    let msgs =
+        client.query("SELECT COUNT(*), (SELECT SUM(amount) FROM orders) AS total FROM users");
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![s("4"), s("850")]],
+        "{msgs:?}"
+    );
+    client.terminate();
+}
+
+#[test]
+fn v10_select_list_subquery_timeout_cancels_slow_query() {
+    // The statement timeout (57014) applies to SELECT-list
+    // subqueries too: with a 500 ms timeout, an uncorrelated
+    // subquery doing a 2000x2000 cross product (seconds of work
+    // in both profiles — the streaming COUNT(*) takes ~2.2 s in
+    // release and longer in debug, so the 500 ms timeout always
+    // fires) is cancelled — and the server stays alive
+    // afterwards. (A 500x500 product used to be the workload,
+    // but it finished inside 500 ms in release and the test
+    // failed deterministically there.)
+    let server = Server::start_with_env(
+        "v10-select-subquery-timeout",
+        &[("ZENO_STATEMENT_TIMEOUT_MS", "500")],
+    );
+    let (mut client, _) = Client::connect(server.port);
+    seed_users_orders(&mut client);
+    seed_numbered(&mut client, "x", 2000);
+    seed_numbered(&mut client, "y", 2000);
+
+    let start = std::time::Instant::now();
+    let msgs = client.query(
+        "SELECT name, (SELECT COUNT(*) FROM x a JOIN y b ON a.id = a.id) AS n \
+         FROM users ORDER BY id LIMIT 1",
+    );
+    let elapsed = start.elapsed();
+    let (code, message) = err_code(&msgs);
+    assert_eq!(code, "57014", "{msgs:?}");
+    assert!(message.contains("statement timeout"), "{message}");
+    eprintln!("timed-out SELECT-list subquery took {elapsed:?}");
+
+    let msgs = client.query("SELECT COUNT(*) FROM users");
+    assert_eq!(Client::rows(&msgs), vec![vec![s("4")]], "{msgs:?}");
+    client.terminate();
+}
+
+#[test]
+fn v10fix_big_cross_product_does_not_kill_server() {
+    // B1: a 1000x1000 cross product used to OOM-kill the server
+    // (COUNT(*) materialised 1M joined rows, ~2 GB; 2000x2000
+    // died with SIGABRT). Now COUNT(*) streams — no joined row
+    // is ever stored — and a plain SELECT fails fast with
+    // 54000 (the materialisation cap), and the server stays
+    // alive for the next query either way.
+    let server = Server::start("v10fix-big-cross-product");
+    let (mut client, _) = Client::connect(server.port);
+    seed_users_orders(&mut client);
+    seed_numbered(&mut client, "x", 1000);
+    seed_numbered(&mut client, "y", 1000);
+
+    let msgs = client.query("SELECT COUNT(*) FROM x a JOIN y b ON a.id = a.id");
+    assert_eq!(Client::rows(&msgs), vec![vec![s("1000000")]], "{msgs:?}");
+
+    let msgs = client.query("SELECT * FROM x a JOIN y b ON a.id = a.id");
+    let (code, message) = err_code(&msgs);
+    assert_eq!(code, "54000", "{msgs:?}");
+    assert!(message.contains("materialisation limit"), "{message}");
+
+    // The server is still alive afterwards.
+    let msgs = client.query("SELECT COUNT(*) FROM users");
+    assert_eq!(Client::rows(&msgs), vec![vec![s("4")]], "{msgs:?}");
+    client.terminate();
+}
+
+#[test]
+fn v10fix_nested_select_list_subquery_references_grand_outer() {
+    // M1: a SELECT-list subquery nested inside another one may
+    // reference the grand-outer query's tables — the inner one
+    // used to fail with 42703 ("missing FROM-clause entry for
+    // table 'users'") because an uncorrelated subquery ran with
+    // the parent outer context only, skipping one level.
+    let server = Server::start("v10fix-nested-subquery-grand-outer");
+    let (mut client, _) = Client::connect(server.port);
+    seed_users_orders(&mut client);
+
+    // Two levels: the inner MAX reads the outer users row.
+    let msgs = client.query(
+        "SELECT name, (SELECT (SELECT MAX(amount) FROM orders WHERE orders.user_id = users.id) FROM orders LIMIT 1) AS m FROM users ORDER BY id",
+    );
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![
+            vec![s("Sanjay"), s("250")],
+            vec![s("Asha"), s("50")],
+            vec![s("Ravi"), s("300")],
+            vec![s("Meera"), None],
+        ],
+        "{msgs:?}"
+    );
+
+    // Four levels of nesting: the same values.
+    let msgs = client.query(
+        "SELECT name, (SELECT (SELECT (SELECT (SELECT MAX(amount) FROM orders WHERE orders.user_id = users.id) FROM orders LIMIT 1) FROM orders LIMIT 1) FROM orders LIMIT 1) AS m FROM users ORDER BY id",
+    );
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![
+            vec![s("Sanjay"), s("250")],
+            vec![s("Asha"), s("50")],
+            vec![s("Ravi"), s("300")],
+            vec![s("Meera"), None],
+        ],
+        "{msgs:?}"
+    );
+
+    // Shadowing still works: the middle subquery's own FROM
+    // users shadows the outer users, so users.id binds to the
+    // middle row (id 1, Sanjay -> 250), not to the outer row.
+    let msgs = client.query(
+        "SELECT name, (SELECT (SELECT MAX(amount) FROM orders WHERE orders.user_id = users.id) FROM users ORDER BY id LIMIT 1) AS m FROM users ORDER BY id",
+    );
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![
+            vec![s("Sanjay"), s("250")],
+            vec![s("Asha"), s("250")],
+            vec![s("Ravi"), s("250")],
+            vec![s("Meera"), s("250")],
+        ],
+        "{msgs:?}"
+    );
+
+    // The same fix through a grouped outer query: users.id IS
+    // a GROUP BY column here, so the nested subquery reads it
+    // per group (the aggregate path's uncorrelated branch).
+    let msgs = client.query(
+        "SELECT id, (SELECT (SELECT MAX(amount) FROM orders WHERE orders.user_id = users.id) FROM orders LIMIT 1) AS m FROM users GROUP BY id ORDER BY id",
+    );
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![
+            vec![s("1"), s("250")],
+            vec![s("2"), s("50")],
+            vec![s("3"), s("300")],
+            vec![s("4"), None],
+        ],
+        "{msgs:?}"
+    );
+
+    // And through an aggregate subquery: the HAVING makes the
+    // middle statement aggregate, so its uncorrelated nested
+    // subquery runs with the aggregate statement's outer
+    // context (the outer users row) — the other half of M1.
+    let msgs = client.query(
+        "SELECT name, (SELECT (SELECT (SELECT MAX(amount) FROM orders WHERE orders.user_id = users.id) FROM orders LIMIT 1) AS m FROM orders HAVING COUNT(*) > 0) AS t FROM users ORDER BY id",
+    );
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![
+            vec![s("Sanjay"), s("250")],
+            vec![s("Asha"), s("50")],
+            vec![s("Ravi"), s("300")],
+            vec![s("Meera"), None],
+        ],
+        "{msgs:?}"
+    );
+    client.terminate();
+}
+
+#[test]
+fn v10fix_correlated_where_subquery_evaluated_per_row() {
+    // M2 + M5: a WHERE subquery may reference the statement
+    // that contains it (or an ancestor statement) — it is
+    // evaluated once per row, against that row. It used to be
+    // hoisted with no outer context and fail with a misleading
+    // 42703 ("missing FROM-clause entry" for a table that IS
+    // in the outer FROM).
+    let server = Server::start("v10fix-correlated-where");
+    let (mut client, _) = Client::connect(server.port);
+    seed_users_orders(&mut client);
+
+    // M2: the WHERE subquery inside a SELECT-list subquery
+    // references that subquery's own alias (o.amount).
+    let msgs = client.query(
+        "SELECT name, (SELECT MAX(amount) FROM orders o WHERE o.user_id IN (SELECT user_id FROM orders WHERE orders.amount > o.amount)) AS m FROM users ORDER BY id",
+    );
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![
+            vec![s("Sanjay"), s("150")],
+            vec![s("Asha"), s("150")],
+            vec![s("Ravi"), s("150")],
+            vec![s("Meera"), s("150")],
+        ],
+        "{msgs:?}"
+    );
+
+    // M2, ancestor chain: the nested WHERE subquery references
+    // the grand-outer users row, through the middle subquery.
+    let msgs = client.query(
+        "SELECT name, (SELECT MAX(amount) FROM orders o WHERE o.user_id IN (SELECT user_id FROM orders WHERE orders.amount > users.id)) AS m FROM users ORDER BY id",
+    );
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![
+            vec![s("Sanjay"), s("300")],
+            vec![s("Asha"), s("300")],
+            vec![s("Ravi"), s("300")],
+            vec![s("Meera"), s("300")],
+        ],
+        "{msgs:?}"
+    );
+
+    // M5: a correlated WHERE subquery at the top level.
+    let msgs = client.query(
+        "SELECT name FROM users WHERE id IN (SELECT user_id FROM orders WHERE orders.amount > users.id)",
+    );
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![vec![s("Sanjay")], vec![s("Asha")], vec![s("Ravi")]],
+        "{msgs:?}"
+    );
+
+    // Same, as a scalar subquery: only Ravi's id equals the MAX
+    // user_id over orders with amount greater than his id.
+    let msgs = client.query(
+        "SELECT name FROM users WHERE id = (SELECT MAX(user_id) FROM orders WHERE orders.amount > users.id)",
+    );
+    assert_eq!(Client::rows(&msgs), vec![vec![s("Ravi")]], "{msgs:?}");
+    client.terminate();
+}
+
+#[test]
+fn v10fix_limit_zero_skips_failing_subquery() {
+    // M4: LIMIT 0 returns no rows without running the
+    // projection — a failing SELECT-list subquery (21000: more
+    // than one row) must not fail a query that returns nothing.
+    let server = Server::start("v10fix-limit-zero");
+    let (mut client, _) = Client::connect(server.port);
+    seed_users_orders(&mut client);
+
+    let msgs = client.query("SELECT name, (SELECT amount FROM orders) FROM users LIMIT 0");
+    assert!(Client::rows(&msgs).is_empty(), "{msgs:?}");
+    assert!(Client::error(&msgs).is_none(), "{msgs:?}");
+
+    let msgs = client.query("SELECT COUNT(*), (SELECT amount FROM orders) FROM users LIMIT 0");
+    assert!(Client::rows(&msgs).is_empty(), "{msgs:?}");
+    assert!(Client::error(&msgs).is_none(), "{msgs:?}");
+
+    // And LIMIT 0 over a good query still returns no rows.
+    let msgs = client.query("SELECT name FROM users LIMIT 0");
+    assert!(Client::rows(&msgs).is_empty(), "{msgs:?}");
+    assert!(Client::error(&msgs).is_none(), "{msgs:?}");
+    client.terminate();
+}
+
+#[test]
+fn v10_power_loss_kill9_committed_rows_survive() {
+    // Kill -9 (SIGKILL, no graceful shutdown, no meta.json
+    // flush) after committed writes, then reopen the SAME data
+    // directory: every committed row must come back, and the
+    // database must stay writable. The rows live only in the
+    // WAL here (10 rows, far below the 64-entry flush), so this
+    // proves WAL replay + fsync, not SSTable reads. A torn WAL
+    // line appended after the kill must not block the reopen.
+    let server = Server::start("v10-power-loss");
+    let (mut client, _) = Client::connect(server.port);
+    seed_users_orders(&mut client);
+    client.query("INSERT INTO users VALUES (5, 'Kiran', 'Goa')");
+    client.query("INSERT INTO orders VALUES (6, 5, 400)");
+    // A transaction that never commits must NOT survive.
+    client.query("BEGIN");
+    client.query("INSERT INTO users VALUES (6, 'Neha', 'Pune')");
+    client.terminate();
+
+    // SIGKILL: `Child::kill` is SIGKILL on Unix. `stop_keep_dir`
+    // keeps the data directory (the Server Drop would delete it).
+    let dir = server.stop_keep_dir();
+    assert!(
+        dir.join("wal.log").exists(),
+        "wal.log must exist after the kill"
+    );
+
+    // Torn WAL line after the kill: the next open must warn
+    // about it and still open, with the data intact.
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("wal.log"))
+            .expect("open wal.log to append a torn line");
+        writeln!(f, "garbage-not-json").expect("append a torn WAL line");
+    }
+
+    let server2 = Server::start_with_args_on_dir(dir, &["--no-auto-vacuum"]);
+    let (mut client2, _) = Client::connect(server2.port);
+    let msgs = client2.query("SELECT COUNT(*) FROM users");
+    assert_eq!(Client::rows(&msgs), vec![vec![s("5")]], "{msgs:?}");
+    let msgs = client2.query("SELECT COUNT(*) FROM orders");
+    assert_eq!(Client::rows(&msgs), vec![vec![s("6")]], "{msgs:?}");
+    let msgs = client2.query(
+        "SELECT name, (SELECT SUM(amount) FROM orders WHERE orders.user_id = users.id) AS total \
+         FROM users ORDER BY id",
+    );
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![
+            vec![s("Sanjay"), s("350")],
+            vec![s("Asha"), s("50")],
+            vec![s("Ravi"), s("450")],
+            vec![s("Meera"), None],
+            vec![s("Kiran"), s("400")],
+        ],
+        "{msgs:?}"
+    );
+    // The uncommitted row (Neha, id 6) must be gone.
+    let msgs = client2.query("SELECT name FROM users WHERE id = 6");
+    assert_eq!(Client::rows(&msgs).len(), 0, "{msgs:?}");
+
+    // The reopened database is still writable, and the new row
+    // survives a second (graceful) restart too.
+    client2.query("INSERT INTO users VALUES (6, 'Neha', 'Pune')");
+    let msgs = client2.query("SELECT COUNT(*) FROM users");
+    assert_eq!(Client::rows(&msgs), vec![vec![s("6")]], "{msgs:?}");
+    client2.terminate();
+    let (status, dir) = server2.shutdown_gracefully();
+    assert!(
+        status.success(),
+        "graceful shutdown after kill-9 recovery must exit 0"
+    );
+
+    let server3 = Server::start_with_args_on_dir(dir, &["--no-auto-vacuum"]);
+    let (mut client3, _) = Client::connect(server3.port);
+    let msgs = client3.query("SELECT COUNT(*) FROM users");
+    assert_eq!(Client::rows(&msgs), vec![vec![s("6")]], "{msgs:?}");
+    client3.terminate();
+}
+
+#[test]
+fn v10_select_list_subquery_extended_protocol() {
+    // A SELECT-list subquery also works through the extended
+    // protocol: Describe names the columns (alias wins) without
+    // executing, and Execute returns the per-row values.
+    let server = Server::start("v10-select-subquery-ext");
+    let (mut client, _) = Client::connect(server.port);
+    seed_users_orders(&mut client);
+
+    let msgs = client.extended(&[
+        parse_frame(
+            "",
+            "SELECT name, (SELECT MAX(amount) FROM orders WHERE orders.user_id = users.id) AS max_amt FROM users ORDER BY id",
+            &[],
+        ),
+        describe_frame(b'S', ""),
+        bind_frame("", "", &[], &[], &[]),
+        describe_frame(b'P', ""),
+        execute_frame("", 0),
+        sync_frame(),
+    ]);
+    assert!(
+        msgs.iter().any(|m| matches!(
+            m,
+            Msg::RowDescription(cols, _) if cols == &["name".to_string(), "max_amt".to_string()]
+        )),
+        "Describe must name name, max_amt: {msgs:?}"
+    );
+    assert_eq!(
+        Client::rows(&msgs),
+        vec![
+            vec![s("Sanjay"), s("250")],
+            vec![s("Asha"), s("50")],
+            vec![s("Ravi"), s("300")],
+            vec![s("Meera"), None],
+        ],
+        "{msgs:?}"
+    );
+    assert_eq!(Client::tag(&msgs).as_deref(), Some("SELECT 4"), "{msgs:?}");
+    assert!(Client::error(&msgs).is_none(), "{msgs:?}");
     client.terminate();
 }

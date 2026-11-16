@@ -56,6 +56,13 @@
 #      tables: INNER JOIN, LEFT JOIN (Meera has no orders — a
 #      real NULL row), GROUP BY + SUM/COUNT with HAVING, and an
 #      IN-subquery, with the exact numbers printed.
+#  16. SELECT-LIST SUBQUERIES + POWER-LOSS RECOVERY (V0.10) —
+#      a correlated subquery (one value per user), an
+#      uncorrelated subquery (the same value in every row),
+#      GROUP BY with both, an honest 21000 error — then kill -9
+#      the server, append a torn line to wal.log, restart, and
+#      show every committed row is back (the uncommitted one
+#      is not).
 #
 # No fake numbers: everything printed below is real output of the binary.
 set -euo pipefail
@@ -1220,6 +1227,183 @@ PYEOF
 kill $SERVER4 || true
 wait $SERVER4 2>/dev/null || true
 rm -rf ./demo-data-v9
+
+#  16. SELECT-LIST SUBQUERIES + POWER-LOSS RECOVERY (V0.10) —
+#      users + orders: a correlated subquery (one value per user),
+#      an uncorrelated subquery (the same value in every row),
+#      a GROUP BY query with both, an honest 21000 error — then
+#      kill -9 the server mid-life (no graceful shutdown), append
+#      a torn line to wal.log, restart, and show every committed
+#      row is back (the uncommitted one is not).
+say "16. SELECT-LIST SUBQUERIES + POWER-LOSS RECOVERY (V0.10)"
+echo "(correlated MAX per user: Sanjay 250, Asha 50, Ravi 300,"
+echo " Meera NULL — she has no orders. Uncorrelated MAX is 300"
+echo " in every row. Then kill -9, a torn WAL line, and restart.)"
+rm -rf ./demo-data-v10
+$ZENO --data ./demo-data-v10 serve --port 5439 --no-auto-vacuum &
+SERVER4=$!
+sleep 1
+python3 - <<'PYEOF'
+import socket, struct
+
+def recvn(s, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = s.recv(n - len(buf))
+        if not chunk:
+            raise EOFError("connection closed")
+        buf += chunk
+    return buf
+
+def read_msg(s):
+    tag = recvn(s, 1)
+    (ln,) = struct.unpack("!I", recvn(s, 4))
+    return tag, recvn(s, ln - 4)
+
+s = socket.create_connection(("127.0.0.1", 5439))
+params = b"user\0zeno\0database\0zeno\0\0"
+body = struct.pack("!I", 196608) + params
+s.sendall(struct.pack("!I", len(body) + 4) + body)
+while True:
+    tag, _ = read_msg(s)
+    if tag == b'Z':
+        break
+
+def q(sql):
+    body = sql.encode() + b"\0"
+    s.sendall(b"Q" + struct.pack("!I", len(body) + 4) + body)
+    rows = []
+    while True:
+        tag, b = read_msg(s)
+        if tag == b'Z':
+            break
+        if tag == b'T':
+            n = struct.unpack("!H", b[:2])[0]
+            cols, p = [], 2
+            for _ in range(n):
+                end = b.index(b"\0", p)
+                cols.append(b[p:end].decode())
+                p = end + 1 + 18
+            print(f"   columns: {cols}")
+        elif tag == b'D':
+            (ncols,) = struct.unpack("!h", b[:2])
+            pos, vals = 2, []
+            for _ in range(ncols):
+                (ln,) = struct.unpack("!i", b[pos:pos+4])
+                pos += 4
+                vals.append(None if ln < 0 else b[pos:pos+ln].decode())
+                pos += max(ln, 0)
+            rows.append(vals)
+        elif tag == b'C':
+            print(f"   {sql} -> {b[:-1].decode()}")
+        elif tag == b'E':
+            code, msg, p = "", "", 0
+            while p < len(b) and b[p] != 0:
+                f = chr(b[p]); p += 1
+                end = b.index(b"\0", p)
+                v = b[p:end].decode(); p = end + 1
+                if f == 'C': code = v
+                if f == 'M': msg = v
+            print(f"   {sql} -> ErrorResponse [{code}] {msg}")
+    print(f"   rows: {rows}")
+    return rows
+
+q("CREATE TABLE v10_users (id, name, city)")
+q("CREATE TABLE v10_orders (id, user_id, amount)")
+q("INSERT INTO v10_users VALUES (1, 'Sanjay', 'Delhi'), (2, 'Asha', 'Mumbai'), (3, 'Ravi', 'Delhi'), (4, 'Meera', 'Pune')")
+q("INSERT INTO v10_orders VALUES (1, 1, 100), (2, 1, 250), (3, 2, 50), (4, 3, 300), (5, 3, 150)")
+print("-- CORRELATED subquery: MAX of each user's OWN orders (Meera: NULL):")
+q("SELECT name, (SELECT MAX(amount) FROM v10_orders WHERE v10_orders.user_id = v10_users.id) AS max_amt FROM v10_users ORDER BY id")
+print("-- UNCORRELATED subquery: MAX over ALL orders (300) in every row:")
+q("SELECT name, (SELECT MAX(amount) FROM v10_orders) AS max_amt FROM v10_users ORDER BY id")
+print("-- GROUP BY + uncorrelated subquery: same total (850) in every group:")
+q("SELECT city, COUNT(*) AS n, (SELECT SUM(amount) FROM v10_orders) AS total FROM v10_users GROUP BY city ORDER BY city")
+print("-- GROUP BY + correlated subquery on the GROUP BY column (id):")
+q("SELECT id, (SELECT SUM(amount) FROM v10_orders WHERE v10_orders.user_id = v10_users.id) AS total FROM v10_users GROUP BY id ORDER BY id")
+print("-- honest error: a subquery returning more than one row is 21000:")
+q("SELECT name, (SELECT amount FROM v10_orders WHERE v10_orders.user_id = v10_users.id) FROM v10_users ORDER BY id")
+print("-- one more committed row before the kill (Kiran, Goa, one order of 400):")
+q("INSERT INTO v10_users VALUES (5, 'Kiran', 'Goa')")
+q("INSERT INTO v10_orders VALUES (6, 5, 400)")
+print("-- and one UNCOMMITTED row, in an open transaction (must NOT survive):")
+q("BEGIN")
+q("INSERT INTO v10_users VALUES (6, 'Neha', 'Pune')")
+s.sendall(b"X" + struct.pack("!I", 4))
+s.close()
+print("V0.10 subquery demo done — now killing the server -9")
+PYEOF
+echo "-- killing the server -9 NOW (no graceful shutdown, no meta.json flush):"
+kill -9 $SERVER4 || true
+wait $SERVER4 2>/dev/null || true
+echo "-- appending a torn/corrupt line to wal.log after the kill:"
+printf 'garbage-not-json\n' >> ./demo-data-v10/wal.log
+echo "-- restarting on the SAME data dir (the torn line must not block the open):"
+$ZENO --data ./demo-data-v10 serve --port 5439 --no-auto-vacuum &
+SERVER4=$!
+sleep 1
+python3 - <<'PYEOF'
+import socket, struct
+
+def recvn(s, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = s.recv(n - len(buf))
+        if not chunk:
+            raise EOFError("connection closed")
+        buf += chunk
+    return buf
+
+def read_msg(s):
+    tag = recvn(s, 1)
+    (ln,) = struct.unpack("!I", recvn(s, 4))
+    return tag, recvn(s, ln - 4)
+
+s = socket.create_connection(("127.0.0.1", 5439))
+params = b"user\0zeno\0database\0zeno\0\0"
+body = struct.pack("!I", 196608) + params
+s.sendall(struct.pack("!I", len(body) + 4) + body)
+while True:
+    tag, _ = read_msg(s)
+    if tag == b'Z':
+        break
+
+def q(sql):
+    body = sql.encode() + b"\0"
+    s.sendall(b"Q" + struct.pack("!I", len(body) + 4) + body)
+    rows = []
+    while True:
+        tag, b = read_msg(s)
+        if tag == b'Z':
+            break
+        if tag == b'D':
+            (ncols,) = struct.unpack("!h", b[:2])
+            pos, vals = 2, []
+            for _ in range(ncols):
+                (ln,) = struct.unpack("!i", b[pos:pos+4])
+                pos += 4
+                vals.append(None if ln < 0 else b[pos:pos+ln].decode())
+                pos += max(ln, 0)
+            rows.append(vals)
+        elif tag == b'C':
+            print(f"   {sql} -> {b[:-1].decode()}")
+        elif tag == b'E':
+            print(f"   {sql} -> ErrorResponse")
+    print(f"   rows: {rows}")
+    return rows
+
+print("-- after kill -9 + torn WAL line + restart:")
+q("SELECT COUNT(*) FROM v10_users")
+q("SELECT COUNT(*) FROM v10_orders")
+q("SELECT name, (SELECT SUM(amount) FROM v10_orders WHERE v10_orders.user_id = v10_users.id) AS total FROM v10_users ORDER BY id")
+print("   (5 users, 6 orders, totals 350 / 50 / 450 / NULL / 400 —")
+print("    every committed row is back; Neha (id 6, uncommitted) is gone)")
+s.sendall(b"X" + struct.pack("!I", 4))
+s.close()
+print("V0.10 power-loss demo done")
+PYEOF
+kill $SERVER4 || true
+wait $SERVER4 2>/dev/null || true
+rm -rf ./demo-data-v10
 
 echo
 echo "PostgreSQL demo done. Try it yourself with psql (on a machine that has it):"

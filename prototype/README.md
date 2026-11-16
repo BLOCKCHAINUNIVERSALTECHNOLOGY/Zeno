@@ -1,9 +1,9 @@
-# Zeno — One Engine, All Data (V0.9 prototype)
+# Zeno — One Engine, All Data (V0.10 prototype)
 
 > **Zeno is a hybrid SQL + JSON database in Rust — not ZenoDB (Lantern, Go
 > time-series) and not ZenDB.** The name was chosen knowing those exist.
 
-Zeno V0.9 is a small, working, single-node database prototype. One engine
+Zeno V0.10 is a small, working, single-node database prototype. One engine
 stores three kinds of data: **key-value**, **tables**, and **JSON
 documents**. It is written in Rust using `std` + `serde` +
 `serde_json` + small RustCrypto crates (`sha2`, `hmac`, `pbkdf2`,
@@ -11,12 +11,12 @@ documents**. It is written in Rust using `std` + `serde` +
 `rustls` (TLS 1.2/1.3, `ring` provider) + `rcgen` (self-signed
 certificate generation) for `serve --tls` — and `ctrlc`
 (SIGINT/SIGTERM handling) for the graceful shutdown — no heavy
-dependencies, no external database engine. V0.9 adds **SQL query
-power — INNER / LEFT JOIN, WHERE subqueries (`IN (SELECT ...)` and
-scalar `= (SELECT ...)`), and GROUP BY + aggregates (COUNT, SUM,
-AVG, MIN, MAX) + HAVING** — on top of the V0.8 savepoint portal
-closing, graceful shutdown and `zeno bench` (see "What is new in
-V0.9").
+dependencies, no external database engine. V0.10 adds **scalar
+subqueries in the SELECT list (correlated and uncorrelated),
+a qualified column as a WHERE right-hand side, and an
+automated kill -9 power-loss recovery test** — on top of the
+V0.9 JOINs, WHERE subqueries and GROUP BY + aggregates (see
+"What is new in V0.10" and "What is new in V0.9").
 
 > **⚠️ LOCAL PROTOTYPE ONLY. With no users configured, `zeno serve`
 > accepts EVERY local client with NO password (trust auth) and
@@ -29,6 +29,150 @@ V0.9").
 > shared machine, and never use it in production. Anyone on the
 > same machine can read and change all your data. See "Password
 > auth (SCRAM-SHA-256)" and "TLS" below.**
+
+## What is new in V0.10
+
+- **Scalar subqueries in the SELECT list — correlated and
+  uncorrelated.** `(SELECT MAX(amount) FROM orders WHERE
+  orders.user_id = users.id)` in the SELECT list returns one
+  value per outer row: 0 rows is NULL, more than one row is
+  21000, more than one column is 42601 — the same rules as a
+  scalar subquery in WHERE. Aggregates (`MAX` / `SUM` /
+  `COUNT`, ...) work inside the subquery, and so does GROUP BY
+  in the outer query (below). An unaliased subquery is named
+  `?column?` in the RowDescription, like PostgreSQL; an alias
+  (`AS max_amt`) works, and ORDER BY on the alias works.
+  ```sql
+  SELECT name, (SELECT MAX(amount) FROM orders
+    WHERE orders.user_id = users.id) AS max_amt FROM users ORDER BY id;
+  -- Sanjay 250, Asha 50, Ravi 300, Meera NULL (she has no orders)
+  SELECT name, (SELECT MAX(amount) FROM orders) AS max_amt FROM users;
+  -- 300 in every row (uncorrelated — evaluated once, not once per row)
+  ```
+  **Correlated vs uncorrelated, and the cost.** A subquery
+  that references the outer query's tables is correlated: it
+  is evaluated once per outer row, against that row — there is
+  no index and no hash join, so on a big table it is slow by
+  design (one inner scan per row). A subquery that references
+  no outer table is uncorrelated: it is evaluated lazily once
+  (on the first row that needs it) and the value is reused for
+  every row — so a statement over an empty outer table never
+  runs it at all (a failing uncorrelated subquery does not
+  fail an empty result). The statement timeout (57014,
+  `ZENO_STATEMENT_TIMEOUT_MS`, default 30000 ms) applies to
+  SELECT-list subqueries too, correlated and uncorrelated.
+  **GROUP BY.** An uncorrelated subquery in a grouped query
+  returns the same value in every group. A correlated
+  subquery in a grouped query is evaluated once per group,
+  against the group's key values — so it may only reference
+  GROUP BY columns of the outer query: any other outer column
+  is 42803, never a silent wrong value from some other row of
+  the group. The same rule holds with no GROUP BY
+  (`SELECT COUNT(*), (SELECT ... users.id ...) FROM users`
+  is 42803, because `users.id` is not grouped). What makes
+  the correlation possible is a **qualified column as a WHERE
+  right-hand side** (new in V0.10): `orders.user_id =
+  users.id`. An unqualified bare word on the right-hand side
+  is still a literal value (`city = Delhi` means the text
+  "Delhi", not a column named Delhi) — only `table.column`
+  is a column reference there. A column-to-column comparison
+  in UPDATE / DELETE is still 0A000 (the table store only
+  filters on literals).
+  ```sql
+  SELECT city, COUNT(*) AS n, (SELECT SUM(amount) FROM orders) AS total
+    FROM users GROUP BY city ORDER BY city;
+  -- Delhi 2 / 850, Mumbai 1 / 850, Pune 1 / 850
+  SELECT id, (SELECT MAX(amount) FROM orders
+    WHERE orders.user_id = users.id) AS max_amt
+    FROM users GROUP BY id ORDER BY id;
+  -- 1 / 250, 2 / 50, 3 / 300, 4 / NULL
+  SELECT city, (SELECT MAX(amount) FROM orders
+    WHERE orders.user_id = users.id) FROM users GROUP BY city;
+  -- 42803: users.id is not a GROUP BY column
+  ```
+  **Still not supported:** FROM-subqueries, RIGHT / FULL JOIN,
+  UNION, OR, LIKE and hash joins are still pending (see
+  `docs/V1-READINESS.md`). Correlated subqueries in WHERE
+  used to be unsupported too (42703) — the V0.10 review fix
+  changed that: a WHERE subquery that references the statement
+  containing it, or an ancestor statement, is now evaluated
+  once per row, against that row (see "Review fixes" below).
+- **Power-loss recovery test (kill -9).** A new regression
+  test (`v10_power_loss_kill9_committed_rows_survive`) starts
+  a real server, writes committed rows (5 users, 6 orders —
+  all still in the WAL, below the 64-entry flush), opens a
+  transaction that never commits, kills the server with
+  SIGKILL (no graceful shutdown, no meta.json flush), appends
+  a torn line to `wal.log`, and restarts on the same data
+  directory: all 5 users and 6 orders come back (totals 350 /
+  50 / 450 / NULL / 400), the uncommitted row is gone, the
+  torn line is warned about (1 corrupt line, line 23) but does
+  not block the open, and the reopened database stays
+  writable — a row written after the recovery survives a
+  second, graceful restart too. No data was lost and no fix
+  was needed: every write is WAL-appended and fsynced before
+  it touches the memtable (see "WAL" in "What works"). Honest
+  limit, unchanged: a kill -9 is a process crash, not a power
+  cut — the OS/disk flush path after a sudden power loss has
+  still not been independently verified.
+- **V0.10 review fixes (B1, M1–M6, m1–m4).** A reviewer
+  re-probed V0.10 and found 1 blocker + 6 must-fixes + 4
+  minors, all fixed with regression tests (4 new pgwire tests
+  `v10fix_*`; suite total 290 → 294 — see "Tests" and
+  `docs/V1-READINESS.md`):
+  - **B1 — a big cross product no longer OOM-kills the
+    server.** A simple aggregate query (COUNT / SUM / MIN /
+    MAX, no GROUP BY) now streams the join: each joined row
+    updates the accumulators on the fly and is dropped, so
+    `SELECT COUNT(*)` over a 2000×2000 cross product returns
+    4000000 in ~2.2 s (release) instead of dying with SIGABRT.
+    A materialised join is capped at 100_000 rows
+    (`ZENO_MAX_JOIN_ROWS` overrides it; `0` disables it) and
+    fails fast with **54000** instead of growing memory until
+    the server dies — a plain 1000×1000 SELECT is 54000, and
+    the server stays alive for the next query.
+  - **M1 — a nested SELECT-list subquery may reference the
+    grand-outer query.** An uncorrelated subquery now runs with
+    its statement's own outer context, not the parent only —
+    `(SELECT (SELECT MAX(amount) FROM orders WHERE
+    orders.user_id = users.id) FROM orders LIMIT 1)` returns
+    250 / 50 / 300 / NULL, at 2 and 4 levels of nesting, and
+    in grouped and aggregate subqueries too. Shadowing still
+    holds: an inner FROM that reuses an outer table name binds
+    to the inner row.
+  - **M2 / M5 — correlated subqueries in WHERE work now.**
+    A WHERE subquery that references its own statement's tables
+    — or an ancestor statement's, e.g. a WHERE subquery nested
+    inside a SELECT-list subquery referencing that subquery's
+    own alias — is evaluated once per row, against that row,
+    instead of being hoisted with no outer context and failing
+    with a misleading 42703. Uncorrelated WHERE subqueries are
+    still hoisted once per statement, as before. Slow by design
+    on big tables (one inner scan per row), like a correlated
+    SELECT-list subquery.
+  - **M3 — timeout tests use a 2000×2000 workload.** The
+    streaming aggregate made the old 500×500 cross product
+    finish inside the 500 ms timeout in release, so both
+    timeout tests now seed 2000 rows per table.
+  - **M4 — LIMIT 0 returns no rows without running the
+    projection**, so a failing SELECT-list subquery (21000)
+    does not fail a query that returns nothing.
+  - **m1–m3 — small hardening:** a missing value in an outer
+    row is XX000 (internal error) instead of a silent `""`;
+    `parse_subquery` restores the nesting depth on a parse
+    error; the integer SUM/AVG path checks the statement
+    deadline like the f64 path does.
+- **V1.0 hardening pass.** `psql` / PostgreSQL is still NOT
+  installed in this sandbox (`which psql postgres mongod`
+  finds nothing, `/usr/lib/postgresql` does not exist —
+  checked again 2026-11-16), so no PostgreSQL comparison ran
+  and no comparison number is claimed anywhere — any number
+  would be invented. The connection limit, SCRAM lockout and
+  TLS tests still pass as part of the suite (294 tests total:
+  133 unit + 43 engine + 118 pgwire). `docs/V1-READINESS.md`
+  is updated for V0.10 (SELECT-list subqueries and the
+  power-loss test are done; RIGHT / FULL JOIN, FROM-subquery,
+  UNION, OR, LIKE and hash join are still pending).
 
 ## What is new in V0.9
 
@@ -84,7 +228,11 @@ V0.9").
   cannot reference the outer query's tables (there is no syntax
   for it; an outer-table reference inside a subquery does not
   resolve). Scalar subqueries in the SELECT list are not
-  supported either (0A000) — only in WHERE.
+  supported either (0A000) — only in WHERE. (Both of these
+  were true in V0.9 and are superseded in V0.10: correlated
+  SELECT-list subqueries work now — see "What is new in
+  V0.10" — and correlated WHERE subqueries work now too, since
+  the V0.10 review fix.)
   ```sql
   SELECT name FROM users WHERE id IN (SELECT user_id FROM orders);
   SELECT name FROM users WHERE id NOT IN (SELECT user_id FROM orders);
@@ -150,12 +298,16 @@ V0.9").
   forever. Subquery nesting is capped at 64 levels (54001) —
   deeper nesting used to overflow the server's stack and kill
   the process.
-- **LIMIT is applied last (no LIMIT pushdown).** `LIMIT` /
-  `OFFSET` slice the result after the join, WHERE, grouping
-  and sort — so `LIMIT 5` over a big JOIN still materialises
-  the whole join first, and a big cross product can use a lot
-  of memory before the LIMIT cuts it down. That is a known
-  prototype limit, not a bug.
+- **LIMIT is applied last (no general LIMIT pushdown).**
+  `LIMIT` / `OFFSET` slice the result after the join, WHERE,
+  grouping and sort — so `LIMIT 5` over a big JOIN still
+  materialises the whole join first (capped at 100_000 joined
+  rows, 54000 — see "V0.10 review fixes" above, so a big cross
+  product fails fast instead of using a lot of memory). Two
+  exceptions: a simple aggregate query (COUNT / SUM / MIN /
+  MAX, no GROUP BY) streams the join and never materialises it,
+  and `LIMIT 0` returns no rows without running the projection
+  at all.
 - Version is now **0.9.0** (Cargo.toml, CLI, README).
 
 ## What is new in V0.8
@@ -988,7 +1140,7 @@ Each has a regression test (see "Tests").
   demonstrated and tested (used by `demo.sh` and the lock tests).
 - Version is now **0.2.0** (Cargo.toml, CLI, README).
 
-## What works in V0.9
+## What works in V0.10
 
 - **MVCC transactions (snapshot isolation)** — `BEGIN` /
   `COMMIT` / `ROLLBACK` (+ `START TRANSACTION`, `END`,
@@ -1089,7 +1241,12 @@ Each has a regression test (see "Tests").
   (with aliases and qualified columns), `WHERE ... IN (SELECT
   ...)` / scalar subqueries, and `GROUP BY` + aggregates
   (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) + `HAVING` (see "What is
-  new in V0.9"). Rows are stored as keys
+  new in V0.9"). V0.10 adds scalar subqueries in the SELECT
+  list — correlated (one value per outer row, or per group in a
+  GROUP BY query) and uncorrelated (evaluated once per
+  statement) — plus a qualified column as a WHERE right-hand
+  side (`orders.user_id = users.id`, see "What is new in
+  V0.10"). Rows are stored as keys
   `table:<name>:<row-id>`. SELECT is still a linear scan filter
   over the rows (no index) — only the parsing is real SQL now.
   JOINs are nested-loop (slow on large inputs — see "What is new
@@ -1111,7 +1268,12 @@ Each has a regression test (see "Tests").
   compaction refuses to run while a transaction is active.
 - **Crash recovery (process crash / restart only)** — proven by the
   demo: stop the process, reopen the same data directory, and the
-  data is still there. WAL, SSTable, `tables.json` and `meta.json`
+  data is still there. V0.10 adds an automated kill -9 test
+  (`v10_power_loss_kill9_committed_rows_survive`): SIGKILL after
+  committed writes, a torn WAL line appended after the kill, and
+  a restart on the same directory — every committed row comes
+  back, the uncommitted row does not, and the database stays
+  writable. WAL, SSTable, `tables.json` and `meta.json`
   writes are all atomic/fsynced now, but this is still **not proven
   power-loss safety**: it has been tested with process kills and
   restarts, not with a sudden power cut, and the OS/disk flush path
@@ -1161,26 +1323,30 @@ Each has a regression test (see "Tests").
   explicit `VACUUM` statement (or the `vacuum` / `compact` CLI
   commands when the server is stopped); the committed-transaction
   set is pruned by VACUUM / compaction.
-- **What the parser does not support (V0.9).** The parser is real
+- **What the parser does not support (V0.10).** The parser is real
   but small: no `RIGHT` / `FULL` / `CROSS JOIN`, no subqueries
   in `FROM`, no `UNION`, no `OR` in WHERE, no expressions or
   arithmetic, no scalar functions (`UPPER(...)`,
   `COALESCE(...)`, ...), no `LIKE` / `IS NULL`, no `EXISTS`,
   no `IN (...)` list of literals (only `IN (SELECT ...)`), no
   `INSERT ... SELECT`, no table-level `PRIMARY KEY (...)`, no
-  `LIMIT $1` (LIMIT/OFFSET need literal numbers), no scalar
-  subqueries in the SELECT list (only in WHERE), no correlated
-  subqueries (a subquery cannot reference the outer query's
-  tables), no `ON ... AND ...` and no literal in an `ON`
-  condition (only one `table.col = table.col`), no
+  `LIMIT $1` (LIMIT/OFFSET need literal numbers), no
+  column-to-column comparison in UPDATE / DELETE (0A000 — use
+  a literal value), no `ON ... AND ...` and no literal in an
+  `ON` condition (only one `table.col = table.col`), no
   `COUNT(DISTINCT ...)`, no `GROUP BY 1` / `ORDER BY 1`
   (column positions — name the column). Those fail
   with 0A000 ("feature not supported"), not with a silent
-  misparse. `JOIN` (INNER / LEFT), `WHERE ... IN (SELECT ...)`
+  misparse. (Correlated subqueries in WHERE used to be on this
+  list — they failed with 42703 — but they work now, since the
+  V0.10 review fix: a WHERE subquery that references its own
+  statement's tables, or an ancestor statement's, is evaluated
+  once per row.) `JOIN` (INNER / LEFT), `WHERE ... IN (SELECT ...)`
   and scalar subqueries, `GROUP BY` / `HAVING`, aggregates
   (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`), table-qualified
   columns (`u.id`) and aliases (`users u`, `SUM(x) AS total`)
-  all work now (V0.9). `VARCHAR(10)` and `SERIAL PRIMARY KEY`
+  all work now (V0.9), and scalar subqueries in the SELECT
+  list — correlated and uncorrelated — work now too (V0.10). `VARCHAR(10)` and `SERIAL PRIMARY KEY`
   in a column definition, a column list in
   `INSERT INTO t (a, b) VALUES (...)`, `WHERE id > 1`, and
   `ORDER BY` / `LIMIT` all work now (V0.7) — including several
@@ -1216,7 +1382,9 @@ Each has a regression test (see "Tests").
   2PC / SERIALIZABLE, and no multi-node support (see the other
   bullets in this section). The V0.7 parser, savepoints, and
   V0.9 JOINs / subqueries / GROUP BY are done (see "What is new
-  in V0.7" and "What is new in V0.9").
+  in V0.7" and "What is new in V0.9"), and V0.10 SELECT-list
+  subqueries (correlated and uncorrelated) plus the kill -9
+  power-loss test are done too (see "What is new in V0.10").
 - **Not production-ready.** No independent audit. A Zeno-only
   benchmark exists (`zeno bench`, see "What is new in V0.8")
   but there is still no benchmark against PostgreSQL or
@@ -1424,7 +1592,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-- 128 unit tests (the 99 from V0.6, plus 16 parser ones (15
+- 133 unit tests (the 99 from V0.6, plus 16 parser ones (15
   from V0.7, plus 1 net new in V0.9: the old "JOIN / GROUP BY /
   aggregates / subqueries as not supported" test became two —
   JOIN / LEFT JOIN / GROUP BY / aggregates / IN + NOT IN +
@@ -1452,7 +1620,11 @@ cargo test
   median/p95/mean, empty summary is zero, `--rows` parsing
   incl. duplicate rejection, median-of-runs takes the middle
   value, the temp-dir guard removes on drop, and the error path
-  removes the temp dir)
+  removes the temp dir — plus 5 parser ones added in V0.9 /
+  V0.10: JOIN / LEFT JOIN / GROUP BY / aggregate / subquery
+  parsing, HAVING without GROUP BY, qualified star +
+  SELECT-list subquery parsing, the 64-level subquery-nesting
+  cap (54001), and the IS NULL message)
 - 43 integration tests in `tests/engine_tests.rs` (the 23 from
   V0.5, plus 7 V0.6 ones: commit makes writes visible /
   rollback hides them, snapshot isolation hides later commits,
@@ -1475,7 +1647,7 @@ cargo test
   on lines 3 and 5 instead of 2 and 3 — plus 2 V0.8 review-fix
   ones: `zeno --version` exits 0 and creates no data dir, and an
   unknown command fails without creating a data dir.
-- 96 integration tests in `tests/pgwire_tests.rs` (the 62 from
+- 118 integration tests in `tests/pgwire_tests.rs` (the 62 from
   V0.6, plus 17 V0.7 ones: savepoint rollback keeps earlier
   writes and drops later ones (and the savepoint survives a
   ROLLBACK TO), savepoint release + unknown-name 3B001 +
@@ -1515,8 +1687,24 @@ cargo test
   text 22P02, non-grouped column 42803, `SELECT *` with GROUP
   BY 42803), JOIN + GROUP BY inside a transaction seeing the
   BEGIN snapshot, and JOIN + GROUP BY over the extended
-  protocol with a `$1` parameter.
-- 267 tests total, all passing.
+  protocol with a `$1` parameter — plus 11 V0.9 review-fix
+  ones: nested IN finishes fast, statement timeout cancels a
+  slow query, deep subquery nesting is 54001 and the server
+  survives, duplicate alias/table is 42712, a second connection
+  is not blocked by a slow SELECT — plus 7 V0.10 ones:
+  SELECT-list subqueries (uncorrelated evaluated once,
+  correlated per row, with GROUP BY, error codes, extended
+  protocol, timeout, kill -9 power loss) — plus 4 V0.10
+  review-fix ones: a big cross product does not kill the
+  server, a nested subquery reads the grand-outer row, a
+  correlated WHERE subquery is evaluated per row, LIMIT 0
+  skips a failing subquery.
+- 294 tests total, all passing — 133 unit + 43 engine + 118
+  pgwire. The counts are the debug profile (`cargo test`); the
+  release profile (`cargo test --release`) runs the same 294
+  and is green too. When the counts change, this section
+  changes with them — the numbers above were verified against
+  `cargo test` and `cargo test --release` for this version.
 
 **How the wire protocol is verified without `psql`:** `psql` is not
 installed in this sandbox, so `tests/pgwire_tests.rs` builds the

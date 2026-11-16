@@ -1,7 +1,7 @@
 # Zeno V1.0 readiness checklist
 
 What is still missing before Zeno can call itself V1.0 — with an
-honest status per item. Statuses as of **V0.9.0** (2026-11-16).
+honest status per item. Statuses as of **V0.10.0** (2026-11-16).
 Nothing here is a promise of a date; "pending" means not done,
 not "coming soon".
 
@@ -15,16 +15,16 @@ not "coming soon".
 
 | # | Item | Status | Note |
 |---|------|--------|------|
-| 1 | Real-client verification with `psql` / libpq | pending | `psql` is NOT installed in this sandbox (`which psql` finds nothing, checked again 2026-11-15). Every wire-protocol test speaks raw TCP from a hand-rolled client instead. Done = the same server answers a real `psql` session (Simple + extended protocol, SCRAM login, prepared statements) on a machine that has it. |
-| 2 | Power-loss / crash-safety test | pending | WAL replay is tested (kill -9 mid-transaction loses only uncommitted rows), but there is no test that cuts power mid-fsync or verifies the on-disk files after an OS crash. A `kill -9` is not a power cut. Done = a test (or a documented manual procedure) that kills the process at arbitrary points and reopens with no lost committed data and no corrupt files. |
+| 1 | Real-client verification with `psql` / libpq | pending | `psql` is NOT installed in this sandbox (`which psql` finds nothing, checked again 2026-11-16). Every wire-protocol test speaks raw TCP from a hand-rolled client instead. Done = the same server answers a real `psql` session (Simple + extended protocol, SCRAM login, prepared statements) on a machine that has it. |
+| 2 | Power-loss / crash-safety test | done (V0.10) | `v10_power_loss_kill9_committed_rows_survive`: a real server writes committed rows (5 users, 6 orders, WAL-only), opens a transaction that never commits, is killed with SIGKILL (no graceful shutdown), gets a torn line appended to `wal.log`, and restarts on the same directory — every committed row comes back, the uncommitted row is gone, the torn line is warned about but does not block the open, and the database stays writable (a row written after the recovery survives a second, graceful restart too). No data loss was found, so no WAL fix was needed. Honest limit: a kill -9 is a process crash, not a power cut — there is still no test that cuts power mid-fsync or verifies the on-disk files after an OS crash. |
 | 3 | JOIN | done (V0.9) | INNER JOIN and LEFT JOIN work (nested-loop; aliases, qualified columns, `*` and `u.*` expansion, NULL padding on LEFT misses, 42702 ambiguous / 42703 unknown / 42P01 missing table, 42712 duplicate alias/table). RIGHT / FULL / CROSS JOIN are still 0A000 — a hash join and the remaining JOIN types are V1.0+ work. Regression tests: `v09_inner_join_returns_matching_rows`, `v09_left_join_pads_missing_rows_with_null`, `v09_ambiguous_column_is_42702_and_right_join_is_0a000`, `v09fix_duplicate_alias_is_42712_and_self_join_still_works`, `v09fix_qualified_star_expands`. |
-| 4 | Subqueries | done (V0.9) | `WHERE ... IN (SELECT ...)` / `NOT IN` (single-column) and scalar `= (SELECT ...)` (0 rows = NULL, 1 row = value, many rows = 21000) work, through Simple Query and the extended protocol, inside transactions (same snapshot). FROM-subqueries are still 0A000. **Correlated subqueries are not supported** (a subquery cannot reference the outer query's tables) and **scalar subqueries in the SELECT list are not supported** (0A000) — both are documented in the README. Cost after the V0.9 review fix: each subquery is evaluated once per statement (hoisted before the WHERE loop), not once per outer row — a nested IN of depth 2 over 200-row tables finishes in well under a second (it used to run 30s+ and never finish). A SELECT takes a statement-level snapshot under the lock and then executes with the lock released, so a slow SELECT no longer blocks other connections; a statement timeout (57014, `ZENO_STATEMENT_TIMEOUT_MS`, default 30000 ms) cancels a SELECT that runs too long. Regression tests: `v09_in_subquery_and_not_in`, `v09_scalar_subquery_null_one_and_many_rows`, `v09_from_subquery_is_0a000`, `v09fix_nested_in_subquery_finishes_fast`, `v09fix_second_connection_not_blocked_by_slow_select`, `v09fix_statement_timeout_cancels_slow_query`, `v09fix_deep_subquery_nesting_is_54001_and_server_survives`. |
+| 4 | Subqueries | done (V0.9, extended V0.10) | `WHERE ... IN (SELECT ...)` / `NOT IN` (single-column) and scalar `= (SELECT ...)` (0 rows = NULL, 1 row = value, many rows = 21000) work, through Simple Query and the extended protocol, inside transactions (same snapshot). FROM-subqueries are still 0A000. **V0.10 adds scalar subqueries in the SELECT list, correlated and uncorrelated** (`SELECT name, (SELECT MAX(amount) FROM orders WHERE orders.user_id = users.id) FROM users` — per-row values 250 / 50 / 300 / NULL; uncorrelated evaluated lazily once per statement; 0 rows = NULL, >1 row = 21000, >1 column = 42601; aggregates inside; GROUP BY: uncorrelated same value per group, correlated only on GROUP BY columns, anything else 42803; statement timeout 57014 applies). A qualified column is now a valid WHERE right-hand side (`orders.user_id = users.id`); an unqualified bare word stays a literal. **Correlated subqueries in WHERE work since the V0.10 review fix** — a WHERE subquery that references its own statement's tables, or an ancestor statement's, is evaluated once per row, against that row (uncorrelated ones are still hoisted once per statement). Cost: a correlated SELECT-list subquery runs once per outer row (once per group when grouped) with no index and no hash join, so it is slow on large inputs by design. Regression tests: `v09_in_subquery_and_not_in`, `v09_scalar_subquery_null_one_and_many_rows`, `v09_from_subquery_is_0a000`, `v09fix_nested_in_subquery_finishes_fast`, `v09fix_second_connection_not_blocked_by_slow_select`, `v09fix_statement_timeout_cancels_slow_query`, `v09fix_deep_subquery_nesting_is_54001_and_server_survives`, `v10_select_list_subquery_uncorrelated_is_evaluated_once`, `v10_select_list_subquery_correlated_per_row_value`, `v10_select_list_subquery_error_codes`, `v10_select_list_subquery_with_group_by`, `v10_select_list_subquery_timeout_cancels_slow_query`, `v10_power_loss_kill9_committed_rows_survive`, `v10_select_list_subquery_extended_protocol`, `v10fix_nested_select_list_subquery_references_grand_outer`, `v10fix_correlated_where_subquery_evaluated_per_row`. |
 | 5 | GROUP BY / HAVING / aggregates | done (V0.9) | GROUP BY (one or more columns) + COUNT(*), COUNT(col), SUM, AVG, MIN, MAX + HAVING (with AND) + ORDER BY on an aggregate/alias work, with JOINs and **without GROUP BY** (one row over the whole table; COUNT 0 / SUM NULL over no rows — `SELECT COUNT(*) FROM orders HAVING COUNT(*) > 1` returns one row). Wrong aggregate input is 22P02, a non-grouped column is 42803, an unknown column in the SELECT list / HAVING / ORDER BY is 42703 (a HAVING output alias is 42703 too). SUM over plain integers is exact (i128); AVG over plain integers is exact via integer division + remainder decimal (non-terminating divisions run to 16 decimal places, documented as approximate); an integer SUM/AVG overflowing i128 is 22003. Regression tests: `v09_group_by_aggregates`, `v09_having_filters_groups_and_order_by_alias`, `v09_aggregate_errors`, `v09fix_having_without_group_by`, `v09fix_aggregate_error_codes`, `v09fix_avg_exact_and_sum_overflow`. |
 | 6 | Two-phase commit (2PC) | pending | No PREPARE TRANSACTION / COMMIT PREPARED. Transactions are snapshot isolation only. Done = 2PC works across a crash (prepared txns survive restart) with tests. |
 | 7 | READ COMMITTED / SERIALIZABLE | pending | Snapshot isolation only; every statement in a transaction sees the BEGIN snapshot. Done = at least one more isolation level works with tests. |
-| 8 | Benchmarks vs PostgreSQL / MongoDB | pending | `zeno bench` (V0.8) measures Zeno's own engine only. No comparison ran, because neither PostgreSQL nor MongoDB is installed in this sandbox (`which psql mongod postgres` finds nothing, checked again 2026-11-15). No comparison number is claimed anywhere — any number would be invented. Done = the same workload runs against a real PostgreSQL and a real MongoDB on the same machine, and the numbers are published side by side with the machine and config. |
+| 8 | Benchmarks vs PostgreSQL / MongoDB | pending | `zeno bench` (V0.8) measures Zeno's own engine only. No comparison ran, because neither PostgreSQL nor MongoDB is installed in this sandbox (`which psql mongod postgres` finds nothing, checked again 2026-11-16). No comparison number is claimed anywhere — any number would be invented. Done = the same workload runs against a real PostgreSQL and a real MongoDB on the same machine, and the numbers are published side by side with the machine and config. |
 | 9 | Production hardening | pending | Several prototype-only behaviours remain: trust auth when no users are configured (any local client, no password); self-signed TLS certificate with no channel binding; SCRAM lockout in-memory only (a restart clears it); no encryption at rest; SSTables fully loaded into memory on open; single-machine lock file (no NFS). Done = each of these is fixed or the V1.0 scope explicitly excludes it in writing. |
-| 10 | Independent security audit | pending | No outside audit of the auth, wire protocol, or storage code. The code has self-review fixes (see README "review fixes" sections) and 283 tests, but that is not an audit. |
+| 10 | Independent security audit | pending | No outside audit of the auth, wire protocol, or storage code. The code has self-review fixes (see README "review fixes" sections) and 294 tests, but that is not an audit. |
 | 11 | DDL inside transactions | pending | CREATE TABLE inside a transaction fails with 0A000. Done = DDL is transactional (or the V1.0 scope explicitly excludes it in writing). |
 | 12 | Secondary indexes | pending | `doc find` is a linear scan; tables have no indexes either. Done = at least one index type works with tests. |
 | 13 | Multi-node / replication | pending | Single node only; out of scope for the current design. Listed so nobody assumes otherwise. |
@@ -164,7 +164,142 @@ parser unit tests; suite total 267 → 283):
 - **Minors deliberately left, documented in the README:**
   WHERE on an unknown column with one table still silently
   matches nothing (V0.3 behaviour — changing it risked
-  regressions); no LIMIT pushdown (LIMIT applies after the
-  full result is built — a big cross product can use a lot of
-  memory first); correlated subqueries stay unsupported
-  (documented, no syntax for them).
+  regressions); no general LIMIT pushdown (LIMIT applies after
+  the full result is built — a big cross product is now capped
+  at 100_000 joined rows, 54000, instead of growing memory
+  first; simple aggregates stream and LIMIT 0 skips the
+  projection); correlated subqueries in WHERE stayed
+  unsupported in V0.9 (documented, no syntax for them) — fixed
+  in the V0.10 review (per-row evaluation, see below).
+
+## Notes from the V0.10 build
+
+- **A correlated subquery needs a column on the right-hand side
+  of WHERE.** The example query
+  `(SELECT MAX(amount) FROM orders WHERE orders.user_id =
+  users.id)` could not even parse in V0.9: a WHERE condition
+  was `column <op> literal` only, so `users.id` after `=` was
+  read as the bare-word literal "users" and the trailing `.id`
+  was a syntax error. V0.10 adds `CondRhs::Column` — but only
+  for a QUALIFIED reference (`table.column`); an unqualified
+  bare word stays a literal (`city = Delhi` still means the
+  text "Delhi"), so no existing query changes meaning.
+  UPDATE / DELETE reject a column-to-column comparison with
+  0A000 (the table store only filters on literals).
+- **Inner scope shadows outer scope, everywhere.** Column
+  resolution in a subquery tries its own tables first and
+  falls through to the outer row only when nothing matches —
+  for qualified references, unqualified references, validation
+  (`validate_column_with_outer`), JOIN ON, WHERE (both sides),
+  GROUP BY, HAVING and aggregates. A reference that exists in
+  both is read from the inner row, never the outer one.
+- **Uncorrelated means evaluated once — but lazily.** The
+  first draft cached uncorrelated SELECT-list subqueries
+  before the row loop, which would have failed a statement
+  over an empty outer table with the subquery's own error
+  (21000) even though it returns no rows at all. The cache is
+  now lazy: the correlation check runs up front (a missing
+  table is still 42P01 at plan time), the value is evaluated
+  on the first row that needs it and reused after that.
+- **GROUP BY + correlated subquery is 42803, not a wrong
+  value.** The per-group outer row carries ONLY the GROUP BY
+  key values, so a correlated reference to any other outer
+  column fails in `outer_value` instead of reading some other
+  row of the group. The first probe of this caught a wrong
+  test, not a bug: `GROUP BY user_id` over `users` is 42703
+  because `users` has no `user_id` column — grouping by `id`
+  is the correct query.
+- **The old "not supported" tests had to move, again.** The
+  parser unit test and the pgwire 0A000 test that asserted
+  SELECT-list subqueries are 0A000 now assert they work
+  (uncorrelated MAX 300 in every row; `MAX(id)` is 5 in every
+  row), and the CLI `--version` test moved from 0.9.0 to
+  0.10.0. Suite total 283 → 290 (133 unit + 43 engine +
+  114 pgwire).
+- **Power-loss test found nothing to fix.** Every committed
+  row survived kill -9 + a torn WAL line on the first run, and
+  the uncommitted row was correctly gone — the WAL fsync
+  discipline from V0.2/V0.6 already held. The test stays as
+  the regression proof. A kill -9 is still not a power cut:
+  no mid-fsync power-loss test exists.
+
+## Notes from the V0.10 review fixes (B1, M1–M6, m1–m4)
+
+A reviewer re-probed V0.10 and found 1 blocker, 6 must-fixes
+and 4 minors, all verified by probe; all are fixed, with
+regression tests (4 new pgwire tests `v10fix_*`; suite total
+290 → 294: 133 unit + 43 engine + 118 pgwire, green in both
+the debug and the release profile):
+
+- **B1 — a big cross product OOM-killed the server.** `COUNT(*)`
+  over a 2000×2000 join materialised 4M joined rows (~2 KB
+  each) and died with SIGABRT (`memory allocation of 808 bytes
+  failed`); 1000×1000 took 6.49 s and ~2 GB. Fix, in
+  `src/query.rs`: (a) a simple aggregate query (aggregate
+  items only, no GROUP BY / HAVING / ORDER BY, no SELECT-list
+  subquery) now streams — `stream_joined` hands each joined
+  row to the accumulator and drops it, so the 2000×2000 COUNT
+  returns 4000000 in ~2.2 s (release) with flat memory; the
+  streaming arithmetic mirrors `compute_aggregate` exactly
+  (i128-exact integer SUM/AVG, 22003 on overflow, 22P02 on the
+  first non-finite value in row order, exact AVG); (b) a
+  materialised join is capped at 100_000 rows
+  (`ZENO_MAX_JOIN_ROWS` overrides it, `0` disables it) and
+  fails fast with 54000 — a plain 1000×1000 SELECT is 54000 in
+  ~0.3 s; (c) LIMIT 0 returns no rows without running the
+  projection (M4). No general LIMIT pushdown yet: a plain
+  `LIMIT 5` over a big join still materialises first and hits
+  the cap — documented in the README, not claimed otherwise.
+- **M1 — nested SELECT-list subquery, grand-outer 42703.**
+  Uncorrelated subqueries ran with the parent outer context
+  only (`outer.parent`), skipping one level, so a subquery
+  nested inside another could not read the grand-outer row.
+  Both call sites (`execute_plain`, `execute_aggregate`) now
+  pass `outer` itself. Safe by construction: "uncorrelated"
+  means no reference matches this statement's scope, so
+  passing `outer` only exposes ancestor levels, and the
+  nearest scope still wins — shadowing is unchanged (regression
+  test covers an inner FROM that reuses the outer table name).
+- **M2 / M5 — correlated WHERE subqueries work now.** WHERE
+  subqueries were always hoisted with no outer context, so any
+  outer reference failed with a misleading 42703. Now each
+  WHERE subquery is checked for correlation against its own
+  statement's scope and every ancestor scope; a correlated one
+  is evaluated once per row, against that row (with the full
+  parent chain, so a WHERE subquery nested inside a SELECT-list
+  subquery can read both its own statement's alias and the
+  grand-outer row). Uncorrelated ones are still hoisted once.
+  M5's probe query now returns correct rows instead of 42703,
+  so no separate "not supported" message was needed.
+- **M3 — timeout tests use a 2000×2000 workload.** The
+  streaming aggregate made the old 500×500 cross product
+  finish inside the 500 ms timeout in release, so
+  `v10_select_list_subquery_timeout_cancels_slow_query` (and
+  the V0.9 `v09fix_statement_timeout_cancels_slow_query`, which
+  failed in release for the same reason) now seed 2000 rows
+  per table. The test-harness `Server::start` also changed
+  (m4): readiness is now the server's own stdout listening
+  line, not a bare TCP probe + 150 ms settle — under parallel
+  load the probe could connect to another test's server on the
+  same port, which failed the TLS test once in a parallel
+  release run. The drain thread keeps reading until EOF: an
+  early version exited when the starter stopped listening,
+  closing the pipe while the server was still printing startup
+  lines, and the server panicked with EPIPE (exit 101).
+- **M4 — LIMIT 0 + failing subquery is 0 rows, no error.**
+  `execute_plain`, `execute_aggregate` and the streaming
+  aggregate path all return early on LIMIT 0, after the
+  up-front column validation — so a failing SELECT-list
+  subquery (21000) does not fail a query that returns nothing.
+- **M6 — README "Tests" section was stale** (128 unit / 96
+  pgwire / 267 total vs the real 133 / 114 / 290). Counts are
+  now 133 unit + 43 engine + 118 pgwire = 294, verified
+  against `cargo test` and `cargo test --release`, and the
+  section says so — when the counts change, it changes with
+  them.
+- **Minors:** `outer_value` on a missing key in a plain outer
+  row is XX000 (internal error) instead of a silent `""`
+  (unreachable in practice — Zeno has no ADD COLUMN);
+  `parse_subquery` restores `subquery_depth` on a parse error;
+  the integer SUM/AVG path checks the statement deadline every
+  1024 values, like the f64 path.
